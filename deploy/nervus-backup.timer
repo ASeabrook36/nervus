@@ -1,0 +1,15 @@
+# Back nervus up once a day (ADR-0027 question 4). Up to an hour late, at
+# random, so many installations do not all back up at once; a machine off at
+# the time backs up when it next starts (Persistent). Which backups are kept
+# is nervus's own keeping, not the timer's.
+
+[Unit]
+Description=Back nervus up once a day (ADR-0027)
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

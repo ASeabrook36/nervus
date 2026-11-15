@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# nervus-headers -- fetch one nervus token from the Keychain, as MCP headers.
+#
+# ADR-0009 decision 5. Any process on this Mac can read another process's
+# environment (`ps -E`), so a token delivered by environment variable is
+# delivered to everything. This script is instead named by `headersHelper` in
+# a project's .mcp.json. Claude Code runs it when it connects to nervus and
+# sends what it prints as the request headers, so the token lives only in that
+# Claude Code process's memory, and in no process's environment.
+#
+#   nervus-headers <keychain-service>
+#   e.g. nervus-headers nervus-token-claude-code-project-a
+#
+# It prints {"Authorization": "Bearer <token>"} on stdout and nothing else.
+# The token is never written to stderr, a file or an environment variable.
+#
+# The Keychain item trusts no application (created with -T ""), so every run
+# raises a macOS prompt naming `security`. Approve it only when you have just
+# opened a session in the project this token belongs to. Never click
+# "Always Allow": that lets anything read the token silently.
+#
+# Claude Code gives a headersHelper about 10 seconds. If the prompt is not
+# answered in time the connection fails; reconnect the nervus server.
+set -uo pipefail
+
+ACCOUNT=nervus
+# Absolute, so a directory earlier on PATH cannot stand in for it.
+# Overridable only so the script can be tested without a Keychain item.
+SECURITY=${NERVUS_SECURITY_BIN:-/usr/bin/security}
+
+if [ $# -ne 1 ] || [ -z "$1" ]; then
+  echo "usage: nervus-headers <keychain-service>" >&2
+  exit 2
+fi
+service=$1
+
+token=$("$SECURITY" find-generic-password -a "$ACCOUNT" -s "$service" -w 2>/dev/null)
+rc=$?
+
+if [ $rc -ne 0 ]; then
+  case $rc in
+    44) echo "nervus-headers: no Keychain item '$service' (account '$ACCOUNT')" >&2 ;;
+    *)  echo "nervus-headers: Keychain read of '$service' failed or was denied (exit $rc)" >&2 ;;
+  esac
+  exit 1
+fi
+
+# Tokens are URL-safe base64. Checking the shape means the value can go into
+# JSON without escaping, and a wrong item is refused rather than sent.
+if ! [[ $token =~ ^[A-Za-z0-9_-]{32,}$ ]]; then
+  echo "nervus-headers: Keychain item '$service' does not look like a nervus token" >&2
+  exit 1
+fi
+
+printf '{"Authorization": "Bearer %s"}\n' "$token"

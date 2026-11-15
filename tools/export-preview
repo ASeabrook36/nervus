@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""export-preview -- build the friends preview of this repository (ADR-0018, as amended).
+
+Run on the operator's machine, from this repository, with its venv:
+
+    .venv/bin/python tools/export-preview <out-dir> --against DIR [--commit REF] [--map PATH]
+
+DIR is a checkout of the preview repository at its last export: the release number in its
+pyproject.toml is the one this export must be above, and the result is diffed against it.
+
+It builds the preview from a commit, never from the working tree, so nothing unsaved or
+untracked goes out. In order, stopping at the first thing that fails:
+
+  1. Takes the commit's tree (`git archive`) into <out-dir>, which must not exist or be empty.
+  2. Leaves out the deployment record whole (ADR-0019 decision H): procedures/,
+     CURRENT_STATE.md, hosts.yaml, deployment/, and .mcp.json; and this repository's own
+     README.md.
+  3. Adds the preview's own files from the same commit: preview/README.md becomes README.md,
+     preview/mcp.json.example becomes .mcp.json.example, and preview/ itself is not exported.
+  4. Checks the release, before anything slow (ADR-0029 questions 2a and 9a). Its number, the
+     version in the result's pyproject.toml, is three numbers with no leading zeros, such as
+     0.2.0, as tests/test_package.py requires, and must be above DIR's, compared part by part
+     as numbers: 0.10.0 is above 0.9.0. The result's CHANGES.md must have its section: a line
+     "## <number>", which may go on after a space, with something under it before the next
+     "## ". The section's first line, which says "Not yet exported." until then, is "Exported
+     <the day>." and nothing else in the commit an export is made from: tests/test_changes.py,
+     run in step 7, requires it.
+  5. Checks every file against the map's check list (secrets/preview-map.yaml, never in the
+     repository). A hit stops it: the fix is made in this repository, at the source. Nothing is
+     rewritten (ADR-0018's amendment: a check, not a rewrite). The map may allow a line, under
+     `allow`, as a file and one whole line of it: a match is passed over only where it lies in
+     that file on a line that is exactly that line, and step 5 says each line it passed over
+     (ADR-0018, amended 2026-11-15: the copyright line). The same words anywhere else are a hit.
+  6. Runs gitleaks over the result (version 8.19 or later, for `gitleaks dir`). A finding stops
+     it; gitleaks missing stops it too, with how to install it.
+  7. Runs tests/ on the result, with the result's own src/ first on the path. A failure stops it.
+  8. Shows how the result differs from DIR, so the operator can read what this export changes
+     before committing it. Left out of both, since no export holds them: .git, and __pycache__/,
+     the bytecode Python writes as step 7 runs the tests.
+
+Exit 0: the preview in <out-dir> passed every check; commit it in the preview repository as
+"Export of <commit>, <date>". Exit 1: something failed, said above; <out-dir> is left for
+reading, and nothing in it should be committed. Exit 2: it could not run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import itertools
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+from datetime import date
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+# The deployment record, and this repository's own files that are not the preview's.
+LEFT_OUT = ("procedures", "CURRENT_STATE.md", "hosts.yaml", "deployment", ".mcp.json", "README.md", "preview")
+# The preview's own files: (in the commit, in the preview).
+ADDED = (("preview/README.md", "README.md"), ("preview/mcp.json.example", ".mcp.json.example"))
+
+
+class Stop(Exception):
+    """A check failed; the message says which and what to do."""
+
+
+def say(line: str) -> None:
+    print(f"[export-preview] {line}", flush=True)
+
+
+def git(*args: str, binary: bool = False):
+    done = subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, check=False)
+    if done.returncode:
+        raise Stop(f"git {' '.join(args)} failed: {done.stderr.decode(errors='replace').strip()}")
+    return done.stdout if binary else done.stdout.decode()
+
+
+def build(commit: str, out: Path) -> str:
+    sha = git("rev-parse", "--verify", f"{commit}^{{commit}}").strip()
+    archive = git("archive", "--format=tar", sha, binary=True)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        names = set(tar.getnames())
+        for source, _ in ADDED:
+            if source not in names:
+                raise Stop(f"{sha[:7]} has no {source}; the preview's own files come from the same commit")
+        tar.extractall(out, filter="data")
+    for source, target in ADDED:
+        # Read before LEFT_OUT removes preview/.
+        (out / f".{Path(target).name}.new").write_bytes((out / source).read_bytes())
+    for name in LEFT_OUT:
+        path = out / name
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    for _, target in ADDED:
+        (out / f".{Path(target).name}.new").rename(out / target)
+    return sha
+
+
+def release_number(tree: Path, which: str, fix: str) -> str:
+    try:
+        project = tomllib.loads((tree / "pyproject.toml").read_text(encoding="utf-8")).get("project")
+    except FileNotFoundError:
+        raise Stop(f"{which} has no pyproject.toml; {fix}") from None
+    except (OSError, ValueError) as exc:  # ValueError: not UTF-8, or not TOML
+        raise Stop(f"cannot read the pyproject.toml of {which}: {exc}; {fix}") from exc
+    number = project.get("version") if isinstance(project, dict) else None  # no [project], or not a table
+    if number is None:
+        raise Stop(f"the pyproject.toml of {which} names no version; {fix}")
+    if not isinstance(number, str):  # TOML's strings are in quotes: version = 0.2 is a number
+        raise Stop(f'the release number of {which}, {number!r}, is not in quotes, as in version = "0.2.0"; {fix}')
+    if not re.fullmatch(r"(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}", number):
+        raise Stop(f"the release number of {which}, {number!r}, is not three numbers with no leading zeros, "
+                   f"such as 0.2.0; {fix}")
+    return number
+
+
+def changes(out: Path, number: str) -> None:
+    path = out / "CHANGES.md"
+    if not path.is_file():
+        raise Stop(f"the export has no CHANGES.md; write it at the top of this repository, with a section for {number}")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    # Its heading may go on after a space; its section runs to the next "## ", so "### " heads are in it.
+    heading = re.compile(rf"## {re.escape(number)}( .*)?")
+    at = next((i for i, line in enumerate(lines) if heading.fullmatch(line)), None)
+    if at is None:
+        raise Stop(f'CHANGES.md has no section for {number}; begin one with the line "## {number}", in this repository')
+    section = itertools.takewhile(lambda line: not line.startswith("## "), lines[at + 1:])
+    if not any(line.strip() for line in section):
+        raise Stop(f"CHANGES.md's section for {number} is empty; say in it what changed, in this repository")
+
+
+def release(out: Path, previous: Path) -> tuple[str, str]:
+    number = release_number(out, "the export", "set [project] version in pyproject.toml, in this repository")
+    last = release_number(previous, f"the last export ({previous})",
+                          "--against takes a checkout of the preview repository")
+    # Part by part, as numbers, never as strings: 0.10.0 is above 0.9.0.
+    if tuple(map(int, number.split("."))) <= tuple(map(int, last.split("."))):
+        raise Stop(f"the release number {number} is not above the last export's, {last}; "
+                   "raise it in pyproject.toml, in this repository")
+    changes(out, number)
+    return number, last
+
+
+def load_checks(map_path: Path) -> list[tuple[re.Pattern, str]]:
+    import yaml
+
+    try:
+        checks = yaml.safe_load(map_path.read_text())["check"]
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as exc:
+        raise Stop(f"cannot read the check list in {map_path}: {exc}") from exc
+    if not checks:
+        raise Stop(f"{map_path} has an empty check list")
+    compiled = []
+    for c in checks:
+        if isinstance(c, dict):
+            word = str(c["word"])
+            compiled.append((re.compile(r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])", re.I), word))
+        else:
+            compiled.append((re.compile(re.escape(str(c)), re.I), str(c)))
+    return compiled
+
+
+def load_allowed(map_path: Path) -> set[tuple[str, str]]:
+    """The lines the map allows: each a file, by its path in the export, and one whole line of it."""
+    import yaml
+
+    try:
+        allowed = yaml.safe_load(map_path.read_text()).get("allow") or []
+    except (OSError, AttributeError, yaml.YAMLError) as exc:
+        raise Stop(f"cannot read the allow list in {map_path}: {exc}") from exc
+    lines = set()
+    for entry in allowed if isinstance(allowed, list) else [allowed]:
+        file, line = (entry.get("file"), entry.get("line")) if isinstance(entry, dict) else (None, None)
+        if not (isinstance(file, str) and isinstance(line, str) and file and line.strip() and "\n" not in line):
+            # The entry is not shown: what it allows is what the check list exists to keep out of sight.
+            raise Stop(f"{map_path}: each entry under allow is a file and one whole line of it, "
+                       'as in { file: NOTICE, line: "..." }')
+        lines.add((file, line))
+    return lines
+
+
+def check(out: Path, checks: list[tuple[re.Pattern, str]], allowed: set[tuple[str, str]] = frozenset()) -> list[str]:
+    hits, passed = [], set()
+    for path in sorted(p for p in out.rglob("*") if p.is_file()):
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        name = path.relative_to(out).as_posix()
+        for rx, word in checks:
+            for mo in rx.finditer(text):
+                line = text.count("\n", 0, mo.start()) + 1
+                # The whole line the match lies on. Allowed only if it is exactly an allowed line of this very file:
+                # more on the line, a space before it, or the same line in another file, and it is a hit.
+                end = text.find("\n", mo.end())
+                whole = text[text.rfind("\n", 0, mo.start()) + 1:len(text) if end < 0 else end]
+                if (name, whole) in allowed:
+                    passed.add(f"{name}:{line}")
+                else:
+                    hits.append(f"  {name}:{line}  [{word}]")
+    if hits:
+        raise Stop("the check list matched; fix each at the source, in this repository:\n" + "\n".join(hits))
+    return sorted(passed)
+
+
+def gitleaks(out: Path) -> None:
+    if shutil.which("gitleaks") is None:
+        raise Stop("gitleaks is not installed; install it (brew install gitleaks) and run this again")
+    done = subprocess.run(["gitleaks", "dir", "--no-banner", "--redact", "--exit-code", "1", str(out)],
+                          capture_output=True, text=True, check=False)
+    if done.returncode == 1:
+        raise Stop("gitleaks found something:\n" + (done.stdout + done.stderr).strip())
+    if done.returncode:
+        raise Stop(f"gitleaks could not run (exit {done.returncode}): {(done.stdout + done.stderr).strip()}")
+
+
+def run_tests(out: Path) -> str:
+    env = {**os.environ, "PYTHONPATH": str(out / "src")}
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", "tests"],
+                          cwd=out, env=env, capture_output=True, text=True, check=False)
+    last = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else done.stderr.strip()
+    if done.returncode:
+        raise Stop(f"tests/ failed on the preview: {last}\n" + done.stdout[-4000:])
+    return last
+
+
+def against(previous: Path, out: Path) -> str:
+    # Compared whole, DIR's .git and the result's bytecode would be listed file by file, burying what this export
+    # changes. So copies without them are compared, side by side, which names each file from the top of its tree.
+    with tempfile.TemporaryDirectory() as tmp:
+        for tree, name in ((previous, "last"), (out, "this")):
+            shutil.copytree(tree, Path(tmp) / name, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        done = subprocess.run(["git", "diff", "--no-index", "--stat", "--", "last", "this"],
+                              cwd=tmp, capture_output=True, text=True, check=False)
+    return done.stdout.rstrip() or "no difference"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="export-preview", description=__doc__.split("\n\n")[0])
+    parser.add_argument("out", type=Path, help="where to build the preview; must not exist, or be empty")
+    parser.add_argument("--commit", default="HEAD", help="the commit to export (default HEAD)")
+    parser.add_argument("--map", type=Path, default=REPO / "secrets" / "preview-map.yaml",
+                        help="the map whose check list is applied (default secrets/preview-map.yaml)")
+    parser.add_argument("--against", type=Path, required=True,
+                        help="a checkout of the preview repository at its last export: its release number is "
+                             "the one to be above, and the result is diffed against it")
+    args = parser.parse_args(argv)
+
+    out = args.out.resolve()
+    previous = args.against.resolve()
+    if out.exists() and any(out.iterdir()):
+        print(f"[export-preview] {out} is not empty; give a new or empty folder", file=sys.stderr)
+        return 2
+    if REPO in out.parents or out == REPO:
+        print("[export-preview] the preview cannot be built inside this repository", file=sys.stderr)
+        return 2
+    try:
+        checks = load_checks(args.map)
+        allowed = load_allowed(args.map)
+        out.mkdir(parents=True, exist_ok=True)
+        sha = build(args.commit, out)
+        say(f"1-3. built from {sha[:7]}: the deployment record left out, the preview's own files added")
+        number, last = release(out, previous)
+        say(f"4.   release {number}, above the last export's {last}; CHANGES.md has its section")
+        passed = check(out, checks, allowed)
+        say(f"5.   the check list ({len(checks)} entries) found nothing"
+            + (f"; passed over, as the map allows: {', '.join(passed)}" if passed else ""))
+        gitleaks(out)
+        say("6.   gitleaks found nothing")
+        say(f"7.   tests/ on the preview: {run_tests(out)}")
+        say("8.   against the last export:\n" + against(previous, out))
+    except Stop as exc:
+        say(f"STOP  {exc}")
+        say(f"{out} is left for reading; commit nothing from it")
+        return 1
+    say(f"done. Commit it in the preview repository as: Export of {sha[:7]}, {date.today().isoformat()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

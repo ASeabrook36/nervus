@@ -1,0 +1,107 @@
+# systemd unit for the nervus MCP bastion.
+#
+# nervus's own unit, naming no installation (ADR-0019). It expects nervus's
+# venv at /opt/nervus/.venv, a link to the running release's own (ADR-0029),
+# secrets under /opt/nervus/secrets/ as 0600 files owned by the nervus service
+# account, and the audit log under /var/log/nervus.
+#
+# Its defaults are secure ones (ADR-0007: no network is trusted): it listens on
+# every address, since nervus is there to be reached from other machines, and
+# serves both MCP and the UI over HTTPS with nervus's own certificate (ADR-0010),
+# so `nervus tls-init` must have run first. It offers no Proxmox tool and names
+# no address for sign-in links.
+#
+# An installation's own flags go in a drop-in,
+# /etc/systemd/system/nervus.service.d/<name>.conf, which clears ExecStart
+# (`ExecStart=` alone) and gives the whole command line again with them added,
+# such as --proxmox and --ui-url. nervus-ctl reads the unit and its drop-ins as
+# systemd does.
+#
+# "User=nervus" is this service's own unprivileged local account on the nervus
+# machine -- unrelated to the "agent" account ADR-0001 section 4 creates on each
+# *target* host. nervus never runs as agent; it authenticates *as* agent, over
+# SSH, to the targets.
+
+[Unit]
+Description=nervus MCP bastion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nervus
+Group=nervus
+WorkingDirectory=/opt/nervus
+# Headroom above systemd's default 1024 so a flood of idle connections cannot
+# exhaust nervus's file descriptors (procedure 056, C22); uvicorn's own
+# limit_concurrency caps concurrent connections well below this.
+LimitNOFILE=16384
+# --switches: the off switch (ADR-0003), re-read on every request and set with
+# nervus-ctl or in the UI. In the state directory below, where nervus may write
+# it, and not in secrets/, which stays read-only to nervus (ADR-0014 decision
+# A). A deploy creates it there (tools/ensure-switches); missing or malformed,
+# nervus refuses every client.
+# --database: what nervus writes while it runs (ADR-0011 decision 1), in the
+# state directory below; first, the operator's sign-in links and sessions
+# (ADR-0012 decision 3).
+# --ui-port: the UI, beside MCP at the same address (ADR-0012 decision 1). Off
+# loopback it serves only HTTPS (ADR-0011 question B), with nervus's own
+# certificate, /opt/nervus/secrets/tls.crt: nervus refuses to start until
+# `nervus tls-init` has made it. --ui-url, where `nervus-ctl signin` points its
+# links, is the installation's address, so it belongs in a drop-in.
+ExecStart=/opt/nervus/.venv/bin/nervus \
+    --hosts /opt/nervus/hosts.yaml \
+    --tokens /opt/nervus/secrets/tokens.yaml \
+    --known-hosts /opt/nervus/secrets/known_hosts \
+    --ssh-key /opt/nervus/secrets/nervus_ed25519 \
+    --ssh-ca-key /opt/nervus/secrets/nervus_ca_ed25519 \
+    --audit-log /var/log/nervus/audit.jsonl \
+    --transfer-dir /opt/nervus/transfer \
+    --switches /var/lib/nervus/switches.yaml \
+    --bind-host 0.0.0.0 \
+    --bind-port 8000 \
+    --database /var/lib/nervus/nervus.db \
+    --ui-port 8443
+
+# `systemctl reload nervus`: re-check the TLS certificate now (ADR-0010
+# decision 5). With plain HTTP it does nothing; without this line, SIGHUP
+# stopped nervus.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# nervus stops itself within 5 seconds of SIGTERM (SHUTDOWN_GRACE_SECONDS in
+# __main__.py). This is the backstop if anything else holds it up: kill after
+# 20 seconds rather than systemd's default 90.
+TimeoutStopSec=20
+
+# Hardening basics for an unprivileged single-purpose service. It only
+# ever needs to read its own config/secrets, write the audit log and its
+# database, serve MCP and the UI, and make outbound SSH/SFTP connections,
+# plus HTTPS to a Proxmox API where a drop-in gives --proxmox (ADR-0009 decision 2).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# /opt/nervus is otherwise read-only under ProtectSystem=strict, which is
+# deliberate -- it keeps `get` away from the secrets and the code. The transfer
+# directory is the one place inside it a transfer may land, and put/get refuse
+# any local path that resolves outside these.
+ReadWritePaths=/var/log/nervus /opt/nervus/transfer
+# The database's home (ADR-0011 consequence 2, ADR-0012 decision 3). systemd
+# makes /var/lib/nervus, owned by nervus, and lets nervus write there despite
+# ProtectSystem=strict. 0700: the database is nervus's alone; nervus-ctl, run
+# as root, changes it as nervus.
+StateDirectory=nervus
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

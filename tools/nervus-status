@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# nervus-status -- is the bastion up, am I authorised, and can it reach the fleet?
+#
+# Client-side only: it speaks MCP to nervus exactly as Claude Code or Codex
+# would, so a green line here means those apps will work too. Adds no endpoint
+# and no attack surface to nervus itself.
+#
+#   NERVUS_URL            required: nervus's MCP endpoint, e.g. https://<nervus>:8000/mcp.
+#                         <nervus> is a name, an IPv4 address, or an IPv6 one in brackets
+#   NERVUS_CACERT         for https://, the certificate file to trust nervus by: nervus's root,
+#                         as tools/nervus-trust saves it (ADR-0021). Unset, the system's roots,
+#                         as for a certificate from a public authority. Certificate checking is
+#                         never turned off
+#   NERVUS_TOKEN          the bearer token, or
+#   NERVUS_TOKEN_COMMAND  a command that prints it, run only if NERVUS_TOKEN is unset,
+#                         e.g. a password manager's read command
+#
+# Needs bash, curl and python3; runs on macOS and Debian alike. Names are looked up
+# as a client looks them up (getaddrinfo: /etc/hosts, mDNS, then DNS), not with dig.
+#
+# Nothing names an instance: one that wants defaults wraps this script and sets them.
+set -uo pipefail
+
+URL=${NERVUS_URL:-}
+[ -n "$URL" ] || { echo "nervus-status: set NERVUS_URL to nervus's MCP endpoint, e.g. https://<nervus>:8000/mcp" >&2; exit 2; }
+CA=${NERVUS_CACERT:-}
+ROOTS="the system's roots"
+SOURCE=${NERVUS_TOKEN:+NERVUS_TOKEN}
+SOURCE=${SOURCE:-${NERVUS_TOKEN_COMMAND:-}}
+
+red() { printf '\033[31m%s\033[0m' "$1"; }
+grn() { printf '\033[32m%s\033[0m' "$1"; }
+yel() { printf '\033[33m%s\033[0m' "$1"; }
+ok()   { printf '  [%s] %s\n' "$(grn ' ok ')" "$1"; }
+bad()  { printf '  [%s] %s\n' "$(red 'FAIL')" "$1"; }
+warn() { printf '  [%s] %s\n' "$(yel 'warn')" "$1"; }
+
+# The URL: its scheme, then a host (a name, an IPv4 address, or [an IPv6 one]) and a port.
+case "$URL" in
+  https://*) scheme=https; rest=${URL#https://} ;;
+  http://*)  scheme=http;  rest=${URL#http://} ;;
+  *) echo "nervus-status: NERVUS_URL must start with https:// or http://, not $URL" >&2; exit 2 ;;
+esac
+host_port=${rest%%/*}
+case "$host_port" in
+  \[*\]:*) host=${host_port%%]*}; host=${host#[}; port=${host_port##*]:} ;;
+  \[*\])   host=${host_port#[}; host=${host%]}; port= ;;
+  *:*)     host=${host_port%%:*}; port=${host_port##*:} ;;
+  *)       host=$host_port; port= ;;
+esac
+[ -n "$port" ] || { [ "$scheme" = https ] && port=443 || port=80; }
+CACERT=()
+[ "$scheme" = https ] && [ -n "$CA" ] && CACERT=(--cacert "$CA")
+
+echo
+echo "nervus  $URL"
+echo "token   ${SOURCE:-none: set NERVUS_TOKEN or NERVUS_TOKEN_COMMAND}"
+[ "$scheme" = https ] && echo "trust   ${CA:-$ROOTS}"
+echo
+
+# 1. name: looked up the way a client looks it up
+ip=$(python3 -c '
+import socket, sys
+try:
+    print(socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)[0][4][0])
+except OSError:
+    pass
+' "$host" 2>/dev/null)
+if [ -z "$ip" ]; then bad "name       $host does not resolve"; exit 1
+elif [ "$ip" = "$host" ]; then ok "address    $host"
+else ok "name       $host -> $ip"; fi
+
+# 2. TCP, to every address the name has, as a client tries them
+if python3 -c '
+import socket, sys
+socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5).close()
+' "$host" "$port" 2>/dev/null; then
+  ok "TCP        port $port open"
+else
+  bad "TCP        port $port unreachable -- is nervus running, and is the address right?"; exit 1
+fi
+
+# 3. TLS, before any token is sent. A failed handshake sends nothing.
+if [ "$scheme" = https ]; then
+  if [ -n "$CA" ] && [ ! -r "$CA" ]; then
+    bad "TLS        NERVUS_CACERT=$CA is not a readable file"; exit 1
+  fi
+  if err=$(curl -sS -o /dev/null --max-time 10 ${CACERT[@]+"${CACERT[@]}"} "$URL" 2>&1); then
+    ok "TLS        certificate checked against ${CA:-$ROOTS}"
+  else
+    err=${err%%$'\n'*}; err=${err#curl: }; err=${err#\(*\) }   # its first line, without "(60) "
+    if [ -n "$CA" ]; then bad "TLS        $err -- is $CA nervus's root?"
+    else bad "TLS        $err -- set NERVUS_CACERT to nervus's root, saved by tools/nervus-trust"; fi
+    exit 1
+  fi
+else
+  [ -n "$CA" ] && warn "TLS        NERVUS_CACERT is not used: $URL is plain HTTP"
+  if ! python3 -c 'import ipaddress, sys; sys.exit(not ipaddress.ip_address(sys.argv[1].split("%")[0]).is_loopback)' "$ip" 2>/dev/null; then
+    warn "TLS        none: plain HTTP, so the token crosses the network unencrypted"
+  fi
+fi
+
+# 4. token
+TOK=${NERVUS_TOKEN:-}
+if [ -z "$TOK" ]; then
+  [ -n "${NERVUS_TOKEN_COMMAND:-}" ] || { bad "token      set NERVUS_TOKEN, or NERVUS_TOKEN_COMMAND to a command that prints it"; exit 1; }
+  TOK=$(bash -c "$NERVUS_TOKEN_COMMAND" 2>/dev/null)
+  [ -z "$TOK" ] && { bad "token      NERVUS_TOKEN_COMMAND printed nothing"; exit 1; }
+  ok "token      printed by NERVUS_TOKEN_COMMAND"
+else
+  ok "token      taken from NERVUS_TOKEN"
+fi
+
+# The token reaches curl in a file only this user can read, never as an argument,
+# which any user on the machine could read from the process list (ps). printf is a
+# shell builtin, so writing the file puts the token on no command line either. The
+# directory, and the token with it, is removed however the script ends.
+PRIV=$(mktemp -d "${TMPDIR:-/tmp}/nervus-status.XXXXXX") || { bad "token      cannot make a private directory"; exit 1; }
+trap 'rm -rf "$PRIV"' EXIT
+AUTH=$PRIV/auth
+(umask 077; printf 'Authorization: Bearer %s\n' "$TOK" > "$AUTH")
+
+CT='Content-Type: application/json'
+AC='Accept: application/json, text/event-stream'
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"nervus-status","version":"1"}}}'
+
+# 5. authenticate
+#
+# The BODY is the evidence here, not the status code and not the presence of a
+# session-id header. nervus answers an unauthorised request with HTTP 200 and a
+# JSON-RPC error, and still returns an mcp-session-id header -- so checking the
+# header alone reports a refused token as a successful login.
+body=$PRIV/body
+hdr=$(curl -sS -D - --max-time 20 ${CACERT[@]+"${CACERT[@]}"} -X POST "$URL" -H @"$AUTH" \
+        -H "$CT" -H "$AC" -d "$INIT" -o "$body" 2>/dev/null)
+SID=$(printf '%s' "$hdr" | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')
+
+if grep -q '"error"' "$body" 2>/dev/null; then
+  msg=$(sed -n 's/^data: //p' "$body" | python3 -c '
+import sys, json
+try:
+    print(json.loads(sys.stdin.read().strip(), strict=False)["error"]["message"])
+except Exception:
+    print("unparseable error response")
+' 2>/dev/null)
+  case "$msg" in
+    *unauthorized*) bad "auth       token refused -- revoked, or locked out by the operator";;
+    *)              bad "auth       $msg";;
+  esac
+  exit 1
+fi
+if [ -z "$SID" ]; then bad "auth       no MCP session established"; exit 1; fi
+ok "auth       accepted, session established"
+
+curl -sS --max-time 15 ${CACERT[@]+"${CACERT[@]}"} -X POST "$URL" -H @"$AUTH" -H "$CT" -H "$AC" \
+     -H "mcp-session-id: $SID" -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+     -o /dev/null 2>/dev/null
+
+call() { # call <tool> <json-args>
+  printf '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2" \
+  | curl -sS --max-time 120 ${CACERT[@]+"${CACERT[@]}"} -X POST "$URL" -H @"$AUTH" -H "$CT" -H "$AC" \
+      -H "mcp-session-id: $SID" --data-binary @- 2>/dev/null | sed -n 's/^data: //p'
+}
+
+# 6. inventory
+inv=$(call hosts '{}')
+names=$(printf '%s' "$inv" | python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read().strip(), strict=False)
+    p = json.loads(d["result"]["content"][0]["text"], strict=False)
+    print(" ".join(h["name"] for h in p["hosts"]))
+except Exception:
+    pass
+' 2>/dev/null)
+if [ -z "$names" ]; then bad "tools      hosts returned nothing"; exit 1; fi
+ok "tools      hosts -> $names"
+
+# 7. can it actually reach each host?
+echo
+for h in $names; do
+  res=$(call exec "{\"host\":\"$h\",\"command\":\"echo reachable\"}")
+  code=$(printf '%s' "$res" | python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read().strip(), strict=False)
+    p = json.loads(d["result"]["content"][0]["text"], strict=False)
+    print(p.get("exit_code"))
+except Exception:
+    print("err")
+' 2>/dev/null)
+  if [ "$code" = "0" ]; then ok "fleet      $h reachable, command ran"
+  else bad "fleet      $h NOT reachable (exit $code)"; fi
+done
+echo

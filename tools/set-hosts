@@ -1,0 +1,171 @@
+#!/opt/nervus/.venv/bin/python
+"""set-hosts -- add one host to named tokens' allowlists in nervus's token file.
+
+Run on the nervus machine (inside its container, if it has one), as root, with
+nervus's own venv:
+
+    /opt/nervus/.venv/bin/python /opt/nervus/releases/<release>/tools/set-hosts [--check] <host> <token-id>...
+
+Each named token's `hosts:` line gains <host>, and nothing else in the file
+changes: not the values, not the other fields, not the comments or layout. The
+line must be a one-line list, `hosts: [host-a, host-b]`, which is how nervus's token
+file is written; anything else stops it. The result is loaded with
+nervus's own load_tokens and compared with the original before it replaces it,
+so a failure at any point leaves the original untouched. The swap is atomic;
+ownership and mode 0600 are kept. Nothing it prints contains a token value.
+
+--check reports what would change and writes nothing: the same checks, stopped
+before the swap. It stops, having changed nothing, if a token is missing, is
+named twice, or already has the host.
+
+nervus reads the file only at startup, so it still needs
+`systemctl restart nervus` afterwards.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+from nervus.auth import load_tokens
+
+TOKENS = Path(os.environ.get("NERVUS_TOKENS_FILE", "/opt/nervus/secrets/tokens.yaml"))
+HOST_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+HOSTS_LINE = re.compile(r"^(\s*(?:-\s+)?hosts:\s*\[)([^\]\n]*)(\].*)$")
+
+
+def read_plain(path: Path) -> str:
+    """The text of the file at `path`, opened without waiting and read only if it is a file.
+    nervus's own account owns the folder, and can put a pipe where the file was: a plain read
+    of a pipe waits for a writer that never comes, and whatever ran this waits with it. As
+    nervus.plainfile.read_text, which this cannot use: a deploy runs this
+    from the tree it is about to install, with the nervus still installed, which may have none."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            what = "pipe" if stat.S_ISFIFO(mode) else "folder" if stat.S_ISDIR(mode) else "device"
+            raise OSError(f"it is a {what}, not a file")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd) as f:
+        return f.read()
+
+
+def fail(msg: str) -> None:
+    print(f"set-hosts: {msg}; nothing changed", file=sys.stderr)
+    sys.exit(1)
+
+
+def entry_bounds(lines: list[str], token_id: str) -> tuple[int, int]:
+    """The [start, end) line range of the list item whose id is token_id."""
+    id_line = re.compile(r"^\s*(?:-\s+)?id:\s*(['\"]?)" + re.escape(token_id) + r"\1\s*(?:#.*)?$")
+    found = [i for i, line in enumerate(lines) if id_line.match(line)]
+    if len(found) != 1:
+        fail(f"expected one 'id: {token_id}' line, found {len(found)}")
+    start = found[0]
+    while start >= 0 and not re.match(r"^\s*-\s", lines[start]):
+        start -= 1
+    if start < 0:
+        fail(f"'{token_id}' is not inside a list item")
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        body = line.strip()
+        if body and not body.startswith("#"):
+            this = len(line) - len(line.lstrip())
+            if this < indent or (this == indent and body.startswith("-")):
+                break
+        end += 1
+    return start, end
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    check = bool(args) and args[0] == "--check"
+    if check:
+        args = args[1:]
+    if len(args) < 2:
+        fail("usage: set-hosts [--check] <host> <token-id>...")
+    host, ids = args[0], args[1:]
+    if not HOST_NAME.fullmatch(host):
+        fail(f"{host!r} is not an inventory name")
+    if len(set(ids)) != len(ids):
+        fail("a token id is named twice")
+
+    old = load_tokens(TOKENS)
+    by_id = {t.id: t for t in old.values()}
+    for i in ids:
+        if i not in by_id:
+            fail(f"no token with id {i!r}")
+        if host in by_id[i].hosts:
+            fail(f"{i!r} already has {host!r}")
+
+    try:
+        lines = read_plain(TOKENS).splitlines(keepends=True)
+    except OSError as exc:
+        fail(f"cannot read {TOKENS}: {exc}")
+    for i in ids:
+        start, end = entry_bounds(lines, i)
+        at = [n for n in range(start, end) if lines[n].lstrip().startswith(("hosts:", "- hosts:"))]
+        if len(at) != 1:
+            fail(f"expected one hosts line in {i!r}'s entry, found {len(at)}")
+        n = at[0]
+        eol = lines[n][len(lines[n].rstrip("\r\n")):]
+        m = HOSTS_LINE.match(lines[n].rstrip("\r\n"))
+        if not m:
+            fail(f"{i!r}'s hosts are not a one-line list like [host-a, host-b]")
+        inside = m.group(2).rstrip()
+        lines[n] = m.group(1) + (f"{inside}, {host}" if inside.strip() else host) + m.group(3) + eol
+    new_text = "".join(lines)
+
+    st = TOKENS.stat()
+    fd, tmp = tempfile.mkstemp(dir=TOKENS.parent, prefix=".tokens.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        if os.geteuid() == 0:
+            os.fchown(fd, st.st_uid, st.st_gid)
+        with os.fdopen(fd, "w") as f:
+            f.write(new_text)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Check the candidate with the loader nervus itself uses: the same
+        # values, and each token the same apart from the one host added.
+        new = load_tokens(Path(tmp))
+        if new.keys() != old.keys():
+            fail("the set of token values would change")
+        for secret, was in old.items():
+            now = new[secret]
+            want = was.hosts | {host} if was.id in ids else was.hosts
+            if (now.id, now.client, now.project, now.hosts) != (was.id, was.client, was.project, want):
+                fail(f"{was.id!r} would change more than its hosts")
+
+        if check:
+            os.unlink(tmp)
+        else:
+            os.replace(tmp, TOKENS)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+    final = load_tokens(TOKENS) if not check else new
+    after = TOKENS.stat()
+    print(f"  {TOKENS}: mode {after.st_mode & 0o777:o}, owner uid {after.st_uid}"
+          + ("  (--check: not written)" if check else ""))
+    for t in sorted(final.values(), key=lambda t: t.id):
+        status = f"gains {host}" if t.id in ids else "unchanged"
+        print(f"  {t.id:28} [{', '.join(sorted(t.hosts))}]  {status}")
+    if not check:
+        print("  nervus still has the old allowlists until: systemctl restart nervus")
+
+
+if __name__ == "__main__":
+    main()

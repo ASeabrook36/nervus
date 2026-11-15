@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# proxmox-template -- build a VM template agents can clone and use through the
+# scoped Proxmox API alone (ADR-0017).
+#
+# Run as root on the Proxmox host, once per template, naming the node it runs on:
+#
+#   NODE=<this node's name> bash proxmox-template
+#
+# NODE is a guard against running it on the wrong machine: it must equal
+# `hostname -s`. The template is Debian 13's cloud
+# image with the QEMU guest agent installed and running, and automatic
+# security updates switched on. It holds no user, password or key: clones are
+# used through the guest agent, and enrolled into nervus over it if they live
+# (ADR-0017 J1).
+#
+# It stops at the first thing that is not as expected. In order:
+#
+#   1. Reads, changing nothing: root on the node named; the template id free; nervus's
+#      user and token present; the role, if it exists, holding exactly
+#      VM.Audit and VM.Clone; the storages it uses; genisoimage present.
+#   2. Fetches the pinned Debian image into local:import and checks its SHA-512.
+#   3. Writes the seed disc (the two cloud-init files below) to local:iso.
+#   4. Creates the role NervusTemplateUse if it is missing.
+#   5. Builds the VM, boots it from the image with the seed disc, waits for its
+#      agent, waits for cloud-init to finish, and checks through the agent
+#      that cloud-init accepted the seed, the agent is installed and running,
+#      and automatic updates are on.
+#   6. Clears what must differ per clone (cloud-init state, machine id, SSH
+#      host keys), shuts the VM down, swaps the seed disc for Proxmox's own
+#      cloud-init drive (DHCP, no upgrade at first boot), and makes it a template.
+#   7. Protects it (ADR-0017 E1): NervusTemplateUse on /vms/<id> for nervus's
+#      user and token, and protection: 1.
+#   8. Verifies: the token holds exactly VM.Audit and VM.Clone there; the
+#      template's configuration; that it is in no pool.
+#   9. Removes the image and the seed disc. The template does not need them.
+#
+# Protecting nervus's own container (ADR-0017 K1) is not this script's job.
+#
+# Settings can be read without building, for review and for the tests:
+#   bash tools/proxmox-template --print-settings | --print-user-data | --print-meta-data
+#   bash tools/proxmox-template --check-cloudinit-drive <qm config file>   (the step-8 check, for the tests)
+#
+# A second template (a refresh, ADR-0017 D1) takes another id:
+#   NODE=<node> TEMPLATE_ID=9001 bash proxmox-template
+#
+# DISK_STORAGE (default local-lvm) and BRIDGE (default vmbr0), Proxmox's own
+# defaults, can be set the same way.
+#
+# If it stops part-way, it says what it made and how to undo it.
+set -uo pipefail
+
+EXPECTED_NODE=${NODE:-}
+TEMPLATE_ID=${TEMPLATE_ID:-9000}
+BUILD=20261001-2618
+IMAGE_FILE=debian-13-genericcloud-amd64-$BUILD.qcow2
+IMAGE_URL=https://cloud.debian.org/images/cloud/trixie/$BUILD/$IMAGE_FILE
+# From Debian's SHA512SUMS for that build, read 2026-10-15 (procedure 024).
+IMAGE_SHA512=f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d
+TEMPLATE_NAME=nervus-debian-13-${BUILD%%-*}
+TAG=nervus-template
+IMPORT_DIR=/var/lib/vz/import
+ISO_DIR=/var/lib/vz/template/iso
+SEED_ISO=nervus-template-seed-$TEMPLATE_ID.iso
+DISK_STORAGE=${DISK_STORAGE:-local-lvm}
+BRIDGE=${BRIDGE:-vmbr0}
+DISK_SIZE=16G
+ROLE=NervusTemplateUse
+ROLE_PRIVS=VM.Audit,VM.Clone
+USER_ID=nervus@pve
+TOKEN_NAME=nervus
+TOKEN_ID="$USER_ID!$TOKEN_NAME"
+
+say()  { printf '[proxmox-template] %s\n' "$*"; }
+ok()   { printf '[proxmox-template]   ok  %s\n' "$*"; }
+die()  { printf '[proxmox-template] STOP  %s\n' "$*"; exit 1; }
+
+user_data() {
+cat <<'EOF'
+#cloud-config
+# nervus VM template builder (ADR-0017, tools/proxmox-template). Runs once, in the
+# builder VM, before it becomes the template. No account, and no credential.
+users: []
+disable_root: true
+ssh_pwauth: false
+package_update: true
+packages:
+  - qemu-guest-agent
+  - unattended-upgrades
+write_files:
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: "0644"
+    defer: true
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+runcmd:
+  - [systemctl, start, qemu-guest-agent]
+EOF
+}
+
+meta_data() {
+cat <<'EOF'
+instance-id: nervus-template-builder
+local-hostname: nervus-template
+EOF
+}
+
+[[ $TEMPLATE_ID =~ ^[0-9]+$ ]] && [ "$TEMPLATE_ID" -ge 100 ] \
+  || die "TEMPLATE_ID must be a VM id, a number of 100 or more; got '$TEMPLATE_ID'"
+
+# Proxmox's own cloud-init drive for the template, on DISK_STORAGE, in a `qm config`: named
+# `<storage>:vm-<id>-cloudinit` on a block storage (lvm-thin, ZFS) and
+# `<storage>:<id>/vm-<id>-cloudinit.<format>` on a directory storage (procedure 058).
+has_cloudinit_drive() {  # has_cloudinit_drive <qm config file>
+  grep -Eq "^ide2: $DISK_STORAGE:($TEMPLATE_ID/)?vm-$TEMPLATE_ID-cloudinit(\.[a-z0-9]+)?,media=cdrom" "$1"
+}
+
+case "${1:-}" in
+  --print-user-data) user_data; exit 0 ;;
+  --print-meta-data) meta_data; exit 0 ;;
+  --check-cloudinit-drive) has_cloudinit_drive "${2:?a qm config file}"; exit $? ;;
+  --print-settings)
+    for v in TEMPLATE_ID TEMPLATE_NAME IMAGE_FILE IMAGE_URL IMAGE_SHA512 ROLE ROLE_PRIVS \
+             DISK_STORAGE BRIDGE DISK_SIZE SEED_ISO TAG; do
+      printf '%s=%s\n' "$v" "${!v}"
+    done
+    exit 0 ;;
+  "") ;;
+  *) die "unknown option '$1' (none, --print-settings, --print-user-data or --print-meta-data)" ;;
+esac
+
+# JSON is parsed with core Perl (JSON::PP): Proxmox is
+# written in Perl, so it is always there. Values reach Perl only through %ENV.
+json() { perl -MJSON::PP -e 'my $d = decode_json(join "", <STDIN>); '"$1"; }
+export USER_ID ROLE ROLE_PRIVS TEMPLATE_ID
+
+# `qm` and `pct` read stdin, and this script may arrive on stdin, so the body
+# runs with stdin from /dev/null, or they would read the rest of the script.
+main() {
+
+MADE=""
+undo_hint() {
+  [ -z "$MADE" ] && return
+  say "made so far:$MADE"
+  say "to undo: qm stop $TEMPLATE_ID; qm set $TEMPLATE_ID --protection 0; qm destroy $TEMPLATE_ID --purge;" \
+      "rm -f $IMPORT_DIR/$IMAGE_FILE $ISO_DIR/$SEED_ISO" \
+      "(and, only if no other template uses it, pveum role delete $ROLE)"
+}
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"; undo_hint' EXIT
+
+# Run a command in the VM through its guest agent. Prints its output; returns
+# its exit code, or 99 if the agent could not run it.
+gexec() {
+  local timeout=$1; shift
+  qm guest exec "$TEMPLATE_ID" --timeout "$timeout" -- "$@" > "$WORK/gexec.json" 2> "$WORK/gexec.err" \
+    || { cat "$WORK/gexec.err"; return 99; }
+  json 'print $d->{"out-data"} // ""; print STDERR $d->{"err-data"} // "";
+        exit(defined $d->{exitcode} ? $d->{exitcode} : 99)' < "$WORK/gexec.json"
+}
+
+# --- 1. read ------------------------------------------------------------------
+say "1. reading the Proxmox host before changing anything"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ -n "$EXPECTED_NODE" ] || die "name the node it runs on: NODE=$(hostname -s) bash proxmox-template"
+[ "$(hostname -s)" = "$EXPECTED_NODE" ] || die "this is '$(hostname -s)', not '$EXPECTED_NODE'"
+ok "running as root on $EXPECTED_NODE ($(pveversion | head -1))"
+
+if qm status "$TEMPLATE_ID" >/dev/null 2>&1 || pct status "$TEMPLATE_ID" >/dev/null 2>&1; then
+  die "id $TEMPLATE_ID is in use; choose another with TEMPLATE_ID=..."
+fi
+ok "id $TEMPLATE_ID is free"
+
+pvesh get /access/users --output-format json \
+  | json 'exit((grep { $_->{userid} eq $ENV{USER_ID} } @$d) ? 0 : 1)' \
+  || die "no user $USER_ID: ADR-0009's scoped access (procedure 010) comes first"
+pveum user token list "$USER_ID" --output-format json \
+  | TOKEN_NAME=$TOKEN_NAME json 'exit((grep { $_->{tokenid} eq $ENV{TOKEN_NAME} } @$d) ? 0 : 1)' \
+  || die "no token $TOKEN_ID"
+ok "user $USER_ID and token $TOKEN_ID present"
+
+ROLE_STATE=$(pvesh get /access/roles --output-format json | json '
+  my ($r) = grep { $_->{roleid} eq $ENV{ROLE} } @$d;
+  if (!$r) { print "missing"; exit 0 }
+  my $have = join ",", sort split /,/, $r->{privs};
+  my $want = join ",", sort split /,/, $ENV{ROLE_PRIVS};
+  print $have eq $want ? "same" : "different:$have"') || die "could not read roles"
+case "$ROLE_STATE" in
+  missing) ok "no role $ROLE yet; step 4 makes it" ;;
+  same) ok "role $ROLE exists, holding exactly $ROLE_PRIVS" ;;
+  *) die "role $ROLE exists but holds ${ROLE_STATE#different:}, not $ROLE_PRIVS; nothing changed" ;;
+esac
+
+for s in local "$DISK_STORAGE"; do
+  pvesm status --storage "$s" 2>/dev/null | grep -q " active " || die "storage $s is not active"
+done
+[ -d "$IMPORT_DIR" ] && [ -d "$ISO_DIR" ] || die "no $IMPORT_DIR or $ISO_DIR"
+[ ! -e "$IMPORT_DIR/$IMAGE_FILE" ] || die "$IMPORT_DIR/$IMAGE_FILE is already there; remove it first"
+[ ! -e "$ISO_DIR/$SEED_ISO" ] || die "$ISO_DIR/$SEED_ISO is already there; remove it first"
+command -v genisoimage >/dev/null || die "genisoimage is not installed"
+ip link show "$BRIDGE" >/dev/null 2>&1 || die "no bridge $BRIDGE"
+ok "storages local and $DISK_STORAGE active; bridge $BRIDGE; genisoimage present"
+
+# --- 2. image -----------------------------------------------------------------
+say "2. fetching $IMAGE_FILE"
+curl -fsSL --proto '=https' -o "$IMPORT_DIR/$IMAGE_FILE.part" "$IMAGE_URL" \
+  || { rm -f "$IMPORT_DIR/$IMAGE_FILE.part"; die "could not fetch $IMAGE_URL"; }
+printf '%s  %s\n' "$IMAGE_SHA512" "$IMPORT_DIR/$IMAGE_FILE.part" | sha512sum -c --quiet - \
+  || { rm -f "$IMPORT_DIR/$IMAGE_FILE.part"; die "SHA-512 does not match; nothing kept"; }
+mv "$IMPORT_DIR/$IMAGE_FILE.part" "$IMPORT_DIR/$IMAGE_FILE"
+MADE="$MADE image"
+ok "$IMAGE_FILE, $(stat -c %s "$IMPORT_DIR/$IMAGE_FILE") bytes, SHA-512 matches"
+
+# --- 3. seed disc -------------------------------------------------------------
+say "3. writing the seed disc"
+user_data > "$WORK/user-data"
+meta_data > "$WORK/meta-data"
+genisoimage -quiet -output "$ISO_DIR/$SEED_ISO" -volid cidata -joliet -rock \
+  "$WORK/user-data" "$WORK/meta-data" || die "genisoimage failed"
+MADE="$MADE seed-disc"
+blkid "$ISO_DIR/$SEED_ISO" | grep -q 'LABEL="cidata"' || die "the seed disc is not labelled cidata"
+ok "local:iso/$SEED_ISO, SHA-256 $(sha256sum "$ISO_DIR/$SEED_ISO" | cut -c1-16)…"
+
+# --- 4. role ------------------------------------------------------------------
+if [ "$ROLE_STATE" = missing ]; then
+  say "4. creating role $ROLE"
+  pveum role add "$ROLE" --privs "$ROLE_PRIVS" || die "could not create role $ROLE"
+  MADE="$MADE role"
+  ok "role $ROLE: $ROLE_PRIVS"
+else
+  say "4. role $ROLE already exists, unchanged"
+fi
+
+# --- 5. build -----------------------------------------------------------------
+say "5. building VM $TEMPLATE_ID"
+qm create "$TEMPLATE_ID" --name "$TEMPLATE_NAME" --tags "$TAG" --ostype l26 \
+  --description "nervus VM template (ADR-0017), built by tools/proxmox-template on $(date -u +%F) from $IMAGE_FILE, SHA-512 ${IMAGE_SHA512:0:16}…. Clone it; do not change it." \
+  --cores 2 --memory 2048 --scsihw virtio-scsi-single \
+  --scsi0 "$DISK_STORAGE:0,import-from=local:import/$IMAGE_FILE" --boot order=scsi0 \
+  --ide2 "local:iso/$SEED_ISO,media=cdrom" --net0 "virtio,bridge=$BRIDGE" \
+  --agent enabled=1 --serial0 socket --vga serial0 --onboot 0 \
+  || die "qm create failed"
+MADE="$MADE vm"
+qm disk resize "$TEMPLATE_ID" scsi0 "$DISK_SIZE" || die "could not resize the disk to $DISK_SIZE"
+qm start "$TEMPLATE_ID" || die "could not start VM $TEMPLATE_ID"
+ok "VM $TEMPLATE_ID created and started"
+
+for _ in $(seq 1 60); do
+  qm guest cmd "$TEMPLATE_ID" ping >/dev/null 2>&1 && break
+  sleep 10
+done
+qm guest cmd "$TEMPLATE_ID" ping >/dev/null 2>&1 || die "the guest agent did not answer within 10 minutes"
+ok "guest agent answers"
+
+gexec 900 cloud-init status --wait >/dev/null
+rc=$?
+[ "$rc" -eq 0 ] || die "cloud-init did not finish cleanly (exit $rc); the VM is left running to look at"
+gexec 60 cloud-init schema --system >/dev/null || die "cloud-init rejects the seed's user-data"
+ok "cloud-init finished, and accepts the seed"
+
+out=$(gexec 30 dpkg-query -W -f '${Package} ${Version}\n' qemu-guest-agent unattended-upgrades cloud-init) \
+  || die "a package is missing: $out"
+ok "$(printf '%s' "$out" | paste -sd ';' -)"
+gexec 30 systemctl is-active --quiet qemu-guest-agent || die "qemu-guest-agent is not active"
+out=$(gexec 30 apt-config dump APT::Periodic::Unattended-Upgrade APT::Periodic::Update-Package-Lists)
+printf '%s\n' "$out" | grep -qx 'APT::Periodic::Unattended-Upgrade "1";' \
+  && printf '%s\n' "$out" | grep -qx 'APT::Periodic::Update-Package-Lists "1";' \
+  || die "automatic updates are not on: $out"
+ok "agent active; automatic security updates on"
+
+# --- 6. clear and convert -----------------------------------------------------
+say "6. clearing per-clone state and making the template"
+gexec 120 sh -c 'apt-get clean && rm -f /etc/ssh/ssh_host_* && cloud-init clean --logs --seed --machine-id' \
+  || die "could not clear the guest's state"
+ok "cloud-init state, machine id and SSH host keys cleared"
+qm shutdown "$TEMPLATE_ID" --timeout 180 || die "VM $TEMPLATE_ID did not shut down"
+qm set "$TEMPLATE_ID" --delete ide2 || die "could not remove the seed disc"
+qm set "$TEMPLATE_ID" --ide2 "$DISK_STORAGE:cloudinit" --ipconfig0 ip=dhcp --ciupgrade 0 \
+  || die "could not add Proxmox's cloud-init drive"
+qm template "$TEMPLATE_ID" || die "could not make VM $TEMPLATE_ID a template"
+ok "VM $TEMPLATE_ID is a template, with Proxmox's cloud-init drive"
+
+# --- 7. protect ---------------------------------------------------------------
+say "7. protecting the template"
+pveum acl modify "/vms/$TEMPLATE_ID" --roles "$ROLE" --users "$USER_ID" --tokens "$TOKEN_ID" \
+  || die "could not grant $ROLE on /vms/$TEMPLATE_ID"
+qm set "$TEMPLATE_ID" --protection 1 || die "could not set protection"
+ok "$ROLE on /vms/$TEMPLATE_ID for the user and the token; protection: 1"
+
+# --- 8. verify ----------------------------------------------------------------
+say "8. verifying"
+HELD=$(pveum user token permissions "$USER_ID" "$TOKEN_NAME" --path "/vms/$TEMPLATE_ID" --output-format json \
+  | json 'my $h = $d->{"/vms/$ENV{TEMPLATE_ID}"} || {}; print join ",", sort grep { defined $h->{$_} } keys %$h')
+[ "$HELD" = "$ROLE_PRIVS" ] || die "the token holds '$HELD' on /vms/$TEMPLATE_ID, expected exactly $ROLE_PRIVS"
+ok "the token holds exactly $HELD on /vms/$TEMPLATE_ID"
+
+qm config "$TEMPLATE_ID" > "$WORK/config"
+grep -qx 'template: 1' "$WORK/config" || die "not a template"
+grep -qx 'protection: 1' "$WORK/config" || die "protection is not set"
+grep -qx 'ciupgrade: 0' "$WORK/config" || die "ciupgrade is not 0"
+grep -q '^agent: enabled=1' "$WORK/config" || die "the agent option is not on"
+has_cloudinit_drive "$WORK/config" || die "no cloud-init drive"
+! grep -qE '^(ciuser|cipassword|sshkeys|cicustom):' "$WORK/config" || die "the template carries a cloud-init credential"
+ok "template: 1, protection: 1, cloud-init drive with DHCP, no credential"
+
+# /pools lists pools without their members; each VM's own entry names its pool.
+pvesh get /cluster/resources --type vm --output-format json | json '
+  my ($v) = grep { ($_->{vmid} // -1) == $ENV{TEMPLATE_ID} } @$d;
+  exit 2 if !$v; exit($v->{pool} ? 1 : 0)' \
+  || die "the template is in a pool (where pool rights could be added back), or not listed"
+ok "in no pool"
+
+# --- 9. tidy ------------------------------------------------------------------
+say "9. removing the image and the seed disc"
+rm -f "$IMPORT_DIR/$IMAGE_FILE" "$ISO_DIR/$SEED_ISO"
+MADE=""
+ok "done: template $TEMPLATE_ID, $TEMPLATE_NAME"
+}
+
+main </dev/null

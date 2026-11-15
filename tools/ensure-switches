@@ -1,0 +1,184 @@
+#!/opt/nervus/.venv/bin/python
+"""ensure-switches -- make sure nervus's off switch exists, without ever lifting a lock.
+
+Run on the nervus machine (inside its container, if it has one), as root, with
+nervus's own venv, by whatever deploys nervus:
+
+    /opt/nervus/.venv/bin/python /opt/nervus/releases/<release>/tools/ensure-switches [--check] [--owner USER] [--from OLD] <path>
+
+ADR-0003, question A: nervus refuses every client while the switches file is
+missing or malformed, so a deployment must create it (ADR-0011 consequence 1).
+
+- Missing: creates it with nothing switched off (`lockdown: false`,
+  `disabled: []`), mode 0600, owned by --owner, in one step (temp file, rename).
+- Present and valid: leaves it exactly as it is, and says what it holds. A lock
+  the operator set survives every deploy.
+- Present and malformed: stops, exit 1, and changes nothing. Overwriting it
+  could lift a lock nobody can now read; the operator fixes it by hand.
+- Missing, with --from naming where it used to live: its content is copied from
+  there exactly, if that one is valid; a malformed one stops it, as above. The
+  old file is left in place, so a deploy that rolls back finds it (ADR-0014
+  decision A and consequence 2). With no old file either, it is created.
+- A missing folder is made, 0700, owned by --owner.
+
+--check says which of those it would do and writes nothing.
+
+Self-contained, on purpose: a deploy runs --check before installing
+anything, while the machine still runs the old nervus, which may have no
+nervus.switches. Its idea of a valid file must equal nervus.switches.load_switches;
+tests/test_ensure_switches.py holds the two to the same cases. For the same
+reason it reads the file itself, without waiting on a pipe put at its name
+(read_plain), as nervus.plainfile does for nervus.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import pwd
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+EVERYTHING_ON = "lockdown: false\ndisabled: []\n"
+
+
+def read_plain(path: Path) -> str:
+    """The text of the file at `path`, opened without waiting and read only if it is a file.
+    nervus's own account owns the folder, and can put a pipe where the file was: a plain read
+    of a pipe waits for a writer that never comes, and whatever ran this waits with it. As
+    nervus.plainfile.read_text, which this cannot use: see above."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            what = "pipe" if stat.S_ISFIFO(mode) else "folder" if stat.S_ISDIR(mode) else "device"
+            raise OSError(f"it is a {what}, not a file")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd) as f:
+        return f.read()
+
+
+def problem(text: str) -> str | None:
+    """Why `text` is not a valid switches file, or None. As load_switches."""
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return f"not valid YAML: {exc}"
+    if not isinstance(raw, dict) or set(raw) != {"lockdown", "disabled"}:
+        return "must have exactly the keys lockdown and disabled"
+    if not isinstance(raw["lockdown"], bool):
+        return "lockdown must be true or false"
+    disabled = raw["disabled"] if raw["disabled"] is not None else []
+    if not isinstance(disabled, list) or not all(isinstance(i, str) for i in disabled):
+        return "disabled must be a list of token ids"
+    return None
+
+
+def describe(text: str) -> str:
+    raw = yaml.safe_load(text)
+    off = ", ".join(raw["disabled"] or []) or "none"
+    return f"lockdown {'ON' if raw['lockdown'] else 'off'}; switched off: {off}"
+
+
+def main(argv: list[str]) -> int:
+    check = "--check" in argv
+    argv = [a for a in argv if a != "--check"]
+    options = {}
+    for name in ("--owner", "--from"):
+        if name in argv:
+            i = argv.index(name)
+            options[name] = argv[i + 1]
+            del argv[i:i + 2]
+    owner = options.get("--owner")
+    if len(argv) != 1:
+        print("usage: ensure-switches [--check] [--owner USER] [--from OLD] <path>", file=sys.stderr)
+        return 2
+    path = Path(argv[0])
+    old = Path(options["--from"]) if "--from" in options else None
+
+    if path.exists() or path.is_symlink():
+        try:
+            text = read_plain(path)
+        except OSError as exc:
+            print(f"ensure-switches: STOP  cannot read {path}: {exc}")
+            return 1
+        why = problem(text)
+        if why is not None:
+            print(f"ensure-switches: STOP  {path} is malformed ({why}), so nervus refuses every "
+                  "client; fix it by hand, it is not overwritten")
+            return 1
+        print(f"ensure-switches: {path} is kept as it is: {describe(text)}")
+        return 0
+
+    content, source = EVERYTHING_ON, None
+    if old is not None and (old.exists() or old.is_symlink()):
+        try:
+            content = read_plain(old)
+        except OSError as exc:
+            print(f"ensure-switches: STOP  cannot read {old}: {exc}")
+            return 1
+        why = problem(content)
+        if why is not None:
+            print(f"ensure-switches: STOP  {old} is malformed ({why}), so it is not copied to {path}; "
+                  "fix it by hand first")
+            return 1
+        source = old
+
+    if check:
+        if source is not None:
+            print(f"ensure-switches: {path} is missing; {source} will be copied to it: {describe(content)}")
+        else:
+            print(f"ensure-switches: {path} is missing; it will be created with nothing switched off")
+        return 0
+    if not path.parent.exists():
+        path.parent.mkdir(mode=0o700)
+        os.chmod(path.parent, 0o700)
+        if owner is not None:
+            entry = pwd.getpwnam(owner)
+            os.chown(path.parent, entry.pw_uid, entry.pw_gid)
+    fd, staging = tempfile.mkstemp(dir=path.parent, prefix=".switches.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            # Mode and owner through the handle, never the name: this folder is nervus's
+            # account's and this runs as root, so a name swapped for a link must not carry
+            # root's chmod and chown to what the link names (procedure 058).
+            os.fchmod(fd, 0o600)
+            if owner is not None:
+                entry = pwd.getpwnam(owner)
+                os.fchown(fd, entry.pw_uid, entry.pw_gid)
+            os.fsync(fd)
+            made = os.fstat(fd)
+            try:
+                named = os.lstat(staging)
+            except FileNotFoundError:
+                named = None
+            if named is None or (named.st_dev, named.st_ino) != (made.st_dev, made.st_ino):
+                print(f"ensure-switches: STOP  the new copy of {path} was swapped for something else while it "
+                      f"was written, which only a process running as the owner of {path.parent} can do; "
+                      "nothing was created")
+                return 1
+            # Fails if the file appeared meanwhile: never replace one. The link itself, never what it names.
+            if os.link in os.supports_follow_symlinks:
+                os.link(staging, path, follow_symlinks=False)
+            else:
+                os.link(staging, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(staging)
+    if source is not None:
+        print(f"ensure-switches: copied {source} to {path}, which is kept as it was: {describe(content)}")
+    else:
+        print(f"ensure-switches: created {path} with nothing switched off")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

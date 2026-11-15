@@ -1,0 +1,270 @@
+#!/opt/nervus/.venv/bin/python
+"""compare-refusals -- is a switched-off client refused exactly as a wrong token is?
+
+ADR-0003 item 8, checked on the machine. Run on the nervus machine (inside its
+container, if it has one), as root, with nervus's own venv; it can be fed in on
+standard input, so nothing has to be copied there first:
+
+    /opt/nervus/.venv/bin/python - <token id> < compare-refusals
+
+The token's value is read from nervus's token file on that machine and sent only to
+nervus on the same machine, so it never crosses the network or reaches the screen.
+
+The client must be on at the start. The script opens a session as that client,
+switches it off with nervus-ctl, compares, and switches it back on with
+nervus-ctl whatever happens. Both actions are audited as the operator's, as any
+use of nervus-ctl is.
+
+Each comparison sends one request three times: as the switched-off client, then
+with two made-up tokens. The two made-up ones are the control pair.
+- A connection request (initialize). nervus puts a fresh random mcp-session-id on
+  every such response, so that value is checked only for its form (32 hex digits).
+  Every other byte must match, in both pairs. This is the method the operator
+  agreed on 2026-10-05, recorded under ADR-0003 item 8.
+- Inside the session (tools/list, tools/call hosts). Byte for byte, nothing left out.
+Each set of three is sent again until all three responses carry the same date.
+
+Then timing (ADR-0003 decision D and item 9): --pairs connection requests (default
+200), each as the switched-off client and as a made-up token, in random order
+within each pair. They pass if neither median is under 50 ms and the switched-off
+one is slower in about half the pairs: within four standard deviations of a coin
+flip, which before decision D it was not (about 88% of pairs, measured locally).
+
+Exit 0: every comparison is equal. 1: a difference, shown, or the client could not
+be switched back on. 2: it could not run; nothing was compared.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import difflib
+import json
+import math
+import os
+import random
+import re
+import secrets
+import shlex
+import socket
+import statistics
+import sys
+import time
+from pathlib import Path
+
+from nervus import ctl
+from nervus.__main__ import parse_args
+from nervus.auth import load_tokens
+from nervus.config import ConfigError
+from nervus.switches import refusal
+
+PROTOCOL = "2025-06-18"
+INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": "compare-refusals", "version": "1"}}}
+LIST = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+CALL = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "hosts", "arguments": {}}}
+REFUSED = b'"code":-32001'
+SESSION = re.compile(rb"^(mcp-session-id: )([^\r\n]*)", re.IGNORECASE | re.MULTILINE)
+SESSION_FORM = re.compile(rb"[0-9a-f]{32}")
+DATE = re.compile(rb"^date: ([^\r\n]*)", re.IGNORECASE | re.MULTILINE)
+TRIES = 10
+REFUSAL_MS = 50  # ADR-0003 decision D
+
+
+class Stop(Exception):
+    """It cannot go on."""
+
+
+def address(unit: Path) -> tuple[str, int]:
+    """Where nervus listens, from its unit's ExecStart, read as ctl.read_unit reads it."""
+    lines = unit.read_text().replace("\\\n", " ").splitlines()
+    start = next(line for line in lines if line.startswith("ExecStart="))
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("NERVUS_")}
+    try:
+        args = parse_args(shlex.split(start.split("=", 1)[1])[1:])
+    finally:
+        os.environ.update(saved)
+    return {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(args.bind_host, args.bind_host), args.bind_port
+
+
+def post(where: tuple[str, int], token: str, message: dict, session: str | None = None) -> bytes:
+    """Send one request; return the response exactly as nervus sent it."""
+    host, port = where
+    body = json.dumps(message).encode()
+    head = ["POST /mcp HTTP/1.1", f"Host: {host}:{port}", "Content-Type: application/json",
+            "Accept: application/json, text/event-stream", f"Authorization: Bearer {token}"]
+    if session is not None:
+        head += [f"mcp-session-id: {session}", f"mcp-protocol-version: {PROTOCOL}"]
+    head += [f"Content-Length: {len(body)}", "Connection: close"]
+    with socket.create_connection((host, port), timeout=10) as s:
+        s.sendall(("\r\n".join(head) + "\r\n\r\n").encode() + body)
+        chunks = []
+        while chunk := s.recv(65536):
+            chunks.append(chunk)
+    response = b"".join(chunks)
+    if not response.startswith(b"HTTP/1.1 "):
+        raise Stop(f"nervus at {host}:{port} did not answer in plain HTTP, the only kind this script speaks")
+    return response
+
+
+def open_session(where: tuple[str, int], token: str) -> str:
+    """Connect as the client while it is on, and check it is served."""
+    response = post(where, token, INIT)
+    found = SESSION.search(response)
+    if REFUSED in response or b'"result"' not in response or found is None:
+        raise Stop("nervus did not serve this client's connection request")
+    session = found.group(2).decode()
+    post(where, token, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
+    if b'"result"' not in post(where, token, LIST, session):
+        raise Stop("nervus did not serve this client inside its session")
+    return session
+
+
+def three(where: tuple[str, int], message: dict, tokens: list[str], session: str | None) -> list[bytes]:
+    """The same request as each token, sent again until the responses share a date."""
+    for _ in range(TRIES):
+        got = [post(where, token, message, session) for token in tokens]
+        dates = {m.group(1) if (m := DATE.search(r)) else None for r in got}
+        if len(dates) == 1:
+            return got
+    raise Stop(f"in {TRIES} tries, three responses never came within the same second")
+
+
+def masked(response: bytes) -> bytes:
+    """The response with its session id's value replaced, if it has the form of one."""
+    return SESSION.sub(
+        lambda m: m.group(1) + (b"<32 hex digits>" if SESSION_FORM.fullmatch(m.group(2)) else m.group(2)),
+        response,
+    )
+
+
+def compare(name: str, responses: list[bytes], mask: bool) -> tuple[list[str], list[str]]:
+    """(what was found, what is wrong) for one set: switched off, made up, made up."""
+    seen = [masked(r) if mask else r for r in responses]
+    found, wrong = [], []
+    if REFUSED not in responses[0]:
+        wrong.append(f"{name}: the switched-off client was not refused")
+    for label, i, j in (("switched off / made up", 0, 1), ("made up / made up (control)", 1, 2)):
+        if seen[i] != seen[j]:
+            diff = difflib.unified_diff(
+                seen[i].decode(errors="replace").splitlines(), seen[j].decode(errors="replace").splitlines(),
+                *label.split(" / "), lineterm="")
+            wrong.append(f"{name}, {label}: DIFFERENT\n" + "\n".join(diff))
+        elif responses[i] == responses[j]:
+            found.append(f"{name}, {label}: identical, byte for byte")
+        else:
+            found.append(f"{name}, {label}: identical except the session id's value, the same form in both")
+    return found, wrong
+
+
+def comparisons(where: tuple[str, int], token: str, made_up: list[str], session: str) -> tuple[list[str], list[str], bytes]:
+    found, wrong, sample = [], [], b""
+    for name, message, in_session in (("initialize, a connection request", INIT, False),
+                                      ("tools/list, inside the session", LIST, True),
+                                      ("tools/call hosts, inside the session", CALL, True)):
+        responses = three(where, message, [token, *made_up], session if in_session else None)
+        sample = sample or masked(responses[0])
+        f, w = compare(name, responses, mask=not in_session)
+        found += f
+        wrong += w
+    return found, wrong, sample
+
+
+def timing(where: tuple[str, int], token: str, made_up: str, pairs: int) -> tuple[list[float], list[float]]:
+    """Milliseconds for each connection request, (switched off, made up), the order
+    within each pair chosen at random so neither always goes first."""
+    off, other = [], []
+    for _ in range(pairs):
+        order = [(off, token), (other, made_up)]
+        random.shuffle(order)
+        for into, value in order:
+            began = time.perf_counter()
+            post(where, value, INIT)
+            into.append((time.perf_counter() - began) * 1000)
+    return off, other
+
+
+def judge_timing(off: list[float], other: list[float]) -> tuple[str, list[str]]:
+    """(what was measured, what is wrong) for ADR-0003 item 9."""
+    n = len(off)
+    slower = sum(a > b for a, b in zip(off, other))
+    found = (f"timing, {n} connection requests each: switched off median {statistics.median(off):.3f} ms, "
+             f"made up median {statistics.median(other):.3f} ms; switched off slower in {slower} of {n} pairs")
+    wrong = []
+    if min(statistics.median(off), statistics.median(other)) < REFUSAL_MS:
+        wrong.append(f"timing: a refusal came back in under {REFUSAL_MS} ms (ADR-0003 decision D)")
+    if abs(slower / n - 0.5) > 4 * 0.5 / math.sqrt(n):
+        wrong.append(f"timing: switched off slower in {slower} of {n} pairs, more than four standard "
+                     "deviations from a coin flip, so its timing tells it apart")
+    return found, wrong
+
+
+def nervus_ctl(unit: Path, *argv: str) -> int:
+    return asyncio.run(ctl.run(["--unit", str(unit), *argv]))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="compare-refusals", description="ADR-0003 item 8 on the machine.")
+    parser.add_argument("--unit", type=Path, default=ctl.UNIT, help=f"nervus's unit file (default {ctl.UNIT})")
+    parser.add_argument("--pairs", type=int, default=200, help="timing pairs (default 200)")
+    parser.add_argument("token_id")
+    args = parser.parse_args(argv)
+
+    try:
+        service = ctl.read_unit(args.unit)
+        where = address(args.unit)
+        tokens = load_tokens(service.tokens)
+        token = next((value for value, t in tokens.items() if t.id == args.token_id), None)
+        if token is None:
+            raise Stop(f"no token {args.token_id!r}; tokens are {', '.join(sorted(t.id for t in tokens.values()))}")
+        why = refusal(service.switches, args.token_id)
+        if why is not None:
+            raise Stop(f"{args.token_id} is refused already ({why}); it must be on, so a session can be "
+                       "opened as it before it is switched off")
+        made_up = []
+        while len(made_up) < 2:
+            candidate = secrets.token_urlsafe(32)
+            if candidate not in tokens:
+                made_up.append(candidate)
+        session = open_session(where, token)
+    except (Stop, ConfigError, OSError) as exc:
+        print(f"compare-refusals: STOP  {exc}. Nothing was compared and nothing changed.")
+        return 2
+    print(f"compare-refusals: {args.token_id} is served, in session {session[:8]}…; switching it off")
+
+    if nervus_ctl(args.unit, "lock", args.token_id) != 0:
+        print("compare-refusals: STOP  nervus-ctl did not switch it off. Nothing was compared.")
+        return 2
+    try:
+        found, wrong, sample = comparisons(where, token, made_up, session)
+        if args.pairs > 0:
+            measured, slow = judge_timing(*timing(where, token, made_up[0], args.pairs))
+            found.append(measured)
+            wrong += slow
+    except (Stop, OSError) as exc:
+        found, wrong, sample = [], [f"could not finish: {exc}"], b""
+    finally:
+        # Switched back on whatever happened above, so a failed comparison never
+        # leaves a client off.
+        unlocked = nervus_ctl(args.unit, "unlock", args.token_id) == 0
+        back_on = unlocked and refusal(service.switches, args.token_id) is None
+
+    for line in found:
+        print(f"  {line}")
+    if sample:
+        print("\nThe switched-off client's refused connection request, as sent:\n")
+        print(sample.decode(errors="replace"))
+    for line in wrong:
+        print(f"compare-refusals: {line}")
+    if not back_on:
+        print(f"compare-refusals: WARNING  {args.token_id} may still be switched off; run "
+              f"nervus-ctl status, and nervus-ctl unlock {args.token_id} if it is")
+        return 1
+    if wrong:
+        return 1
+    print(f"compare-refusals: every comparison equal; {args.token_id} is on again")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

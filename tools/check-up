@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""check-up -- whether nervus, on this machine, answers as its clients need (ADR-0029 question 7).
+
+Run by install.sh --upgrade with the machine's own Python, after nervus starts on the new release
+and again if it goes back, so it needs nothing beyond Python's standard library:
+
+    python3 -I tools/check-up [--wait <seconds>] <nervus's root certificate> <MCP port> <web UI port>
+
+It asks nervus at 127.0.0.1, over HTTPS checked against nervus's own root (secrets/tls-root.crt),
+so that only nervus can answer:
+
+- its MCP endpoint, /mcp on the MCP port, with an initialize that carries no token, which nervus
+  refuses in its own words: JSON-RPC error -32001, "unauthorized". Anything else is not nervus
+  answering its clients, even with nervus's certificate.
+- its web UI, on the UI port, which answers a browser with no session by its sign-in page (200).
+
+A nervus just started takes a moment to begin listening, longer on a slow machine, so a connection
+refused is asked again, for up to a minute unless told otherwise (procedure 051, finding 3). Any other
+answer counts at once.
+
+nervus being active is not enough: it can be active and refusing every client (AGENTS.md rule 3).
+Which start lines say it refuses clients, and whether it stays on one main process, install.sh
+reads from systemd itself.
+
+Exit 0: both answered as nervus does, said in one line. Exit 1: what did not, on standard error.
+Exit 2: it could not run (its arguments).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import ssl
+import stat
+import sys
+import time
+import urllib.error
+import urllib.request
+
+INITIALIZE = (b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",'
+              b'"capabilities":{},"clientInfo":{"name":"install.sh","version":"1"}}}')
+# nervus holds a refusal for a moment (auth.py's _hold), so a slow answer is still an answer.
+TIMEOUT = 15
+# How long a nervus just started has to begin listening.
+WAIT = 60
+
+
+def _ask(request: urllib.request.Request, context: ssl.SSLContext) -> tuple[int, str]:
+    """The status and body of nervus's answer: one it refused with is an answer too."""
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT, context=context) as answer:
+            return answer.status, answer.read().decode(errors="replace")
+    except urllib.error.HTTPError as answer:
+        return answer.code, answer.read().decode(errors="replace")
+
+
+def _refused(exc: OSError) -> bool:
+    """Whether nothing is listening yet, the one failure worth asking again."""
+    return isinstance(getattr(exc, "reason", exc), ConnectionRefusedError)
+
+
+def _ask_once_it_listens(request: urllib.request.Request, context: ssl.SSLContext, deadline: float) -> tuple[int, str]:
+    while True:
+        try:
+            return _ask(request, context)
+        except OSError as exc:
+            if not _refused(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(1)
+
+
+def read_root(path: str) -> str:
+    """nervus's root certificate, opened without waiting and read only if it is a file. It sits in
+    a folder nervus's own account owns, which can put a pipe where the file was: given the name,
+    the TLS library would open it itself and wait there for ever, and the upgrade with it."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            what = "pipe" if stat.S_ISFIFO(mode) else "folder" if stat.S_ISDIR(mode) else "device"
+            raise OSError(f"it is a {what}, not a file")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as f:
+        return f.read().decode("ascii", errors="replace")
+
+
+def check(root: str, mcp_port: int, ui_port: int, wait: float = 0) -> list[str]:
+    """What did not answer as nervus does; empty when both did."""
+    context = ssl.create_default_context(cadata=read_root(root))
+    deadline = time.monotonic() + wait
+    failed = []
+    mcp = urllib.request.Request(
+        f"https://127.0.0.1:{mcp_port}/mcp", method="POST", data=INITIALIZE,
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+    try:
+        status, body = _ask_once_it_listens(mcp, context, deadline)
+        if not (re.search(r'"code":\s*-32001', body) and "unauthorized" in body):
+            failed.append(f"the MCP endpoint answered ({status}), but not with nervus's refusal: {body[:200]!r}")
+    except (OSError, ssl.SSLError) as exc:  # URLError is an OSError
+        failed.append(f"the MCP endpoint, https://127.0.0.1:{mcp_port}/mcp, did not answer: {exc}")
+    try:
+        status, _ = _ask_once_it_listens(urllib.request.Request(f"https://127.0.0.1:{ui_port}/"), context, deadline)
+        if status != 200:
+            failed.append(f"the web UI answered {status}, not its sign-in page")
+    except (OSError, ssl.SSLError) as exc:
+        failed.append(f"the web UI, https://127.0.0.1:{ui_port}/, did not answer: {exc}")
+    return failed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="check-up", description=__doc__.splitlines()[0])
+    parser.add_argument("root", help="nervus's root certificate, which its answers must be checked against")
+    parser.add_argument("mcp_port", type=int)
+    parser.add_argument("ui_port", type=int)
+    parser.add_argument("--wait", type=float, default=WAIT,
+                        help=f"seconds to go on asking while nothing listens (default {WAIT})")
+    args = parser.parse_args(argv)
+    try:
+        failed = check(args.root, args.mcp_port, args.ui_port, args.wait)
+    except (OSError, ssl.SSLError, ValueError) as exc:  # the root certificate cannot be read, or is empty
+        print(f"check-up: cannot read nervus's root certificate {args.root}: {exc}", file=sys.stderr)
+        return 1
+    if failed:
+        print("\n".join(f"check-up: {line}" for line in failed), file=sys.stderr)
+        return 1
+    print(f"nervus answers: MCP on {args.mcp_port} with its refusal of a call without a token, "
+          f"the web UI on {args.ui_port}, both over HTTPS checked against its root")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

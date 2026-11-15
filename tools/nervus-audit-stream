@@ -1,0 +1,107 @@
+#!/usr/bin/python3
+"""nervus-audit-stream -- the one thing the audit reader key can do (ADR-0009 decision 4).
+
+Installed on the nervus machine as a forced command: the reader account's authorized_keys
+line is
+
+    restrict,command="/usr/local/bin/nervus-audit-stream /var/log/nervus/audit.jsonl" ssh-ed25519 ...
+
+so whatever the copy's machine asks to run, sshd runs this instead and hands over what was
+asked in SSH_ORIGINAL_COMMAND. The log's path comes from that fixed command
+line, never from the copy's machine.
+
+The conversation. The copy's machine (the one keeping a copy of the log)
+sends one thing: how many bytes of the log it already
+holds, as a decimal number. The answer is one header line, then data:
+
+    OK <start> <end> <sha256>\\n<bytes start..end>
+        <sha256> is the SHA-256 of the log's first <start> bytes. The copy's machine compares
+        it with the SHA-256 of its own copy. If they differ, nervus's log was
+        edited after it was copied, which is what the copy exists to catch.
+        Only whole lines are sent, so <end> always follows a newline; a record
+        nervus is halfway through writing waits for the next pull.
+    SHRUNK <size>\\n
+        The log is shorter than what the copy holds: truncated or replaced.
+    ERR <reason>\\n
+        A malformed request, or the log could not be read.
+
+The log is opened without waiting, and must be a plain file. nervus's account
+owns the log's folder and can put a pipe or a folder at its name: waiting on
+the pipe would hold the copy's machine's connection open with nothing said,
+and its copy would stop growing with no alarm raised. It gets an ERR line,
+which raises one.
+
+The prefix, its hash and the data are all read through one open file
+descriptor, so they describe the same file even if it is replaced meanwhile.
+Standard library only: this runs on the nervus machine's system Python,
+not nervus's venv.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import stat
+import sys
+
+MAX_CHUNK = 8 * 1024 * 1024  # a pull that is further behind catches up over several
+BLOCK = 1024 * 1024
+_OFFSET = re.compile(r"[0-9]{1,15}")
+
+
+def reply(out, line: str, code: int) -> int:
+    out.write(line.encode() + b"\n")
+    out.flush()
+    return code
+
+
+def stream(log_path: str, request: str, out) -> int:
+    request = request.strip()
+    if not _OFFSET.fullmatch(request):
+        return reply(out, "ERR request must be one decimal byte offset", 2)
+    start = int(request)
+
+    try:
+        fd = os.open(log_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError as exc:
+        return reply(out, f"ERR cannot open the log: {exc.strerror}", 2)
+    mode = os.fstat(fd).st_mode
+    if not stat.S_ISREG(mode):
+        os.close(fd)
+        kind = "pipe" if stat.S_ISFIFO(mode) else "folder" if stat.S_ISDIR(mode) else "device"
+        return reply(out, f"ERR the log is a {kind}, not a file", 2)
+    with os.fdopen(fd, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        if start > size:
+            return reply(out, f"SHRUNK {size}", 3)
+
+        digest = hashlib.sha256()
+        remaining = start
+        while remaining:
+            block = f.read(min(BLOCK, remaining))
+            if not block:  # shorter than fstat said: changed underneath us
+                return reply(out, f"SHRUNK {start - remaining}", 3)
+            digest.update(block)
+            remaining -= len(block)
+
+        chunk = f.read(min(MAX_CHUNK, size - start))
+        cut = chunk.rfind(b"\n") + 1  # 0 when there is no complete line yet
+        if cut == 0 and len(chunk) == MAX_CHUNK:
+            return reply(out, f"ERR a line at offset {start} is longer than {MAX_CHUNK} bytes", 2)
+        data = chunk[:cut]
+
+    out.write(f"OK {start} {start + len(data)} {digest.hexdigest()}\n".encode())
+    out.write(data)
+    out.flush()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        return reply(sys.stdout.buffer, "ERR the forced command must name the log", 2)
+    return stream(argv[1], os.environ.get("SSH_ORIGINAL_COMMAND", ""), sys.stdout.buffer)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

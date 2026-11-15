@@ -1,0 +1,84 @@
+#!/bin/sh
+# nervus's read-only shell (ADR-0024 decision 1): the forced command of a
+# machine enrolled read-only. Its line in `agent`'s authorized_keys is
+#
+#   restrict,command="/usr/local/lib/nervus/readonly-shell" ssh-ed25519 <nervus's key> nervus
+#
+# so the machine's own SSH server runs this program, whatever nervus asks for,
+# with what nervus asked in SSH_ORIGINAL_COMMAND. Every command runs inside
+# bubblewrap (bwrap) with the whole filesystem read-only, enforced by the
+# kernel, except:
+#   - ~/.nervus, where nervus keeps each command's output and its jobs;
+#   - a private, empty /tmp and /dev/shm, gone when the command ends.
+# SFTP runs as `sftp-server -R`, which refuses every write, inside the same.
+#
+# It fails closed: no command, no bwrap, or a bwrap that cannot start (no
+# user namespaces), and nothing runs. It never runs a command outside the
+# sandbox. Background jobs survive: tmux's socket lives in ~/.nervus/tmux, so a
+# later command, in its own sandbox, finds the same tmux server.
+set -eu
+
+cmd=${SSH_ORIGINAL_COMMAND:-}
+if [ -z "$cmd" ]; then
+  echo "nervus read-only: this key runs commands only; no login shell" >&2
+  exit 1
+fi
+# Where the machine's AppArmor keeps programs from making user namespaces, as
+# Ubuntu's does since 24.04, enrollment gives nervus its own copy of bubblewrap,
+# which only agent may run, and a profile letting that copy alone make them
+# (ADR-0024 question 9). It runs with --disable-userns, so no command inside the
+# sandbox makes a namespace of its own. So does the system's bubblewrap, wherever
+# it knows the flag (0.8 and later): on Ubuntu 26.04, whose own profile lets it
+# through, and everywhere else (question 9, as amended after procedure 055).
+copy=/usr/local/lib/nervus/bwrap
+if [ -x "$copy" ]; then
+  bwrap=$copy isolate="--unshare-user --disable-userns"
+elif command -v bwrap >/dev/null 2>&1; then
+  bwrap=bwrap isolate=
+  case $(bwrap --help 2>&1) in
+    *--disable-userns*) isolate="--unshare-user --disable-userns" ;;
+  esac
+else
+  echo "nervus read-only: bwrap is not installed here, so nothing runs" >&2
+  exit 1
+fi
+
+work=$HOME/.nervus
+mkdir -p "$work/tmux"
+chmod 700 "$work" "$work/tmux"
+
+sandbox() {
+  # shellcheck disable=SC2086 # $isolate is two words, or none
+  # /run/user is masked so a command cannot reach agent's session bus and have the
+  # systemd --user manager -- which runs outside the sandbox, as the same user -- write
+  # for it (procedure 057, finding 5: a read-only escape found on Ubuntu 26.04, where
+  # that bus is within the sandbox's reach; on Debian it was not, but masking is harmless
+  # there). tmux's socket lives in ~/.nervus/tmux, not /run/user, so jobs are unaffected.
+  exec "$bwrap" $isolate \
+    --ro-bind / / \
+    --dev-bind /dev /dev \
+    --tmpfs /dev/shm \
+    --tmpfs /tmp \
+    --tmpfs /run/user \
+    --bind "$work" "$work" \
+    --setenv TMUX_TMPDIR "$work/tmux" \
+    --chdir "$HOME" \
+    -- "$@"
+}
+
+# An SFTP request arrives as the SSH server's own sftp line: its first word is
+# the server's path, or internal-sftp. A command merely mentioning one is not.
+case ${cmd%% *} in
+  internal-sftp | */sftp-server)
+    for server in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server \
+                  /usr/lib/ssh/sftp-server /usr/libexec/sftp-server; do
+      if [ -x "$server" ]; then
+        sandbox "$server" -R
+      fi
+    done
+    echo "nervus read-only: no sftp-server found here" >&2
+    exit 1
+    ;;
+esac
+
+sandbox /bin/bash -c "$cmd"

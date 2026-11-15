@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# proxmox-access -- give nervus its scoped Proxmox API access (ADR-0009 decision 2).
+#
+# Run as root on the Proxmox host, naming three things nothing here can assume
+# (ADR-0019): the node it runs on, the name nervus reaches the API by, and the
+# id of the container nervus runs in on this host, which the token is kept out of:
+#
+#   NODE=<node> API_HOST=<name> NERVUS_CT=<id> bash proxmox-access
+#
+# It can be fed in on standard input, so nothing has to be copied there first:
+#
+#   ssh root@<host> 'NODE=<node> API_HOST=<name> NERVUS_CT=<id> bash -s' < tools/proxmox-access
+#
+# It supports nervus running as a container on this same Proxmox host: it writes
+# the token into that container with `pct`.
+#
+# It stops at the first thing that is not as expected. In order:
+#
+#   1. Reads, changing nothing: that this is the node named; that no user, role
+#      or token named for nervus exists yet; that nervus's container is running
+#      and holds neither proxmox.yaml nor pve-root-ca.pem; that API_HOST resolves;
+#      and the full privilege list, read from the Administrator role on this
+#      machine rather than typed in.
+#   2. Creates role NervusScoped (every privilege except the 13 ADR-0009
+#      withholds), user nervus@pve (no password, so it cannot log in), and API
+#      token nervus@pve!nervus with privilege separation.
+#   3. Grants NervusScoped on / and NoAccess on /vms/<NERVUS_CT>, to both the user
+#      and the token: with privilege separation a token gets only what both hold.
+#      Storage holding nervus's own disk needs its NoAccess too, set separately.
+#   4. Has the nervus account write the token and Proxmox's root CA in nervus's
+#      container, as /opt/nervus/secrets/proxmox.yaml and pve-root-ca.pem, both
+#      0600 and nervus's own, and read each back to compare it with what was
+#      sent. The secret is never printed. It exists only in Proxmox and in
+#      that file (ADR-0009 consequence 3); if it is lost, make a new token.
+#   5. Verifies, read-only: the role's privileges; the token's effective
+#      permissions on / and /vms/<NERVUS_CT>; live API calls with the token,
+#      trusting only Proxmox's CA (the version answers, nervus's container is
+#      refused and missing from the guest list); and, from inside nervus's
+#      container, a TLS handshake to API_HOST:8006 with exactly the pin nervus
+#      will use.
+#
+# Nothing in nervus changes: the proxmox tool stays off until nervus is started
+# with --proxmox, and the inventory marks this host `hypervisor: proxmox`.
+#
+# To undo everything it creates:
+#   pveum user delete nervus@pve      # removes its token and their ACL entries
+#   pveum role delete NervusScoped
+#   pct exec <NERVUS_CT> -- rm -f /opt/nervus/secrets/proxmox.yaml /opt/nervus/secrets/pve-root-ca.pem
+set -uo pipefail
+
+EXPECTED_NODE=${NODE:-}
+FQDN=${API_HOST:-}
+API_PORT=8006
+NERVUS_CT=${NERVUS_CT:-}
+ROLE=NervusScoped
+USER_ID=nervus@pve
+TOKEN_NAME=nervus
+TOKEN_ID="$USER_ID!$TOKEN_NAME"
+SECRETS=/opt/nervus/secrets
+# Proxmox's own root CA. PROXMOX_CA exists for the tests, which run off Proxmox.
+CA=${PROXMOX_CA:-/etc/pve/pve-root-ca.pem}
+
+# ADR-0009 decision 2: the 13 privileges that would amount to root on the host,
+# and so to control of nervus.
+WITHHELD="Permissions.Modify User.Modify Group.Allocate Realm.Allocate Realm.AllocateUser
+Sys.Console Sys.Modify Sys.PowerMgmt Sys.Incoming Datastore.Allocate Mapping.Modify
+Mapping.Use SDN.Allocate"
+EXPECTED_ALL=47
+EXPECTED_GRANTED=34
+
+say()  { printf '[proxmox-access] %s\n' "$*"; }
+ok()   { printf '[proxmox-access]   ok  %s\n' "$*"; }
+die()  { printf '[proxmox-access] STOP  %s\n' "$*"; exit 1; }
+
+[ -n "$EXPECTED_NODE" ] && [ -n "$FQDN" ] && [ -n "$NERVUS_CT" ] \
+  || die "name all three: NODE=<node> API_HOST=<name nervus reaches the API by> NERVUS_CT=<nervus's container id> bash proxmox-access"
+[[ $NERVUS_CT =~ ^[0-9]+$ ]] && [ "$NERVUS_CT" -ge 100 ] || die "NERVUS_CT must be a container id, a number of 100 or more; got '$NERVUS_CT'"
+[[ $FQDN =~ ^[A-Za-z0-9.-]+$ ]] || die "API_HOST must be a host name or address; got '$FQDN'"
+[[ $EXPECTED_NODE =~ ^[A-Za-z0-9-]+$ ]] || die "NODE must be a node name; got '$EXPECTED_NODE'"
+
+# JSON is parsed with core Perl (JSON::PP): Proxmox is written in Perl, so it
+# is always there, which jq and python3 are not guaranteed to be. Values reach
+# the Perl code only through %ENV, never spliced into it: inside Perl's
+# double quotes "nervus@pve" would silently become "nervus".
+json() { perl -MJSON::PP -e 'my $d = decode_json(join "", <STDIN>); '"$1"; }
+export USER_ID ROLE
+
+# `pct exec` reads stdin, and the script itself may arrive on stdin, so the body
+# is one function that runs with stdin from /dev/null.
+main() {
+
+CREATED=""
+undo_hint() {
+  [ -z "$CREATED" ] && return
+  say "created so far:$CREATED"
+  say "to undo:  pveum user delete $USER_ID; pveum role delete $ROLE; pct exec $NERVUS_CT -- rm -f $SECRETS/proxmox.yaml $SECRETS/pve-root-ca.pem"
+}
+trap undo_hint EXIT
+
+# --- 1. read ------------------------------------------------------------------
+say "1. reading the Proxmox host before changing anything"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ "$(hostname -s)" = "$EXPECTED_NODE" ] || die "this is '$(hostname -s)', not '$EXPECTED_NODE'"
+ok "running as root on $EXPECTED_NODE ($(pveversion | head -1))"
+
+pvesh get /access/users --output-format json \
+  | json 'exit((grep { $_->{userid} eq $ENV{USER_ID} } @$d) ? 1 : 0)' \
+  || die "user $USER_ID already exists; nothing changed"
+ok "no user $USER_ID yet"
+
+ROLES_JSON=$(pvesh get /access/roles --output-format json) || die "could not read roles"
+printf '%s' "$ROLES_JSON" | json 'exit((grep { $_->{roleid} eq $ENV{ROLE} } @$d) ? 1 : 0)' \
+  || die "role $ROLE already exists; nothing changed"
+ok "no role $ROLE yet"
+
+ALL=$(printf '%s' "$ROLES_JSON" \
+  | json 'my ($a) = grep { $_->{roleid} eq "Administrator" } @$d; print join("\n", sort split /,/, $a->{privs}), "\n"')
+n_all=$(printf '%s\n' "$ALL" | grep -c .)
+[ "$n_all" -eq "$EXPECTED_ALL" ] \
+  || die "Administrator holds $n_all privileges, ADR-0009 was built on $EXPECTED_ALL; stop and re-read"
+for p in $WITHHELD; do
+  printf '%s\n' "$ALL" | grep -qx "$p" || die "withheld privilege '$p' does not exist on this Proxmox"
+done
+GRANTED=$(printf '%s\n' "$ALL" | grep -vxF -f <(printf '%s\n' $WITHHELD))
+n_granted=$(printf '%s\n' "$GRANTED" | grep -c .)
+[ "$n_granted" -eq "$EXPECTED_GRANTED" ] || die "role would hold $n_granted privileges, expected $EXPECTED_GRANTED"
+ok "$n_all privileges on this machine; the role will hold $n_granted and withhold 13"
+
+pct status "$NERVUS_CT" | grep -q 'status: running' || die "CT $NERVUS_CT is not running"
+pct exec "$NERVUS_CT" -- test -d "$SECRETS" || die "CT $NERVUS_CT has no $SECRETS"
+# Both names free: a file, a folder, or a link that leads nowhere at either is not as expected.
+for name in proxmox.yaml pve-root-ca.pem; do
+  pct exec "$NERVUS_CT" -- sh -c 'test ! -e "$1" && test ! -L "$1"' sh "$SECRETS/$name" \
+    || die "CT $NERVUS_CT already has $SECRETS/$name; nothing changed"
+done
+pct exec "$NERVUS_CT" -- id nervus >/dev/null || die "CT $NERVUS_CT has no nervus account"
+ok "CT $NERVUS_CT running, no proxmox.yaml or pve-root-ca.pem yet"
+
+getent hosts "$FQDN" >/dev/null || die "$FQDN does not resolve on this host"
+pct exec "$NERVUS_CT" -- getent hosts "$FQDN" >/dev/null || die "$FQDN does not resolve in CT $NERVUS_CT"
+[ -s "$CA" ] || die "no $CA"
+ok "$FQDN resolves here and in CT $NERVUS_CT; CA at $CA"
+
+# --- 2. create ----------------------------------------------------------------
+say "2. creating role, user and token"
+pveum role add "$ROLE" --privs "$(printf '%s\n' "$GRANTED" | paste -sd, -)" \
+  || die "could not create role $ROLE"
+CREATED="$CREATED role"
+ok "role $ROLE"
+
+pveum user add "$USER_ID" --comment "nervus MCP bastion, scoped API access (ADR-0009)" \
+  || die "could not create user $USER_ID"
+CREATED="$CREATED user"
+ok "user $USER_ID (no password)"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"; undo_hint' EXIT
+umask 077
+pveum user token add "$USER_ID" "$TOKEN_NAME" --privsep 1 \
+  --comment "nervus proxmox tool (ADR-0009)" --output-format json > "$WORK/token.json" \
+  || die "could not create token $TOKEN_ID"
+CREATED="$CREATED token"
+SECRET=$(json 'print $d->{value}' < "$WORK/token.json")
+rm -f "$WORK/token.json"
+[[ $SECRET =~ ^[0-9a-f-]{36}$ ]] || die "the new token's secret is not in the expected form"
+ok "token $TOKEN_ID, privilege separation on (secret not shown)"
+
+# --- 3. grant -----------------------------------------------------------------
+say "3. granting"
+pveum acl modify / --roles "$ROLE" --users "$USER_ID" --tokens "$TOKEN_ID" \
+  || die "could not grant $ROLE on /"
+ok "$ROLE on / for the user and the token"
+pveum acl modify "/vms/$NERVUS_CT" --roles NoAccess --users "$USER_ID" --tokens "$TOKEN_ID" \
+  || die "could not set NoAccess on /vms/$NERVUS_CT"
+ok "NoAccess on /vms/$NERVUS_CT for the user and the token"
+
+# --- 4. write into nervus's container ------------------------------------------
+say "4. writing the settings into CT $NERVUS_CT"
+{
+  printf '# Written by tools/proxmox-access on %s (ADR-0009 decision 2).\n' "$(date -u +%FT%TZ)"
+  printf 'url: https://%s:%s\n' "$FQDN" "$API_PORT"
+  printf 'token_id: "%s"\n' "$TOKEN_ID"
+  printf 'secret: "%s"\n' "$SECRET"
+  printf 'ca_file: pve-root-ca.pem\n'
+} > "$WORK/proxmox.yaml"
+printf 'Authorization: PVEAPIToken=%s=%s\n' "$TOKEN_ID" "$SECRET" > "$WORK/auth.hdr"
+unset SECRET
+
+# Written inside the container by the nervus account, from standard input given here: beside the
+# name, then renamed over it, 0600, and only if the whole file arrived. nervus owns this folder,
+# so root does nothing there by path: a link planted at either name would otherwise carry root's
+# write, and its chown, to whatever the link names (procedures 056 and 058). tools/proxmox-accounts
+# writes nervus's known_hosts the same way.
+put_as_nervus() {  # put_as_nervus <file here> <path in the container>
+  pct exec "$NERVUS_CT" -- runuser -u nervus -- sh -c \
+    'umask 077; t=$(mktemp "$1.XXXXXX") && cat > "$t" && [ -s "$t" ] && mv -f "$t" "$1" || { [ -z "$t" ] || rm -f "$t"; exit 1; }' \
+    sh "$2" < "$1"
+}
+# What the nervus account reads at the name, compared with what was sent, since nervus is who will
+# read it. Its account can put a link or a folder at a name while this runs; the file then lands
+# somewhere else, or nowhere, and this run must not call that written (procedure 060). It can
+# put a pipe there too, which a plain cmp would wait on for ever: the read is given 30 seconds
+# (--foreground, as this is run from a terminal: tools/proxmox-accounts says why).
+reads_back() {  # reads_back <file here> <path in the container>
+  pct exec "$NERVUS_CT" -- runuser -u nervus -- timeout --foreground 30 cmp -s - "$2" < "$1"
+}
+not_written() { die "what the nervus account reads at $1 is not what was written: something else was put at that name in CT $NERVUS_CT while this ran"; }
+put_as_nervus "$WORK/proxmox.yaml" "$SECRETS/proxmox.yaml" || die "could not write $SECRETS/proxmox.yaml"
+CREATED="$CREATED proxmox.yaml"
+reads_back "$WORK/proxmox.yaml" "$SECRETS/proxmox.yaml" || not_written "$SECRETS/proxmox.yaml"
+put_as_nervus "$CA" "$SECRETS/pve-root-ca.pem" || die "could not write $SECRETS/pve-root-ca.pem"
+CREATED="$CREATED pve-root-ca.pem"
+reads_back "$CA" "$SECRETS/pve-root-ca.pem" || not_written "$SECRETS/pve-root-ca.pem"
+rm -f "$WORK/proxmox.yaml"
+ok "$(pct exec "$NERVUS_CT" -- stat -c '%n %a %U:%G' "$SECRETS/proxmox.yaml" "$SECRETS/pve-root-ca.pem" | tr '\n' ';')"
+
+# --- 5. verify ------------------------------------------------------------------
+say "5. verifying"
+n_role=$(pvesh get /access/roles --output-format json \
+  | json 'my ($r) = grep { $_->{roleid} eq $ENV{ROLE} } @$d; my @p = split /,/, $r->{privs}; print scalar @p')
+[ "$n_role" -eq "$EXPECTED_GRANTED" ] || die "role holds $n_role privileges, expected $EXPECTED_GRANTED"
+for p in $WITHHELD; do
+  PRIV=$p pvesh get /access/roles --output-format json \
+    | PRIV=$p json 'my ($r) = grep { $_->{roleid} eq $ENV{ROLE} } @$d; exit((grep { $_ eq $ENV{PRIV} } split /,/, $r->{privs}) ? 1 : 0)' \
+    || die "role holds withheld privilege $p"
+done
+ok "role holds $n_role privileges, none of the 13 withheld"
+
+perm_count() {  # privileges the token effectively holds on exactly this path
+  pveum user token permissions "$USER_ID" "$TOKEN_NAME" --path "$1" --output-format json \
+    | ACLPATH=$1 json 'my $h = $d->{$ENV{ACLPATH}} || {}; print scalar grep { $h->{$_} } keys %$h'
+}
+n_root=$(perm_count /)
+n_ct=$(perm_count "/vms/$NERVUS_CT")
+[ "$n_root" -eq "$EXPECTED_GRANTED" ] || die "the token holds $n_root privileges on /, expected $EXPECTED_GRANTED"
+[ "$n_ct" -eq 0 ] || die "the token holds $n_ct privileges on /vms/$NERVUS_CT, expected 0"
+ok "token's effective permissions: $n_root on /, $n_ct on /vms/$NERVUS_CT"
+
+api() {  # api PATH -> prints HTTP status; body in $WORK/body. Trusts only Proxmox's CA.
+  curl -sS --cacert "$CA" -H @"$WORK/auth.hdr" -o "$WORK/body" -w '%{http_code}' \
+    "https://$FQDN:$API_PORT/api2/json$1"
+}
+code=$(api /version)
+[ "$code" = 200 ] || die "GET /version answered $code"
+ok "GET /version: 200, Proxmox $(json 'print $d->{data}{version}' < "$WORK/body")"
+
+code=$(api "/nodes/$EXPECTED_NODE/lxc/$NERVUS_CT/status/current")
+[ "$code" = 403 ] || die "CT $NERVUS_CT's status answered $code, expected 403"
+ok "GET CT $NERVUS_CT status: 403, refused by Proxmox"
+
+code=$(api "/cluster/resources?type=vm")
+[ "$code" = 200 ] || die "GET /cluster/resources answered $code"
+guests=$(json 'print join(" ", sort map { $_->{vmid} } @{$d->{data}})' < "$WORK/body")
+case " $guests " in *" $NERVUS_CT "*) die "the guest list includes $NERVUS_CT: $guests" ;; esac
+ok "guest list as the token sees it: ${guests:-<none>} (no $NERVUS_CT)"
+rm -f "$WORK/auth.hdr" "$WORK/body"
+
+tls=$(pct exec "$NERVUS_CT" -- timeout --foreground 60 /opt/nervus/.venv/bin/python -c "
+import socket, ssl
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.load_verify_locations('$SECRETS/pve-root-ca.pem')
+with socket.create_connection(('$FQDN', $API_PORT), timeout=5) as s:
+    with ctx.wrap_socket(s, server_hostname='$FQDN') as t:
+        print(t.version())
+") || die "CT $NERVUS_CT could not complete a pinned TLS handshake to $FQDN:$API_PORT"
+ok "from CT $NERVUS_CT: pinned TLS handshake to $FQDN:$API_PORT ($tls)"
+
+CREATED=""
+say "done. Nothing in nervus changed; the tool stays off until nervus runs with --proxmox."
+}
+
+main < /dev/null

@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# proxmox-accounts -- create `observer` and `agent` on a Proxmox host, for nervus
+# to reach it over SSH (ADR-0009 decisions 1 to 3).
+#
+# Run as root on the Proxmox host, naming what nothing here can assume (ADR-0019):
+#
+#   NODE=<node> SSH_HOST=<name nervus reaches this host by> NERVUS_CT=<nervus's container id> \
+#   NERVUS_CA_FP=<SHA256:... of nervus's SSH CA> HOST_KEY_FP=<SHA256:... of this host's ED25519 key> \
+#     bash proxmox-accounts [install-sudo]
+#
+# It can be fed in on standard input (`ssh root@<host> '<the names> bash -s' < proxmox-accounts`).
+# The two fingerprints are checked, not trusted: give each as you have it from somewhere
+# other than this host -- nervus's CA as a machine nervus enrolled holds it
+# (`ssh-keygen -lf ~agent/.ssh/authorized_keys` there), this host's key as your own
+# known_hosts has it -- so that a wrong key stops it.
+#
+# If sudo is not installed, it stops and says so; `install-sudo` installs it and goes on.
+#
+# The two accounts behind this host's two inventory entries:
+#   observer  no password, no sudo, groups adm and systemd-journal only. For
+#             diagnostics: processes, network, disks, logs (decision 2).
+#   agent     no password, passwordless sudo: root-equivalent, like `agent` on any
+#             other host nervus reaches, for one token only (decision 3), on an entry
+#             marked `issue: never`.
+# Both trust one line, `cert-authority` and nervus's SSH CA (ADR-0025 decision 4, as
+# enrollment writes it): each admits only the short certificates nervus signs for
+# each call, and this host's journal names the client behind every login. nervus's
+# key alone opens neither. This host's keys are pinned in nervus's known_hosts,
+# inside nervus's container.
+#
+# It supports nervus running as a container on this same Proxmox host: it reads
+# nervus's CA and writes its known_hosts with `pct exec`, as the nervus account.
+# nervus owns /opt/nervus/secrets, so a process running as nervus could put a
+# symbolic link there; root reads and writes nothing in it, and a link reaches
+# only what nervus could reach already (procedure 056). A nervus from before
+# ADR-0025 has no CA, and this stops. Nothing uses either account until the host
+# is in nervus's inventory and a token's allowlist.
+#
+# Verifies by logging in from nervus's container as the nervus service account,
+# with its key, a certificate signed for five minutes as the operator's, and its
+# known_hosts, strictly, as nervus will: observer reads the journal and the
+# process list, cannot use sudo, and cannot read nervus's secrets through host
+# paths (ADR-0009 verification 4); nervus's key without a certificate is refused.
+#
+# To undo:
+#   userdel -r observer; userdel -r agent; rm -f /etc/sudoers.d/agent
+#   and remove the <SSH_HOST> lines from /opt/nervus/secrets/known_hosts in nervus's container
+set -uo pipefail
+
+EXPECTED_NODE=${NODE:-}
+FQDN=${SSH_HOST:-}
+CT=${NERVUS_CT:-}
+SECRETS=/opt/nervus/secrets
+KNOWN_HOSTS=$SECRETS/known_hosts
+NERVUS_KEY=$SECRETS/nervus_ed25519
+NERVUS_CA=$SECRETS/nervus_ca_ed25519
+NERVUS_CA_FP=${NERVUS_CA_FP:-}
+HOST_KEY_FP=${HOST_KEY_FP:-}
+# This host's SSH host keys. PROXMOX_HOST_KEYS exists for the tests, which run off Proxmox.
+HOST_KEYS=${PROXMOX_HOST_KEYS:-/etc/ssh}
+OBSERVER_GROUPS=adm,systemd-journal
+
+say()  { printf '[proxmox-accounts] %s\n' "$*"; }
+ok()   { printf '[proxmox-accounts]   ok  %s\n' "$*"; }
+die()  { printf '[proxmox-accounts] STOP  %s\n' "$*"; exit 1; }
+# A file of nervus's in CT $CT, as the nervus account reads it, on standard output. That account
+# owns the folder and can put a pipe where a file was, which a plain cat would wait on for ever,
+# and this script with it. So what is not a file is refused by name, and a read is given 30
+# seconds, which ends one whose file was swapped after that look. Every other command below that
+# has nervus open one of its files is given a time in the same way. Always --foreground: this is
+# run from a terminal, where a plain timeout puts what it times in the background, and a read of
+# the terminal from there (a passphrase asked for, a line typed at ssh) stops the command and
+# timeout with it, for good (procedure 062).
+nervus_cat() {  # nervus_cat <path in the container>
+  # Said on standard error: standard output is the file's, and goes where the caller sends it.
+  pct exec "$CT" -- runuser -u nervus -- test -f "$1" \
+    || die "$1 in CT $CT is not a file, as the nervus account sees it; nothing more was changed" >&2
+  pct exec "$CT" -- runuser -u nervus -- timeout --foreground 30 cat "$1"
+}
+
+[ -n "$EXPECTED_NODE" ] && [ -n "$FQDN" ] && [ -n "$CT" ] && [ -n "$NERVUS_CA_FP" ] && [ -n "$HOST_KEY_FP" ] \
+  || die "name all five: NODE, SSH_HOST, NERVUS_CT, NERVUS_CA_FP and HOST_KEY_FP (see the top of this script)"
+[[ $CT =~ ^[0-9]+$ ]] && [ "$CT" -ge 100 ] || die "NERVUS_CT must be a container id, a number of 100 or more; got '$CT'"
+[[ $FQDN =~ ^[A-Za-z0-9.-]+$ ]] || die "SSH_HOST must be a host name or address; got '$FQDN'"
+[[ $EXPECTED_NODE =~ ^[A-Za-z0-9-]+$ ]] || die "NODE must be a node name; got '$EXPECTED_NODE'"
+for fp in "$NERVUS_CA_FP" "$HOST_KEY_FP"; do
+  [[ $fp =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || die "a fingerprint is SHA256: and 43 characters, as ssh-keygen -lf prints it; got '$fp'"
+done
+
+# `pct exec` reads stdin, and the script may arrive on stdin, so the body runs
+# with stdin from /dev/null.
+main() {
+MODE=${1:-}
+case "$MODE" in ""|install-sudo) ;; *) die "usage: proxmox-accounts [install-sudo]" ;; esac
+
+CREATED=""
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"; [ -n "$CREATED" ] && say "created so far:$CREATED -- see the undo lines in this script'"'"'s header"' EXIT
+
+# --- 1. read ------------------------------------------------------------------
+say "1. reading the Proxmox host before changing anything"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ "$(hostname -s)" = "$EXPECTED_NODE" ] || die "this is '$(hostname -s)', not '$EXPECTED_NODE'"
+for u in observer agent; do
+  getent passwd "$u" >/dev/null && die "user $u already exists; nothing changed"
+done
+[ -e /etc/sudoers.d/agent ] && die "/etc/sudoers.d/agent already exists; nothing changed"
+ok "no observer or agent account, no /etc/sudoers.d/agent"
+for g in adm systemd-journal; do getent group "$g" >/dev/null || die "group $g does not exist"; done
+ok "groups adm and systemd-journal exist"
+
+if ! command -v sudo >/dev/null; then
+  [ "$MODE" = install-sudo ] || die "sudo is not installed here. agent needs it. To install it and continue, add install-sudo"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q sudo >/dev/null || die "apt-get install sudo failed"
+  CREATED="$CREATED sudo-package"
+  ok "installed sudo ($(dpkg-query -W -f '${Version}' sudo))"
+else
+  ok "sudo present ($(dpkg-query -W -f '${Version}' sudo 2>/dev/null || echo unknown version))"
+fi
+
+sshd_t=$(sshd -T 2>/dev/null) || die "could not read sshd's effective settings"
+printf '%s\n' "$sshd_t" | grep -qx 'usepam yes' \
+  || die "sshd has UsePAM off: key logins to accounts with no password would be refused"
+printf '%s\n' "$sshd_t" | grep -qx 'pubkeyauthentication yes' || die "sshd has PubkeyAuthentication off"
+printf '%s\n' "$sshd_t" | grep -qiE '^(allowusers|allowgroups) ' \
+  && die "sshd restricts logins with AllowUsers/AllowGroups; the accounts would be refused"
+ok "sshd: UsePAM and PubkeyAuthentication on, no AllowUsers/AllowGroups"
+
+pct exec "$CT" -- runuser -u nervus -- test -f "$NERVUS_CA" \
+  || die "CT $CT has no $NERVUS_CA: a nervus from before ADR-0025, or one whose CA key was never made (docs/install.md)"
+pubkey=$(pct exec "$CT" -- runuser -u nervus -- timeout --foreground 30 ssh-keygen -y -f "$NERVUS_CA") \
+  || die "could not derive nervus's CA public key in CT $CT"
+printf '%s nervus-ca\n' "$pubkey" > "$WORK/nervus-ca.pub"
+fp=$(ssh-keygen -lf "$WORK/nervus-ca.pub" | awk '{print $2}')
+[ "$fp" = "$NERVUS_CA_FP" ] || die "nervus's CA in CT $CT is $fp, not $NERVUS_CA_FP as you gave it"
+printf 'cert-authority %s\n' "$(cat "$WORK/nervus-ca.pub")" > "$WORK/authorized_keys"
+ok "nervus's CA public key, derived in CT $CT: $fp, as you gave it"
+
+for t in ed25519 ecdsa rsa; do
+  [ -s "$HOST_KEYS/ssh_host_${t}_key.pub" ] || die "no $HOST_KEYS/ssh_host_${t}_key.pub"
+done
+hfp=$(ssh-keygen -lf "$HOST_KEYS/ssh_host_ed25519_key.pub" | awk '{print $2}')
+[ "$hfp" = "$HOST_KEY_FP" ] || die "this host's ED25519 host key is $hfp, not $HOST_KEY_FP as you gave it"
+ok "this host's key $hfp, as you gave it"
+
+pct exec "$CT" -- sh -c 'command -v ssh' >/dev/null || die "CT $CT has no ssh client to test with"
+nervus_cat "$KNOWN_HOSTS" > "$WORK/known_hosts" \
+  || die "could not read CT $CT's known_hosts"
+grep -q "^$FQDN " "$WORK/known_hosts" && die "CT $CT's known_hosts already has $FQDN; nothing changed"
+n_before=$(grep -c . "$WORK/known_hosts")
+ok "CT $CT's known_hosts: $n_before entries, none for $FQDN"
+
+# observer must not reach nervus's secrets through its container's disk. Tested
+# by trying, as `nobody`, rather than by reading modes: a locked parent
+# directory protects an open file, and an ACL can open a closed one. The disk is
+# found from the container's own configuration.
+rootfs=$(pct config "$CT" | sed -n 's/^rootfs: \([^,]*\).*/\1/p')
+[ -n "$rootfs" ] || die "CT $CT's configuration has no rootfs"
+CT_DISK=$(pvesm path "$rootfs") || die "could not find where CT $CT's disk $rootfs is"
+[ -e "$CT_DISK" ] || die "no $CT_DISK"
+if runuser -u nobody -- head -c 1 "$CT_DISK" >/dev/null 2>&1; then
+  [ -f "$CT_DISK" ] || die "CT $CT's disk $CT_DISK is readable by an unprivileged account; close it first"
+  imgdir=$(dirname "$(dirname "$CT_DISK")")   # the storage's images directory
+  say "  CT $CT's disk image is readable by an unprivileged account ($(stat -c '%a' "$CT_DISK") on the file,"
+  say "  $(stat -c '%a' "$imgdir") on $imgdir). Closing $imgdir to root only (ADR-0009 decision 2)."
+  chmod 0700 "$imgdir" || die "could not chmod $imgdir"
+  CREATED="$CREATED chmod-images"
+  runuser -u nobody -- head -c 1 "$CT_DISK" >/dev/null 2>&1 && die "still readable after chmod 0700 $imgdir"
+fi
+ok "CT $CT's disk image cannot be read by an unprivileged account"
+command -v tmux >/dev/null && ok "tmux present (exec_bg will work on this host)" \
+  || say "  note: tmux is not installed here; exec and job work, exec_bg will not"
+
+# --- 2. create ----------------------------------------------------------------
+say "2. creating the accounts"
+useradd -m -U -s /bin/bash -c "nervus scoped diagnostics (ADR-0009)" \
+  -G "$OBSERVER_GROUPS" observer || die "useradd observer failed"
+CREATED="$CREATED observer"
+useradd -m -U -s /bin/bash -c "nervus full access (ADR-0009)" agent || die "useradd agent failed"
+CREATED="$CREATED agent"
+for u in observer agent; do
+  [ "$(getent shadow "$u" | cut -d: -f2 | cut -c1)" = '!' ] || die "$u's password is not locked"
+done
+ok "observer: groups $(id -Gn observer | tr ' ' ',') ; agent: groups $(id -Gn agent | tr ' ' ',') ; both passwords locked"
+
+printf 'agent ALL=(ALL) NOPASSWD: ALL\n' > "$WORK/sudoers-agent"
+visudo -cqf "$WORK/sudoers-agent" || die "the sudoers line did not validate"
+install -m 0440 -o root -g root "$WORK/sudoers-agent" /etc/sudoers.d/agent
+CREATED="$CREATED sudoers"
+visudo -cq || die "the sudoers tree no longer validates; remove /etc/sudoers.d/agent now"
+ok "/etc/sudoers.d/agent (0440): agent ALL=(ALL) NOPASSWD: ALL; sudoers tree valid"
+
+for u in observer agent; do
+  home=$(getent passwd "$u" | cut -d: -f6)
+  install -d -m 0700 -o "$u" -g "$u" "$home/.ssh"
+  install -m 0600 -o "$u" -g "$u" "$WORK/authorized_keys" "$home/.ssh/authorized_keys"
+done
+ok "each account's authorized_keys trusts nervus's CA alone: cert-authority $fp"
+
+# --- 3. pin this host's keys in nervus's container -------------------------------
+say "3. pinning this host's keys in CT $CT"
+cp "$WORK/known_hosts" "$WORK/known_hosts.new"
+for t in ed25519 ecdsa rsa; do
+  printf '%s %s\n' "$FQDN" "$(awk '{print $1, $2}' "$HOST_KEYS/ssh_host_${t}_key.pub")" >> "$WORK/known_hosts.new"
+done
+# nervus writes it, from standard input given here, beside the old one and then renamed over it,
+# 0600: nothing is replaced unless the whole new file arrived.
+pct exec "$CT" -- runuser -u nervus -- sh -c \
+  'umask 077; t=$(mktemp "$1.XXXXXX") && cat > "$t" && [ -s "$t" ] && mv -f "$t" "$1" || { [ -z "$t" ] || rm -f "$t"; exit 1; }' \
+  sh "$KNOWN_HOSTS" < "$WORK/known_hosts.new" || die "could not write CT $CT's known_hosts"
+CREATED="$CREATED known_hosts"
+nervus_cat "$KNOWN_HOSTS" > "$WORK/known_hosts.after" \
+  || die "could not read CT $CT's known_hosts back"
+head -n "$n_before" "$WORK/known_hosts.after" | cmp -s - "$WORK/known_hosts" \
+  || die "CT $CT's existing known_hosts entries changed"
+ok "3 entries added for $FQDN; the $n_before existing entries unchanged; $(pct exec "$CT" -- runuser -u nervus -- stat -c '%a %U' "$KNOWN_HOSTS")"
+
+# --- 4. verify, as nervus will connect ---------------------------------------------
+say "4. logging in from CT $CT as the nervus service account"
+# A certificate for nervus's key, as nervus signs one for a call, valid five
+# minutes either side and named as the operator's check (ADR-0025, the
+# operator's choice at its step 3), in a folder of its own in CT $CT, removed
+# on the way out. It names both accounts, which nervus's own never do at once.
+# nervus reads its own public key (root only writes it into the folder root just
+# made), so a link at that name copies nothing nervus could not read already.
+CERT_DIR=$(pct exec "$CT" -- sh -c "d=\$(mktemp -d) && runuser -u nervus -- timeout --foreground 30 cat $NERVUS_KEY.pub > \"\$d/nervus_ed25519.pub\" && chown -R nervus \"\$d\" && \
+  runuser -u nervus -- timeout --foreground 30 ssh-keygen -q -s $NERVUS_CA -I 'operator proxmox-accounts' -n observer,agent \
+    -V -5m:+5m \"\$d/nervus_ed25519.pub\" && echo \"\$d\"") || die "could not sign a certificate in CT $CT"
+[[ $CERT_DIR =~ ^/[A-Za-z0-9/._-]+$ ]] || die "CT $CT's certificate folder is '$CERT_DIR'"
+trap 'pct exec "$CT" -- rm -rf "$CERT_DIR"; rm -rf "$WORK"; [ -n "$CREATED" ] && say "created so far:$CREATED -- see the undo lines in this script'"'"'s header"' EXIT
+as_nervus() {  # as_nervus USER COMMAND [plain]
+  local cert=(-o CertificateFile="$CERT_DIR/nervus_ed25519-cert.pub")
+  [ "${3:-}" = plain ] && cert=()
+  pct exec "$CT" -- runuser -u nervus -- timeout --foreground 60 ssh -F /dev/null -i "$NERVUS_KEY" ${cert[@]+"${cert[@]}"} -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+    -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 "$1@$FQDN" "$2"
+}
+out=$(as_nervus agent 'id -un; sudo -n id -un') || die "agent login or sudo failed"
+[ "$out" = "$(printf 'agent\nroot')" ] || die "agent answered: $out"
+ok "agent: logs in with a certificate nervus's CA signed, strict host check; 'sudo -n id -un' is root"
+for u in agent observer; do
+  as_nervus "$u" true plain >/dev/null 2>&1 && die "$u let nervus's key in without a certificate"
+done
+ok "agent and observer refuse nervus's key without a certificate"
+
+nervus_pid=$(pgrep -f '/opt/nervus/.venv/bin/nervus' | head -1)
+[ -n "$nervus_pid" ] || die "could not find nervus's process on this host"
+out=$(as_nervus observer "id -un
+id -Gn
+sudo -n true 2>/dev/null; echo sudo=\$?
+journalctl -n 1 --no-pager >/dev/null 2>&1; echo journal=\$?
+echo processes=\$(ps -e --no-headers | wc -l)
+cat /etc/pve/priv/authkey.key >/dev/null 2>&1; echo pvepriv=\$?
+head -c 1 $CT_DISK >/dev/null 2>&1; echo ctdisk=\$?
+ls /proc/$nervus_pid/root/opt/nervus/secrets >/dev/null 2>&1; echo ctroot=\$?") \
+  || die "observer login failed"
+printf '%s\n' "$out" > "$WORK/observer.out"
+get() { sed -n "s/^$1=//p" "$WORK/observer.out"; }
+[ "$(sed -n 1p "$WORK/observer.out")" = observer ] || die "observer answered: $out"
+groups=$(sed -n 2p "$WORK/observer.out")
+case " $groups " in *" sudo "*|*" disk "*|*" www-data "*|*" lxc "*) die "observer is in a group it must not be: $groups" ;; esac
+[ "$(get sudo)" != 0 ] || die "observer can use sudo"
+[ "$(get journal)" = 0 ] || die "observer cannot read the journal"
+[ "$(get pvepriv)" != 0 ] || die "observer can read /etc/pve/priv"
+[ "$(get ctdisk)" != 0 ] || die "observer can read CT $CT's disk image"
+[ "$(get ctroot)" != 0 ] || die "observer can reach nervus's secrets through /proc/$nervus_pid/root"
+ok "observer: logs in; groups '$groups'; sudo refused; journal readable; $(get processes) processes visible"
+ok "observer: cannot read /etc/pve/priv, CT $CT's disk image, or nervus's secrets via /proc/$nervus_pid/root"
+
+CREATED=""
+say "done. Nothing reaches these accounts until this host is in nervus's inventory and a token's allowlist."
+}
+
+main "$@" < /dev/null

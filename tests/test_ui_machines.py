@@ -1,0 +1,321 @@
+"""The UI's machines page (ADR-0024 step 4): adding a machine makes a one-time
+code and shows its two lines once; a machine's address can be changed; a
+machine removed is forgotten, with what takes nervus off it; tokens may name
+enrolled machines. Every change is audited, and undone if its record cannot
+be written, except a removal, which takes access away and stands. Driven
+through Starlette's test client, as the rest of the UI is."""
+
+import html
+import json
+import re
+import shlex
+
+import pytest
+from starlette.testclient import TestClient
+
+from nervus.audit import AuditLog
+from nervus.auth import Token, Tokens
+from nervus.database import Database
+from nervus.enrolled_hosts import EnrolledHostStore
+from nervus.enrollment_codes import EnrollmentCodes
+from nervus.host_enrollment import REMOVE_COMMANDS
+from nervus.pages import PLAIN_HTTP
+from nervus.ui import Machines, Management, build_ui
+
+ORIGIN = "https://nervus.example:8443"
+PIN = "sha256//47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+MACHINE = "0123456789abcdef0123456789abcdef"
+BY_HAND = ["node-a", "hv"]
+FILE_TOKENS = {"file-value": Token(id="codex-anywhere", client="codex", project="p", hosts=frozenset({"nas"}))}
+
+
+class World:
+    def __init__(self, tmp_path, pin=PIN, nervus_host=""):
+        self.db = Database(tmp_path / "nervus.db")
+        self.db.open()
+        self.audit = AuditLog(path=tmp_path / "audit.jsonl")
+        self.codes, self.store = EnrollmentCodes(self.db), EnrolledHostStore(self.db)
+        self.pin = pin
+        switches = tmp_path / "switches.yaml"
+        switches.write_text("lockdown: false\ndisabled: []\n")
+        self.tokens = Tokens(FILE_TOKENS, self.db.token)
+        self.machines = Machines(self.codes, self.store, lambda: self.pin, 8000, BY_HAND, nervus_host)
+        self.browser = TestClient(build_ui(
+            self.db, self.audit, secure=True, management=Management(self.tokens, switches, BY_HAND),
+            machines=self.machines), base_url=ORIGIN, follow_redirects=False)
+        link, _ = self.db.make_link()
+        assert self.browser.post("/signin", data={"link": link}, headers={"Origin": ORIGIN}).status_code == 303
+
+    def act(self, path="/machines", **fields):
+        token = re.search(r'name="form_token" value="([^"]*)"', self.browser.get(path).text).group(1)
+        return self.browser.post(path, data={"form_token": token, **fields}, headers={"Origin": ORIGIN})
+
+    def enroll(self, name="nas", level="standard", address="192.0.2.20"):
+        self.store.add(name, address=address, level=level, host_keys=[KEY], machine_id=MACHINE,
+                       enrolled_by="operator")
+
+    def break_audit(self):
+        """A folder where the log should be: every write to it fails."""
+        self.audit.path.unlink(missing_ok=True)
+        self.audit.path.mkdir()
+
+    def records(self, action):
+        if not self.audit.path.exists():
+            return []
+        rows = [json.loads(line) for line in self.audit.path.read_text().splitlines()]
+        return [r for r in rows if r.get("tool") == "ui" and r.get("action") == action]
+
+
+@pytest.fixture
+def world(tmp_path):
+    return World(tmp_path)
+
+
+def _lines(page):
+    return html.unescape(re.search(r"<pre class=\"lines\"><code>(.*?)</code></pre>", page, re.S).group(1))
+
+
+def _code(lines):
+    return re.search(r"/enroll/([A-Za-z0-9_-]+)", lines).group(1)
+
+
+# --- the page ---------------------------------------------------------------------------
+
+def test_signed_out_it_shows_only_how_to_sign_in(tmp_path, world):
+    stranger = TestClient(build_ui(world.db, world.audit, secure=True, machines=world.machines), base_url=ORIGIN)
+    assert "nervus-ctl signin" in stranger.get("/machines").text
+    assert stranger.post("/machines", data={"action": "add", "name": "x"}, headers={"Origin": ORIGIN}).status_code == 403
+
+
+def test_every_page_links_to_it(world):
+    assert '<a href="machines">Machines</a>' in world.browser.get("/").text
+
+
+def test_it_lists_enrolled_machines_and_names_those_described_by_hand(world):
+    world.enroll()
+    page = world.browser.get("/machines").text
+    assert "<code>nas</code>" in page and "192.0.2.20" in page and "standard" in page and MACHINE[:12] in page
+    assert "hosts.yaml" in page and "node-a, hv" in page
+
+
+def test_full_access_asks_whether_nervus_runs_on_that_machine(world):
+    """ADR-0025 question 3a: nervus cannot tell which machine hosts it, so the
+    choice of full access asks, where it is made."""
+    page = " ".join(html.unescape(world.browser.get("/machines").text).split())
+    assert ("Does nervus run on this machine, as a VM or container? Then a client given full access here can "
+            "rewrite nervus's audit log.") in page
+
+
+def test_read_only_is_the_level_offered_first(world):
+    page = world.browser.get("/machines").text
+    assert re.findall(r'name="level" value="([a-z-]+)"', page) == ["read-only", "standard", "full"]
+    assert 'value="read-only" checked' in page
+
+
+# --- adding -----------------------------------------------------------------------------
+
+def test_adding_shows_the_two_lines_once_and_the_code_in_them_works(world):
+    page = world.act(action="add", name="nas", confirm="nas", address="192.0.2.20", level="read-only")
+    assert page.status_code == 200 and "Add nas, read-only" in page.text
+    lines = _lines(page.text)
+    first, second = lines.strip().splitlines()
+    value = _code(first)
+    assert shlex.split(first) == ["curl", "-fsSk", "--pinnedpubkey", PIN, "-o", "nervus-enroll.sh",
+                                  f"https://nervus.example:8000/enroll/{value}"]
+    assert second == "less nervus-enroll.sh && sh nervus-enroll.sh"
+    code = world.codes.find(value)
+    assert (code.name, code.address, code.level, code.made_by) == ("nas", "192.0.2.20", "read-only", "operator")
+    later = world.browser.get("/machines").text
+    assert value not in later and "waiting for the machine" in later
+
+
+def test_the_making_is_audited_by_the_code_id_never_the_code(world):
+    page = world.act(action="add", name="nas", confirm="nas", address="", level="full")
+    value = _code(_lines(page.text))
+    record, = world.records("enrollment_code")
+    assert (record["target"], record["level"], record["actor"]) == ("nas", "full", "operator")
+    assert record["code_id"] == world.codes.find(value).id
+    assert record["machine_address"] == "where its report comes from" and record["address"]
+    assert value not in world.audit.path.read_text()
+
+
+def test_the_lines_name_nervus_as_its_ui_url_does(tmp_path):
+    world = World(tmp_path, nervus_host="2001:db8::5")
+    lines = _lines(world.act(action="add", name="nas", confirm="nas", level="standard").text)
+    assert "https://[2001:db8::5]:8000/enroll/" in lines
+
+
+@pytest.mark.parametrize("fields, says", [
+    (dict(name="Nas Box", level="standard"), "is not a name for a machine"),
+    (dict(name="nas", level="root"), "is not a level"),
+    (dict(name="nas", level="standard", address="http://nas"), "is not an IP address or a DNS name"),
+    (dict(name="node-a", level="standard"), "already a machine in hosts.yaml"),
+])
+def test_nothing_is_made_for_what_cannot_be_enrolled(world, fields, says):
+    page = world.act(action="add", **fields)
+    assert page.status_code == 400 and says in page.text and "No commands made" in page.text
+    assert world.codes.recent() == []
+
+
+def test_over_plain_http_no_commands_are_offered_or_made(world):
+    world.pin = None
+    page = world.browser.get("/machines").text
+    assert PLAIN_HTTP.split(",")[0] in page and 'value="add"' not in page
+    refused = world.act(action="add", name="nas", level="standard")
+    assert refused.status_code == 400 and world.codes.recent() == []
+
+
+def test_a_code_whose_making_cannot_be_audited_is_cancelled(world, tmp_path):
+    world.break_audit()
+    page = world.act(action="add", name="nas", confirm="nas", level="standard")
+    assert page.status_code == 500 and "nothing changed" in page.text
+    code, = world.codes.recent()
+    assert code.expires_at <= code.made_at + 5 and "expired" in world.browser.get("/machines").text
+
+
+def test_what_became_of_a_code_is_shown(world):
+    value = _code(_lines(world.act(action="add", name="nas", confirm="nas", level="standard").text))
+    code = world.codes.spend(value)
+    world.codes.finish(code.id, "enrolled nas, standard")
+    assert "enrolled nas, standard" in world.browser.get("/machines").text
+
+
+# --- changing an address ------------------------------------------------------------------
+
+def test_a_machine_that_moved_gets_its_new_address_and_keeps_its_keys(world):
+    world.enroll()
+    assert world.act(action="move", name="nas", address="192.0.2.21").status_code == 303
+    row = world.store.get("nas")
+    assert row.address == "192.0.2.21" and row.host_keys
+    record, = world.records("move_machine")
+    assert (record["target"], record["from"], record["to"]) == ("nas", "192.0.2.20", "192.0.2.21")
+
+
+def test_a_move_that_cannot_be_audited_is_undone(world):
+    world.enroll()
+    world.break_audit()
+    page = world.act(action="move", name="nas", address="192.0.2.21")
+    assert page.status_code == 500 and world.store.get("nas").address == "192.0.2.20"
+
+
+@pytest.mark.parametrize("fields, says", [(dict(name="nas", address="not an address"), "Not changed"),
+                                          (dict(name="nothing", address="192.0.2.1"), "no machine nothing")])
+def test_a_move_to_nowhere_or_of_nothing_is_refused(world, fields, says):
+    world.enroll()
+    page = world.act(action="move", **fields)
+    assert page.status_code == 400 and says in page.text and world.store.get("nas").address == "192.0.2.20"
+
+
+# --- removing ---------------------------------------------------------------------------
+
+def test_removing_needs_the_name_typed(world):
+    world.enroll()
+    page = world.act(action="remove", name="nas", confirm="na")
+    assert page.status_code == 400 and "type its name exactly" in page.text and world.store.get("nas")
+
+
+def test_a_removed_machine_is_forgotten_and_the_page_says_how_to_take_nervus_off_it(world):
+    world.enroll(level="full")
+    world.db.issue_token("laptop", "claude-code", "p", ["nas", "node-a"], taken=world.tokens.file_ids())
+    page = world.act(action="remove", name="nas", confirm="nas")
+    assert page.status_code == 200 and world.store.get("nas") is None
+    assert "nas is forgotten" in page.text and _lines(page.text) == REMOVE_COMMANDS
+    assert "These tokens still name nas: codex-anywhere, laptop." in page.text
+    record, = world.records("remove_machine")
+    assert (record["target"], record["level"], record["machine_id"]) == ("nas", "full", MACHINE)
+
+
+def test_a_removal_stands_without_its_record(world):
+    world.enroll()
+    world.break_audit()
+    assert world.act(action="remove", name="nas", confirm="nas").status_code == 200
+    assert world.store.get("nas") is None
+
+
+# --- what protects every change -----------------------------------------------------------
+
+def test_a_change_posted_from_another_site_or_without_the_form_token_is_refused(world):
+    world.enroll()
+    token = re.search(r'name="form_token" value="([^"]*)"', world.browser.get("/machines").text).group(1)
+    other = world.browser.post("/machines", data={"action": "remove", "name": "nas", "confirm": "nas",
+                                                  "form_token": token}, headers={"Origin": "https://evil.example"})
+    unsigned = world.browser.post("/machines", data={"action": "remove", "name": "nas", "confirm": "nas",
+                                                     "form_token": "x"}, headers={"Origin": ORIGIN})
+    assert other.status_code == unsigned.status_code == 403 and world.store.get("nas")
+
+
+def test_an_unknown_action_is_refused(world):
+    world.enroll()
+    assert world.act(action="explode", name="nas").status_code == 400
+
+
+# --- tokens may name enrolled machines (ADR-0024 decision 3) ------------------------------
+
+def test_the_token_form_offers_enrolled_machines_and_issues_for_them(world):
+    world.enroll()
+    offered = re.findall(r'name="hosts" value="([^"]+)"', world.browser.get("/clients").text)
+    assert offered == ["node-a", "hv", "nas"]
+    issued = world.act("/clients", action="issue", id="nas-reader", client="codex", project="p", hosts="nas")
+    assert issued.status_code == 200 and "Token issued: nas-reader" in issued.text
+    world.store.remove("nas")
+    assert "nas" not in re.findall(r'name="hosts" value="([^"]+)"', world.browser.get("/clients").text)
+    refused = world.act("/clients", action="issue", id="late", client="codex", project="p", hosts="nas")
+    assert refused.status_code == 400 and "Not in the inventory: nas" in refused.text
+
+
+# --- a reused name or a raised level is asked about (ADR-0024 question 8) ---------------
+
+def _issue(world, token_id, hosts):
+    world.db.issue_token(token_id, "claude-code", "p", hosts, taken=world.tokens.file_ids())
+
+
+def test_a_removed_name_that_tokens_still_name_is_asked_about_first(world):
+    """codex-anywhere, in the token file, names nas; no machine is enrolled as nas."""
+    page = world.act(action="add", name="nas", address="192.0.2.30", level="standard")
+    assert page.status_code == 200 and "Add nas?" in page.text
+    assert "codex-anywhere" in page.text and "No machine has the name nas now" in page.text
+    assert world.codes.recent() == [] and "/enroll/" not in page.text
+    assert re.search(r'name="confirm"', page.text)
+    # The form asks again with what was given, so nothing need be typed twice but the name.
+    assert 'name="address" value="192.0.2.30"' in page.text and 'name="level" value="standard"' in page.text
+
+
+def test_with_the_name_typed_the_code_is_made_and_its_record_lists_the_tokens_shown(world):
+    _issue(world, "laptop", ["nas"])
+    page = world.act(action="add", name="nas", level="standard", confirm="nas")
+    assert page.status_code == 200 and "Add nas, standard" in page.text and "/enroll/" in page.text
+    record, = world.records("enrollment_code")
+    assert record["tokens_shown"] == ["codex-anywhere", "laptop"]
+
+
+def test_the_name_typed_wrong_makes_nothing(world):
+    page = world.act(action="add", name="nas", level="standard", confirm="nas2")
+    assert "Add nas?" in page.text and world.codes.recent() == []
+
+
+def test_raising_a_level_that_tokens_reach_is_asked_about(world):
+    world.enroll(level="read-only")
+    page = world.act(action="add", name="nas", level="full")
+    assert "Add nas?" in page.text and "from read-only to full" in page.text and "codex-anywhere" in page.text
+    assert world.codes.recent() == []
+
+
+@pytest.mark.parametrize("level", ["standard", "read-only"])
+def test_adding_a_machine_again_at_its_own_or_a_lower_level_asks_nothing(world, level):
+    """A reinstall: add it again under its name; its tokens keep reaching it."""
+    world.enroll(level="standard")
+    page = world.act(action="add", name="nas", level=level)
+    assert "/enroll/" in page.text and "Add nas?" not in page.text
+    assert world.records("enrollment_code")[0]["tokens_shown"] == []
+
+
+def test_a_name_no_token_names_asks_nothing_whatever_it_had(world):
+    world.enroll(name="box", level="read-only")
+    assert "/enroll/" in world.act(action="add", name="box", level="full").text
+    assert "/enroll/" in world.act(action="add", name="newbox", level="full").text
+
+
+def test_the_page_says_a_reinstall_is_adding_it_again_not_removing_it(world):
+    shown = " ".join(world.browser.get("/machines").text.split())
+    assert "To reinstall a machine, add it again under its name too, without removing it" in shown

@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# nervus-trust -- save nervus's root on this machine, once, after comparing its fingerprint.
+#
+# nervus's TLS certificate comes from a small certificate authority of its own (ADR-0021):
+# a client trusts nervus by trusting that authority's root, one file. This reads the root
+# from nervus's own TLS handshake, prints its SHA-256, and saves it only when that matches
+# the value `nervus tls-init` printed, or `nervus tls-fingerprint` prints on nervus's machine.
+#
+# The read is unchecked on purpose: there is nothing on this machine yet to check it
+# against. The comparison is the check -- trust on first use, as with an SSH host key -- and
+# then nervus is checked against the root, with checking on, under the name given, before
+# anything is saved. It prints the setting each client needs, and changes nothing else.
+#
+# Claude Code takes one file of roots, and the one ~/.claude/settings.json names wins over the
+# environment. So beside each nervus's own root it keeps ~/.config/nervus/roots.pem, every root
+# saved there, and Claude Code is told that file: a second nervus (a friend's, or one restored at
+# another address) then needs this script again and a new session, not a new setting
+# (procedure 047, finding 1).
+#
+#   tools/nervus-trust https://<nervus>:8000/mcp [--expect <SHA-256>] [--resolve <name>:<port>:<address>]
+#                      [--out <file>] [--replace]
+#
+#   --expect   the root's SHA-256, as tls-init printed it; colons and case do not matter.
+#              Without it, the script asks, and saves only on "yes"
+#   --resolve  as curl's: reach <name> at <address>, for a name this machine cannot look up yet
+#   --out      where to save it, and the one file each client is told; default
+#              ~/.config/nervus/root-<nervus>.pem, gathered with the others into roots.pem
+#   --replace  replace a different root saved there before: another nervus, or a new root
+#
+# Needs bash, curl and openssl; macOS's own LibreSSL is enough.
+set -uo pipefail
+
+usage() { echo "usage: nervus-trust https://<nervus>:<port>/mcp [--expect <SHA-256>] [--resolve <name>:<port>:<address>] [--out <file>] [--replace]" >&2; exit 2; }
+
+URL= EXPECT= RESOLVE= OUT= REPLACE=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expect)  [ $# -ge 2 ] || usage; EXPECT=$2; shift 2 ;;
+    --resolve) [ $# -ge 2 ] || usage; RESOLVE=$2; shift 2 ;;
+    --out)     [ $# -ge 2 ] || usage; OUT=$2; shift 2 ;;
+    --replace) REPLACE=1; shift ;;
+    -*)        usage ;;
+    *)         [ -z "$URL" ] || usage; URL=$1; shift ;;
+  esac
+done
+[ -n "$URL" ] || usage
+case "$URL" in
+  https://*) rest=${URL#https://} ;;
+  *) echo "nervus-trust: give nervus's https:// address, not $URL: a root is only for HTTPS" >&2; exit 2 ;;
+esac
+host_port=${rest%%/*}
+case "$host_port" in
+  \[*\]:*) host=${host_port%%]*}; host=${host#[}; port=${host_port##*]:} ;;
+  \[*\])   host=${host_port#[}; host=${host%]}; port=443 ;;
+  *:*)     host=${host_port%%:*}; port=${host_port##*:} ;;
+  *)       host=$host_port; port=443 ;;
+esac
+
+red() { printf '\033[31m%s\033[0m' "$1"; }
+yel() { printf '\033[33m%s\033[0m' "$1"; }
+fail() { printf '  [%s] %s\n' "$(red 'FAIL')" "$1"; exit 1; }
+warn() { printf '  [%s] %s\n' "$(yel 'warn')" "$1"; }
+
+case "$host" in
+  *:*) ip=1; bracketed="[$host]" ;;                       # IPv6
+  *)   bracketed=$host; ip=; [[ $host =~ ^[0-9.]+$ ]] && ip=1 ;;
+esac
+connect="$bracketed:$port"
+RES=()
+if [ -n "$RESOLVE" ]; then
+  case "$RESOLVE" in
+    "$host:$port:"*) address=${RESOLVE#"$host:$port:"}
+                     case "$address" in *:*) connect="[${address#[}"; connect="${connect%]}]:$port" ;;
+                                        *)   connect="$address:$port" ;; esac
+                     RES=(--resolve "$RESOLVE") ;;
+    *) echo "nervus-trust: --resolve must name $host:$port, as $host:$port:<address>" >&2; exit 2 ;;
+  esac
+fi
+SNI=()
+[ -n "$ip" ] || SNI=(-servername "$host")   # a server name is a name, never an address
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/nervus-trust.XXXXXX") || fail "cannot make a temporary directory"
+trap 'rm -rf "$work"' EXIT
+
+# 1. The certificates nervus presents, read without checking them.
+openssl s_client -connect "$connect" ${SNI[@]+"${SNI[@]}"} -showcerts </dev/null >"$work/handshake" 2>"$work/err"
+awk -v d="$work" '
+  /-----BEGIN CERTIFICATE-----/ { n++; f = d "/cert" n ".pem" }
+  f { print > f }
+  /-----END CERTIFICATE-----/ { close(f); f = "" }
+  END { print n + 0 > (d "/count") }' "$work/handshake"
+count=$(cat "$work/count")
+if [ "$count" -eq 0 ]; then
+  fail "no certificate from $connect: $(head -1 "$work/err") -- is nervus running there, and serving HTTPS?"
+fi
+root=$work/cert$count.pem
+if [ "$count" -lt 2 ] || ! openssl x509 -in "$root" -noout -text 2>/dev/null | grep -q "CA:TRUE" \
+   || ! openssl verify -CAfile "$root" "$root" >/dev/null 2>&1; then
+  fail "what $host presented does not end with a root of its own, so there is nothing to save. A nervus made before ADR-0021 needs 'nervus tls-init --upgrade' on its machine; one with a certificate from a public authority needs no file"
+fi
+
+# 2. The comparison, which is the check.
+fp=$(openssl x509 -in "$root" -noout -fingerprint -sha256 | sed 's/^.*=//' | tr 'a-f' 'A-F')
+echo
+echo "nervus's root, as $host presented it:"
+echo
+echo "  root certificate SHA-256 $fp"
+echo
+echo "Compare it with the value 'nervus tls-init' printed, or that 'nervus tls-fingerprint' prints"
+echo "on nervus's machine. Not with anything shown over the network: that is what is being checked."
+echo
+norm() { printf '%s' "$1" | tr -d ': ' | tr 'a-f' 'A-F'; }
+if [ -n "$EXPECT" ]; then
+  [ "$(norm "$EXPECT")" = "$(norm "$fp")" ] \
+    || fail "it does not match the value given with --expect, so nothing was saved. Do not trust this root: something other than your nervus may have answered"
+else
+  printf 'Does it match? Type yes to save it: '
+  read -r answer || answer=
+  [ "$answer" = yes ] || fail "not saved"
+fi
+
+# 3. nervus, checked against the root, by the name given, before anything is saved.
+if ! err=$(curl -sS -o /dev/null --max-time 10 --cacert "$root" ${RES[@]+"${RES[@]}"} "https://$bracketed:$port/" 2>&1); then
+  err=${err%%$'\n'*}; err=${err#curl: }; err=${err#\(*\) }
+  fail "nervus does not check out against that root as $host: $err -- is $host one of the names its certificate is for? Nothing was saved"
+fi
+
+# 4. Saved, readable by anyone: a root is not a secret.
+safe=$(printf '%s' "$host" | tr ':' '-')
+folder=${XDG_CONFIG_HOME:-$HOME/.config}/nervus
+BUNDLE=
+[ -n "$OUT" ] || { OUT=$folder/root-$safe.pem; BUNDLE=$folder/roots.pem; }
+if [ -e "$OUT" ]; then
+  have=$(openssl x509 -in "$OUT" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr 'a-f' 'A-F')
+  if [ "$have" = "$fp" ]; then
+    echo "This root is already saved, at $OUT."
+  elif [ -z "$REPLACE" ]; then
+    fail "a different root is already saved at $OUT. If nervus has a new root, or this is another nervus, give --replace, or --out for another file"
+  fi
+fi
+if [ "${have:-}" != "$fp" ]; then
+  mkdir -p "$(dirname "$OUT")" || fail "cannot make $(dirname "$OUT")"
+  cp "$root" "$OUT.new" && chmod 0644 "$OUT.new" && mv "$OUT.new" "$OUT" || fail "cannot write $OUT"
+  echo "Saved nervus's root at $OUT."
+fi
+
+# 5. Every root saved here, in the one file Claude Code is told, made again each time: a root
+#    replaced leaves it too. Each is read as a certificate, so nothing else gets in.
+CLAUDE_FILE=$OUT
+if [ -n "$BUNDLE" ]; then
+  : > "$BUNDLE.new" || fail "cannot write $BUNDLE"
+  for f in "$folder"/root-*.pem; do
+    openssl x509 -in "$f" >> "$BUNDLE.new" 2>/dev/null || warn "$f is not a certificate, so it is not in $BUNDLE"
+  done
+  chmod 0644 "$BUNDLE.new" && mv "$BUNDLE.new" "$BUNDLE" || fail "cannot write $BUNDLE"
+  echo "$BUNDLE holds every nervus root saved there: $(grep -c 'BEGIN CERTIFICATE' "$BUNDLE")."
+  CLAUDE_FILE=$BUNDLE
+fi
+
+# 6. What each client needs: its own setting, never the system's trust store (ADR-0021 F1).
+echo
+echo "Tell each client on this machine, then restart it:"
+echo
+echo "  Claude Code, in ~/.claude/settings.json:  \"env\": {\"NODE_EXTRA_CA_CERTS\": \"$CLAUDE_FILE\"}"
+echo "  Codex, in its environment:                CODEX_CA_CERTIFICATE=$OUT"
+echo "                                            (not SSL_CERT_FILE, which replaces Codex's other roots)"
+echo "  tools/nervus-status:                      NERVUS_CACERT=$OUT"
+echo
+# Claude Code reads one file: the one its settings name, which wins over the environment's.
+settings=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+named= where=
+[ -f "$settings" ] && named=$(sed -n 's/.*"NODE_EXTRA_CA_CERTS"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings" | head -1)
+if [ -n "$named" ]; then
+  where="$settings sets NODE_EXTRA_CA_CERTS to $named, and it wins over the environment"
+elif [ -n "${NODE_EXTRA_CA_CERTS:-}" ]; then
+  named=$NODE_EXTRA_CA_CERTS where="NODE_EXTRA_CA_CERTS is already set, to $named"
+fi
+if [ -n "$named" ] && [ "$named" != "$CLAUDE_FILE" ]; then
+  case "$named" in
+    "$folder"/root-*.pem) instead="set it to $CLAUDE_FILE" ;;  # one nervus's root: never add others to it
+    *) instead="set it to $CLAUDE_FILE, or, if that file holds a root you need besides nervus's (a company's, say), add nervus's to it: cat '$CLAUDE_FILE' >> '$named'" ;;
+  esac
+  warn "$where: Claude Code reads one file, and trusts what it holds and nothing more. To reach this nervus, $instead"
+fi

@@ -1,0 +1,52 @@
+# nervus's inventory: the machines nervus may reach, read once at start.
+#
+# Copy to /opt/nervus/hosts.yaml and edit. Every field below is required except the last
+# two. nervus never contacts a host to fill these in: a value is only as good as where you
+# read it, so say so in a comment beside it, with the date (rule 2 in AGENTS.md).
+#
+#   name        what clients call the host, in `exec`, `get` and their token's allowlist
+#   address     the name nervus reaches it by. Prefer a DNS name to an address a DHCP
+#               server may move
+#   os, role    free text, shown to clients by the `hosts` tool
+#   agent_user  the account nervus logs in as: `agent`, made by docs/install.md step 4
+#   status      free text, such as `onboarded`
+#   hypervisor  optional: `proxmox` marks the one entry whose allowlist gates the
+#               `proxmox` tool (ADR-0019 decision D). nervus refuses to start on a value it
+#               does not know, or on two entries marked `proxmox`
+#   issue       optional: `never` marks an entry the web UI never issues a token for, such
+#               as root on the Proxmox host (ADR-0009 decision 3)
+
+hosts:
+  - name: node-a
+    address: node-a.home.example.net
+    os: Debian 13
+    role: builds and tests
+    agent_user: agent
+    status: onboarded
+    # Read off node-a over SSH on <date>.
+
+  - name: node-b
+    address: node-b.home.example.net
+    os: Ubuntu 26.04 LTS
+    role: inference
+    agent_user: agent
+    status: onboarded
+
+  # A Proxmox host, if you have one, as two entries for one machine (ADR-0009):
+  # the scoped one, a shell without sudo plus the `proxmox` tool, for every client;
+  # and root, for one client at most, never issued from the UI.
+  - name: hv
+    address: hv.home.example.net
+    os: Proxmox VE 9
+    role: Proxmox VE host
+    agent_user: observer
+    status: onboarded
+    hypervisor: proxmox
+
+  - name: hv-root
+    address: hv.home.example.net
+    os: Proxmox VE 9
+    role: root on the Proxmox VE host, nervus's own container included
+    agent_user: agent
+    status: onboarded
+    issue: never

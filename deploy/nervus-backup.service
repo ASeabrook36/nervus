@@ -1,0 +1,21 @@
+# systemd unit for nervus's backup (ADR-0027 question 4), started once a day by
+# nervus-backup.timer, and the same as `nervus-ctl backup` run by hand.
+#
+# It runs as root only to read nervus's unit; nervus-ctl makes the backup as
+# the account nervus runs as, which reads everything it backs up and writes
+# only its state folder and its audit log. The backup is locked to the
+# recovery key's public half; nothing here can open it.
+
+[Unit]
+Description=nervus backup (ADR-0027)
+After=nervus.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/nervus/.venv/bin/nervus-ctl backup
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nervus /var/log/nervus
+UMask=0077
