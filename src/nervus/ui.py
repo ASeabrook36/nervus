@@ -38,6 +38,11 @@ What protects it, beyond the link itself:
 - Sign-ins, refused links and sign-outs are audited, actor "operator", with
   the browser's address and the link and session by their audit ids
   (decision 6). A sign-in whose record cannot be written is undone.
+- Every form refused is audited too, as a refusal: the page, the action asked
+  and why not, with the machine, token or range it named. Its fields are named
+  one by one, never taken from the form, which can hold a password. A post
+  that carries no session is refused without a record, as a call with no token
+  is: anyone who can reach the port could otherwise write to the audit log.
 - Connect is audited the same way before nervus contacts the machine: the
   name, the address it reaches out to and the level. Without that record it
   contacts nothing (ADR-0001 section 10).
@@ -73,7 +78,7 @@ from starlette.routing import Route
 from nervus.audit import AuditError, AuditLog
 from nervus import restore
 from nervus.audit_view import Cursor, Query, read_page, read_row
-from nervus.backup import made_at as backup_made_at
+from nervus.backup import kept as backup_kept, made_at as backup_made_at
 from nervus.config import ConfigError
 from nervus.auth import Tokens
 from nervus.clients import clients_view
@@ -132,6 +137,9 @@ SECURITY_HEADERS = {
 MAX_BODY_BYTES = 64 * 1024
 
 REFUSED_LINK = "That link cannot be used. A link works once, within 5 minutes; make another with nervus-ctl signin."
+ANOTHER_SITE = "posted from another site, not from nervus's own page"
+NO_FORM_TOKEN = "posted without the token nervus's own page carries for this session"
+_ACTION = re.compile(r"[a-z][a-z-]{0,31}")
 
 
 def _position(text: str | None) -> int | None:
@@ -265,6 +273,34 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
     def refused() -> PlainTextResponse:
         return PlainTextResponse("Refused: this request did not come from nervus's own page.", status_code=403)
 
+    def refusal(request: Request, page_name: str, action: str, reason: str, **named: object) -> None:
+        """A form that changed nothing, on record: the page, what was asked and
+        why not, as a client's refused call is (ADR-0001 section 10; ADR-0012
+        decision 6 as amended). `named` is what the form was about, given one by
+        one by the caller and never taken from the form whole, which on the
+        login holds a password. A refusal changes nothing, so it stands whether
+        or not its record can be written."""
+        fields = {"actor": "operator", "page": page_name,
+                  "action": action if _ACTION.fullmatch(action) else "(not an action nervus knows)",
+                  **{name: value for name, value in named.items() if value not in ("", None)},
+                  "reason": reason, "address": address(request)}
+        try:
+            audit.record_refusal("ui", fields)
+        except AuditError as exc:
+            print(f"nervus: a refusal in the UI was not audited: {exc}", file=sys.stderr, flush=True)
+
+    async def not_ours(request: Request, page_name: str, why: str, action: str | None = None) -> PlainTextResponse:
+        """A post that did not come from nervus's own page: refused, and
+        recorded where the browser carries a session, since a signed-in browser
+        was then made to send it. With no session there is no record, as for a
+        call with no token: anyone who can reach the port could otherwise write
+        to the audit log."""
+        if await session_of(request) is not None:
+            if action is None:
+                action = str((await request.form()).get("action", ""))
+            refusal(request, page_name, action, why)
+        return refused()
+
     async def session_of(request: Request) -> tuple[str, Session] | None:
         value = request.cookies.get(cookie)
         if not value:
@@ -323,7 +359,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
 
     async def signin(request: Request) -> Response:
         if not same_origin(request):
-            return refused()
+            return await not_ours(request, "signin", ANOTHER_SITE, action="signin")
         link = await form_field(request, "link")
         where = address(request)
         try:
@@ -348,13 +384,13 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
 
     async def signout(request: Request) -> Response:
         if not same_origin(request):
-            return refused()
+            return await not_ours(request, "signout", ANOTHER_SITE, action="signout")
         found = await session_of(request)
         token = await form_field(request, "form_token")
         if found is not None:
             value, _ = found
             if not hmac.compare_digest(token, form_token(value)):
-                return refused()
+                return await not_ours(request, "signout", NO_FORM_TOKEN, action="signout")
             await anyio.to_thread.run_sync(database.sign_out, value)
             try:
                 audit.record_operator("signout", {"session": audit_id(value), "address": address(request)},
@@ -442,7 +478,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
 
     async def manage(request: Request) -> Response:
         if not same_origin(request):
-            return refused()
+            return await not_ours(request, "clients", ANOTHER_SITE)
         found = await signed_in(request)
         if isinstance(found, RedirectResponse):
             return found  # setup first: nothing here changes (ADR-0015 decision A)
@@ -451,7 +487,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         value, session, standing = found
         form = await request.form()
         if not hmac.compare_digest(str(form.get("form_token", "")), form_token(value)):
-            return refused()
+            return await not_ours(request, "clients", NO_FORM_TOKEN)
         action, token_id = str(form.get("action", "")), str(form.get("id", ""))
         where = {"address": address(request)}
         try:
@@ -514,12 +550,15 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             else:
                 raise _Refused("That is not an action nervus knows.")
         except _Refused as exc:
+            refusal(request, "clients", action, str(exc), target=token_id)
             return await clients_page(request, value, session, str(exc), 400)
         except SwitchesSwapped as exc:
+            refusal(request, "clients", action, f"Nothing changed: {exc}.", target=token_id)
             return await clients_page(request, value, session, f"Nothing changed: {exc}.", 409)
         except SwitchesUnreadable as exc:
-            return await clients_page(request, value, session,
-                                      f"Nothing changed: the switch file is unreadable ({exc}).", 409)
+            said = f"Nothing changed: the switch file is unreadable ({exc})."
+            refusal(request, "clients", action, said, target=token_id)
+            return await clients_page(request, value, session, said, 409)
         return RedirectResponse("clients", status_code=303)
 
     # --- machines (ADR-0024) ----------------------------------------------------------
@@ -590,7 +629,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
 
     async def manage_machines(request: Request) -> Response:
         if not same_origin(request):
-            return refused()
+            return await not_ours(request, "machines", ANOTHER_SITE)
         found = await signed_in(request)
         if isinstance(found, RedirectResponse):
             return found  # setup first: nothing here changes (ADR-0015 decision A)
@@ -599,7 +638,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         value, session, standing = found
         form = await request.form()
         if not hmac.compare_digest(str(form.get("form_token", "")), form_token(value)):
-            return refused()
+            return await not_ours(request, "machines", NO_FORM_TOKEN)
         action, name = str(form.get("action", "")), str(form.get("name", "")).strip()
         where = {"address": address(request)}
         try:
@@ -664,6 +703,9 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             else:
                 raise _Refused("That is not an action nervus knows.")
         except _Refused as exc:
+            # Named one by one: on the login this form holds a password, which goes in no record.
+            refusal(request, "machines", action, str(exc), target=name,
+                    machine_address=str(form.get("address", "")).strip(), level=str(form.get("level", "")))
             return await machines_page(value, session, str(exc), 400)
         return RedirectResponse("machines", status_code=303)
 
@@ -725,10 +767,13 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                  "key_file": key_file(key),
                  "confirm": confirm, "confirmed_level": confirmed_level, **framing}
         if not LOGIN.fullmatch(account):
-            return page(page_enroll_login(notice="Give the admin account to log in as: root, or an account that "
-                                                 "can use sudo. Nothing was sent.", **again), 400)
+            said = "Give the admin account to log in as: root, or an account that can use sudo. Nothing was sent."
+            refusal(request, "machines", action, said, target=name, machine_address=at, level=level)
+            return page(page_enroll_login(notice=said, **again), 400)
         if not password:
-            return page(page_enroll_login(notice="Give that account's password. Nothing was sent.", **again), 400)
+            said = "Give that account's password. Nothing was sent."
+            refusal(request, "machines", action, said, target=name, machine_address=at, level=level)
+            return page(page_enroll_login(notice=said, **again), 400)
         try:
             code_value, code = await anyio.to_thread.run_sync(lambda: machines.codes.make(
                 name=name, address=at, level=level, made_by="operator", reserved=machines.by_hand, login=account,
@@ -804,14 +849,14 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         warning, or change the tier, is undone if its record cannot be
         written; a withdrawal only makes the warning louder, so it stands."""
         if not same_origin(request):
-            return refused()
+            return await not_ours(request, "setup", ANOTHER_SITE)
         found = await session_of(request)
         if found is None or setup is None:
             return refused()
         value, session = found
         form = await request.form()
         if not hmac.compare_digest(str(form.get("form_token", "")), form_token(value)):
-            return refused()
+            return await not_ours(request, "setup", NO_FORM_TOKEN)
         action, where = str(form.get("action", "")), {"address": address(request)}
         try:
             if action == "tier":
@@ -838,9 +883,9 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                                {"target": str(ipaddress.ip_network(network.strip(), strict=False)), **where})
             else:
                 raise _Refused("That is not an action nervus knows.")
-        except SetupRefused as exc:
-            return await setup_page(value, session, str(exc), 400)
-        except _Refused as exc:
+        except (SetupRefused, _Refused) as exc:
+            refusal(request, "setup", action, str(exc),
+                    target=str(form.get("tier" if action == "tier" else "network", "")))
             return await setup_page(value, session, str(exc), 400)
         return RedirectResponse("setup", status_code=303)
 
@@ -869,9 +914,10 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         name = request.query_params.get("download")
         if name is None:
             return await backups_page(value, session, standing)
-        # Only a name the folder holds: never a path from the address.
+        # Only a name the folder holds: never a path from the address. A backup's own name, or the
+        # name one is kept under from before an upgrade (ADR-0029 step 7).
         path = backups.folder / name
-        if backup_made_at(name) is None or not path.is_file():
+        if _backup_made(name) is None or not path.is_file():
             return PlainTextResponse("No such backup.", status_code=404)
         try:
             audit.record_operator("backup_download", {"file": name, "address": address(request)}, tool="ui")
@@ -887,7 +933,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
 
     async def manage_backups(request: Request) -> Response:
         if not same_origin(request):
-            return refused()
+            return await not_ours(request, "backups", ANOTHER_SITE)
         found = await signed_in(request)
         if isinstance(found, RedirectResponse):
             return found  # setup first: nothing here changes (ADR-0015 decision A)
@@ -896,12 +942,17 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         value, session, standing = found
         form = await request.form()
         if not hmac.compare_digest(str(form.get("form_token", "")), form_token(value)):
-            return refused()
-        if str(form.get("action", "")) != "make":
+            return await not_ours(request, "backups", NO_FORM_TOKEN)
+        action = str(form.get("action", ""))
+        if action != "make":
+            refusal(request, "backups", action, "That is not an action nervus knows.")
             return await backups_page(value, session, standing, "That is not an action nervus knows.", 400)
         try:
             await anyio.to_thread.run_sync(backups.make)
         except ConfigError as exc:
+            # Where the backup's own record was written, its failure is recorded beside it (backup.py);
+            # where it stopped before that, this is the only record of the asking.
+            refusal(request, "backups", action, f"No backup was made: {exc}")
             return await backups_page(value, session, await standing_now(), f"No backup was made: {exc}", 500)
         return RedirectResponse("backups", status_code=303)
 
@@ -931,8 +982,15 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
     )
 
 
+def _backup_made(name: str):
+    """When the backup of that name was made, a daily one or one kept from
+    before an upgrade; None for any other name."""
+    named = backup_kept(name)
+    return backup_made_at(name) if named is None else named[0]
+
+
 def _downloaded(database: Database, name: str) -> None:
     """When a backup was last downloaded, for `status` and this page."""
     with database.transaction() as db:
         db.execute("INSERT INTO backup_event (kind, file, made_at, at) VALUES ('downloaded', ?, ?, ?)",
-                   (name, backup_made_at(name).timestamp(), time.time()))
+                   (name, _backup_made(name).timestamp(), time.time()))

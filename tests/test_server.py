@@ -552,6 +552,33 @@ def _records(audit) -> list[dict]:
     return [json.loads(line) for line in audit.path.read_text().splitlines() if line.strip()]
 
 
+async def _tool_descriptions(mcp_server, token: str) -> dict[str, str]:
+    """Each tool's description, as a client is shown it."""
+    app = mcp_server.streamable_http_app()
+    http_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    async with mcp_server.session_manager.run():
+        async with http_client:
+            async with streamable_http_client(
+                "http://127.0.0.1:8000/mcp", http_client=http_client
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return {t.name: " ".join((t.description or "").split()) for t in (await session.list_tools()).tools}
+
+
+async def test_the_proxmox_tool_says_what_a_clone_takes_from_its_template(tmp_path, ssh_server, pki, fake_api):
+    # ADR-0017 question F, amended 2026-11-15: the hypervisor copies a template's protection, tags and
+    # description into a clone, and a protected clone refuses to be destroyed. The client guide's step 3
+    # said so; a client that had not read the guide met the refusal. Every client is shown this.
+    mcp_server, _ = _build_with_proxmox(tmp_path, ssh_server, pki, fake_api.port)
+    said = (await _tool_descriptions(mcp_server, PVE_TOKEN))["proxmox"]
+    assert "A clone takes its template's `protection`, tags and description with it" in said
+    assert "`protection=0` for a VM you will destroy" in said and "PUT /nodes/{node}/qemu/{vmid}/config" in said
+
+
 async def test_the_proxmox_tool_is_absent_when_unconfigured(tmp_path, ssh_server):
     mcp_server, _, _ = _build(tmp_path, ssh_server)
     assert "proxmox" not in await _list_tools(mcp_server, GOOD_TOKEN)

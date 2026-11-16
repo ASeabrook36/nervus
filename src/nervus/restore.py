@@ -196,20 +196,27 @@ class BackupFile:
     name: str
     size: int
     made_at: float
+    # For the backup made before an upgrade and kept until the next (ADR-0029 step 7): the release
+    # it was made before the upgrade to. None for a backup the daily keeping holds.
+    kept_before: str | None = None
 
 
 def listing(folder: Path) -> list[BackupFile]:
-    """The backups in `folder`, newest first; none if it cannot be read."""
-    from nervus.backup import made_at
+    """The backups in `folder`, newest first, a kept one after the daily one
+    of the same moment; none if it cannot be read."""
+    from nervus.backup import kept, made_at
     found = []
     try:
         for path in folder.iterdir():
-            made = made_at(path.name)
+            made, release = made_at(path.name), None
+            if made is None and (named := kept(path.name)) is not None:
+                made, release = named
             if made is not None and path.is_file():
-                found.append(BackupFile(name=path.name, size=path.stat().st_size, made_at=made.timestamp()))
+                found.append(BackupFile(name=path.name, size=path.stat().st_size, made_at=made.timestamp(),
+                                        kept_before=release))
     except OSError:
         return []
-    return sorted(found, key=lambda b: b.made_at, reverse=True)
+    return sorted(found, key=lambda b: (-b.made_at, b.kept_before is not None))
 
 
 def stale(backups: list[BackupFile], now: float | None = None) -> str:

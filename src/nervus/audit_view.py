@@ -70,6 +70,20 @@ class Entry:
 
 _KINDS = {"intent": "call", "result": "call", "refused": "refused", "operator": "operator"}
 
+# The operator's actions in the UI whose `target` is a machine (ADR-0024, ADR-0026). Every other
+# action's target is a token, which may bear a machine's name and is not one.
+_MACHINE_ACTIONS = frozenset({"connect", "enrollment_code", "move_machine", "remove_machine"})
+
+
+def _vm(value: object) -> str:
+    """A VM named by its id, as the viewer shows and finds it: `vmid 104`. "" for what is not an
+    id: a call's record holds one as a number, an upload's as the digits it was sent."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 10:
+        value = int(value)
+    return f"vmid {value}" if isinstance(value, int) else ""
+
 
 def cut(text: str, limit: int = CUT_CHARACTERS) -> tuple[str, str]:
     """What the list shows of a value (decision C): its first line, at most
@@ -129,8 +143,25 @@ class Row:
         return self._get("token_id") or self._get("actor")
 
     @property
+    def machines(self) -> tuple[str, ...]:
+        """Every machine the row is about, as the Host column shows them and
+        its filter finds them, whatever the record calls it: the `host` a call
+        names; a VM a call names by its id instead (ADR-0022), as `vmid 104`;
+        the machine an enrollment is of; and the machine the operator's action
+        in the UI, or a form the Machines page refused, was about."""
+        first = self._first()
+        found = [self._get("host"), _vm(first.get("vmid"))]
+        if self.tool == "enroll":
+            found.append(self._get("name"))
+        if self.tool == "ui" and (first.get("page") == "machines" if self.kind == "refused"
+                                  else self._get("action") in _MACHINE_ACTIONS):
+            found.append(self._get("target"))
+        return tuple(dict.fromkeys(name for name in found if name))
+
+    @property
     def host(self) -> str:
-        return self._get("host")
+        """The first of `machines`, or "" for a row about none."""
+        return next(iter(self.machines), "")
 
     @property
     def tool(self) -> str:
@@ -208,10 +239,13 @@ class Query:
     text: str = ""
 
     def matches(self, row: Row) -> bool:
-        for name in ("client", "host", "tool", "kind"):
+        for name in ("client", "tool", "kind"):
             wanted = getattr(self, name)
             if wanted and getattr(row, name) != wanted:
                 return False
+        # A machine by any name the row has for it; a VM also by its id alone, as a person types it.
+        if self.host and self.host not in row.machines and (_vm(self.host) or None) not in row.machines:
+            return False
         if self.text:
             needle = self.text.casefold()
             return any(needle in value.casefold() for value in row.texts())

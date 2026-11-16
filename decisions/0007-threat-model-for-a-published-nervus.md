@@ -1,6 +1,9 @@
 # ADR-0007: the threat model for a published nervus
 
-**Status:** Proposed (Accepted when the verification below is observed). The four
+**Status:** **Accepted 2026-11-15, at the operator's word** ("Both Accepted (Recommended)", asked
+of this record and ADR-0019 together), every verification item observed: "Where each stands",
+under the list, says where, and names the two readings the operator was shown before accepting,
+of items 4, 5 and 7. (It was Proposed: accepted when the verification below is observed.) The four
 questions this ADR was drafted around were settled by the operator on 2026-09-18.
 **Amended 2026-10-02** by ADR-0010 decision 1, decided by the operator: decision 3 and
 verification 6.
@@ -271,3 +274,30 @@ ADR-0006's. Moves to Accepted when:
    public address is warned about.
 7. The audit log is readable in the UI, unreadable through every MCP tool, and follows
    the configured location when that is changed.
+
+**Where each stands, 2026-11-15.** What this record asked for was built under later ones, and each
+item was observed there. Read against the code, the tests and the procedures on 2026-11-15, after
+the review of procedure 056 went through this list:
+
+1. The README states the non-goals and the single trust domain, and the setup page states the same
+   list: ADR-0015 verification 5 (procedure 039 step 5, and in tests). A test holds the two lists
+   to each other since procedure 054's fifth finding.
+2. ADR-0015 verification 1 and 2: procedure 039 steps 3, 4, 6 and 8, and in tests.
+3. ADR-0015 verification 3: procedure 039 steps 2 and 7, on a real reading of a machine's
+   addresses, and in tests.
+4. ADR-0024 verification 2: a write outside `~/.nervus` is refused by the machine, on each system
+   tried (procedures 037, 054, 055 and 057). **Read as ADR-0024 built it:** the refusal is made by
+   the machine's kernel, inside the read-only shell, so it shows in the command's own answer, which
+   nervus's audit log keeps as the call's result. The machine's own `sshd` journal holds the login,
+   naming the client and the run (ADR-0025 verification 1, procedures 042 to 044); it holds no line
+   for the refusal itself, as this item was first worded.
+5. Every route tried by procedure 056 was refused, and ADR-0025 verification 7 observed the same
+   for the certificate key (procedures 042 and 043). **With the exception ADR-0013 asked to have
+   named here:** a token given root on the hypervisor under nervus's machine reaches everything in
+   that machine. ADR-0009 decision 3 grants that level knowingly, and decision 8 above, as ADR-0025
+   amended it, names the machine underneath nervus.
+6. ADR-0010 verification 1, each part observed when that record was accepted (in tests, and at
+   its deploy, procedure 017); and every installation the installer has made serves both its ports
+   over HTTPS (procedures 035, 047, 054, 055 and 064).
+7. Readable in the UI, and following `--audit-log`: ADR-0013 verification 8 (procedure 021).
+   Unreadable through every MCP tool: procedure 056, with the same exception as item 5.

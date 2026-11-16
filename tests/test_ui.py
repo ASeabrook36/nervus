@@ -501,6 +501,45 @@ def test_a_token_that_cannot_be_issued_is_refused_and_says_why(managed, db, fiel
     assert db.issued_tokens() == []
 
 
+def _refusals(audit, page):
+    return [r for r in _records(audit) if r.get("tool") == "ui" and r.get("phase") == "refused" and r.get("page") == page]
+
+
+@pytest.mark.parametrize("fields, target, reason", [
+    ({"action": "off", "id": "nobody"}, "nobody", "There is no token nobody."),
+    ({"action": "on", "id": "codex-anywhere"}, "codex-anywhere", "codex-anywhere is not switched off."),
+    ({"action": "revoke", "id": "codex-anywhere"}, "codex-anywhere", "was not issued here"),
+    ({"action": "issue", "id": "laptop", "client": "c", "project": "p", "hosts": ["elsewhere"]}, "laptop",
+     "Not in the inventory: elsewhere."),
+])
+def test_a_refused_form_on_the_clients_page_is_recorded_with_what_was_asked_and_why(managed, audit, fields, target, reason):
+    # ADR-0012 decision 6, as amended 2026-11-15: no refused form left a record, on any page.
+    client, _, _ = managed
+    assert _act(client, **fields).status_code == 400
+    record, = _refusals(audit, "clients")
+    assert (record["actor"], record["action"], record["target"]) == ("operator", fields["action"], target)
+    assert reason in record["reason"] and record["address"] == "testclient"
+
+
+def test_a_switch_file_nobody_can_read_refuses_the_change_on_record(managed, audit):
+    client, _, switches = managed
+    switches.write_text("lockdown: [\n")
+    assert _act(client, action="lockdown-off").status_code == 409
+    record, = _refusals(audit, "clients")
+    assert record["action"] == "lockdown-off" and "the switch file is unreadable" in record["reason"]
+
+
+def test_signing_out_from_another_site_or_without_the_form_token_is_recorded_and_ends_nothing(ui, db, audit):
+    _, response = _sign_in(ui, db)
+    assert ui.post("/signout", data={"form_token": "x"}, headers={"Origin": ORIGIN}).status_code == 403
+    token = _hidden(ui.get("/").text, "form_token")
+    assert ui.post("/signout", data={"form_token": token}, headers={"Origin": "https://evil.example"}).status_code == 403
+    unsigned, other = _refusals(audit, "signout")
+    assert unsigned["action"] == other["action"] == "signout"
+    assert "token" in unsigned["reason"] and "another site" in other["reason"]
+    assert db.session(response.cookies[COOKIE]) is not None
+
+
 def test_revoking_needs_the_id_typed_and_then_the_token_is_refused(managed, audit, db):
     """ADR-0014 decision E and verification 2."""
     client, tokens, _ = managed

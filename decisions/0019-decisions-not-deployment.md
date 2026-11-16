@@ -1,7 +1,9 @@
 # ADR-0019: decision records hold decisions, the deployment record holds the installation, and code names no system
 
-**Status:** Proposed (Accepted when the verification below is observed). **Its policy was set
-by the operator on 2026-10-15** (quoted below). **Decided by the operator the same day**, in a
+**Status:** **Accepted 2026-11-15, at the operator's word** ("Both Accepted (Recommended)", asked
+of this record and ADR-0007 together), every verification item observed; "Where each stands",
+under the list, says where. (It was Proposed: accepted when the verification below is observed.)
+**Its policy was set by the operator on 2026-10-15** (quoted below). **Decided by the operator the same day**, in a
 Claude Code session, one question at a time: D as the session revised it after the operator's
 question about other hypervisors, E as set with the policy, and 0, A, B, C, F, G and H as
 recommended.
@@ -244,3 +246,16 @@ Each a step of its own, under rule 1.
    instance's names, the full-level token's id and the planned range found only general words
    ("the operator's machine", Codex's sandbox, the macOS keychain, Caddy in ADR-0010's sources).
 4. Every observation removed from an ADR is found in the deployment record.
+
+**Where each stands, 2026-11-15.**
+
+1. Searched again on 2026-11-15: no name in the first installation's inventory occurs anywhere in
+   `src/`, `tools/`, `deploy/`, `install.sh`, `docs/` or `decisions/`. The export's own check, with
+   its longer list, found nothing in the whole exported tree the same day (procedure 064).
+2. In tests; and on the first installation after the deploy (procedure 027): the `proxmox` tool
+   worked through the entry marked as the hypervisor, and issuing the entry marked `issue: never`
+   was refused. One piece was seen in a test and not on that installation: the Clients page leaving
+   that entry out of what it offers, which the operator was told before accepting.
+3. Observed 2026-10-17, as the item says.
+4. Each ADR rewritten under decision F names the deployment note that keeps its original, and each
+   note named exists in `deployment/` (checked 2026-11-15: nine notes, 0001 to 0019).

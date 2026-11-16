@@ -9,7 +9,7 @@ from nervus.ssh import connect
 
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
-    reason="tmux not available in this sandbox; job lifecycle is untested here (see CURRENT_STATE.md)",
+    reason="tmux is not installed here, so the job lifecycle is not tested on this machine",
 )
 
 

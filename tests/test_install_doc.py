@@ -372,7 +372,11 @@ def test_the_by_hand_steps_lay_out_the_release_as_the_installer_does(both):
     assert os.readlink(by_hand.opt / ".venv") == os.readlink(installer.opt / ".venv") == f"releases/{name}/.venv"
     log = by_hand.logged()
     assert [line for line in log if line.startswith("venv ")] == [f"venv {rel}/.venv"]
-    assert [line for line in log if "/bin/pip " in line] == [f"{rel}/.venv/bin/pip install {rel}"]
+    # As the installer fills it: the lock's libraries, each file checked; nervus itself, nothing fetched.
+    assert [line for line in log if "/bin/pip " in line] == [
+        f"{rel}/.venv/bin/pip install --require-hashes -r {rel}/requirements.lock",
+        f"{rel}/.venv/bin/pip install --no-deps --no-index --no-build-isolation {rel}",
+        f"{rel}/.venv/bin/pip check"]
     code = _raw("by-hand-code").splitlines()
     pip, link = (next(i for i, line in enumerate(code) if word in line) for word in ("/bin/pip", "ln -s "))
     assert pip < link

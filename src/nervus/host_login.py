@@ -92,15 +92,34 @@ def key_file(host_key: str) -> str:
     return f"/etc/ssh/ssh_host_{stem}_key.pub"
 
 
+NO_CURL = ("nervus enrollment: this machine has no curl, which fetches nervus's script, and no apt-get to install "
+           "it with: install curl, then add the machine again. Nothing here was changed")
+NO_CURL_INSTALLED = ("nervus enrollment: apt-get could not install curl, which fetches nervus's script: install it, "
+                     "then add the machine again")
+# A machine without curl is given it first (ADR-0026 question 10), as nervus's script gives it tmux: by
+# apt-get, the package lists first, nothing asked, said in a step line; nothing of standard input reaches
+# apt-get. Without apt-get nothing is changed, and it says what is missing. Before, the fetch below failed
+# as an unreachable nervus does, and the owner was told that.
+_CURL_FIRST = ("if ! command -v curl >/dev/null 2>&1; then "
+               f"command -v apt-get >/dev/null 2>&1 || {{ echo {shlex.quote(NO_CURL)} >&2; exit 1; }}; "
+               "echo 'nervus enrollment: installing curl'; "
+               "DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null >/dev/null "
+               "&& DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl </dev/null >/dev/null "
+               "&& command -v curl >/dev/null 2>&1 "
+               f"|| {{ echo {shlex.quote(NO_CURL_INSTALLED)} >&2; exit 1; }}; fi; ")
+
+
 def root_command(url: str, pin: str, shown: str) -> str:
     """The two lines as nervus runs them as root: fetch the script to a file of
     its own that is removed on every way out, then run it with nothing on its
-    standard input. `shown` is the URL with `<code>` for the code, so the code
-    is never shown in a message."""
+    standard input. Before them, on a machine that has no curl to fetch with,
+    curl is installed (question 10). `shown` is the URL with `<code>` for the
+    code, so the code is never shown in a message."""
     if not PIN.fullmatch(pin):
         raise ValueError("a pin is sha256// and a key's hash, so the machine checks it is talking to nervus")
     message = f"nervus enrollment: this machine could not reach nervus at {shown}, so nothing here was changed"
-    return ("t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; "
+    return (_CURL_FIRST +
+            "t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; "
             f"curl -fsSk --pinnedpubkey {shlex.quote(pin)} -o \"$t\" {shlex.quote(url)} "
             f"|| {{ echo {shlex.quote(message)} >&2; exit 1; }}; sh \"$t\" </dev/null")
 

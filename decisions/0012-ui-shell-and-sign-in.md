@@ -128,6 +128,18 @@ operator did not make. The cost: anyone on the network can add refused-link reco
 will. Public exposure is not supported in v1 (ADR-0007 decision 4), and retention is
 already an open item.
 
+*Amended 2026-11-15: every form the UI refuses is recorded too.* Each change made in the UI has
+had its record since ADR-0014, but a form refused left none, on any page: found on the Machines
+page, where Connect and the login refused in lockdown were in no record (procedure 040), and
+carried as a note until the operator's instruction of 2026-11-15 to close every such note. A
+refused form is now a refusal in the audit log, as a client's refused call is: the page, the
+action asked and why not, with the machine, token or range it named. Its fields are named one by
+one, never taken from the form, which on the login holds a password. A form posted from another
+site, or without the page's own token, is recorded where the browser carries a session, since a
+signed-in browser was then made to send it. A post that carries no session is refused without a
+record, as a call with no token is: this decision's cost above stays as it was, the refused link
+and no more.
+
 **7. The certificate the browser shows.** As decided, B had two gaps with what a browser
 does.
 

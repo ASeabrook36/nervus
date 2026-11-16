@@ -697,7 +697,13 @@ def build_server(
             nervus error.
             Long-running actions return a task id (UPID); poll
             /nodes/{node}/tasks/{upid}/status. Responses over 256 KiB are refused,
-            not cut short: narrow the request."""
+            not cut short: narrow the request.
+
+            A clone takes its template's `protection`, tags and description with
+            it, and Proxmox refuses to destroy a protected VM. Before you start a
+            clone, give it its own in one call,
+            PUT /nodes/{node}/qemu/{vmid}/config: `tags`, a `description`, and
+            `protection=0` for a VM you will destroy."""
             token = require_token(ctx.headers, tokens)
             verb = _authorized_proxmox(
                 audit=audit, token=token, host=proxmox_host, method=method, path=path, params=params

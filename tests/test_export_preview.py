@@ -11,6 +11,7 @@ any other.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,13 +20,19 @@ from pathlib import Path
 import pytest
 
 TOOL = Path(__file__).resolve().parent.parent / "tools" / "export-preview"
+LOCK_TOOL = TOOL.with_name("lock-libraries")
 
-PYPROJECT = '[project]\nname = "thing"\nversion = "{}"\n'
+PYPROJECT = ('[build-system]\nrequires = ["hatchling==1.27.0"]\n\n'
+             '[project]\nname = "thing"\nversion = "{}"\nrequires-python = ">=3.11"\n')
+# A release's lock, as tools/lock-libraries makes one: for that release, holding what pyproject.toml names.
+LOCK = ("# Made for nervus {} on 2026-11-15, by tools/lock-libraries with uv 0.0.0.\n"
+        "hatchling==1.27.0 \\\n    --hash=sha256:" + "ab" * 32 + "\n")
 FILES = {
     "src/thing/__init__.py": "VALUE = 1\n",
     "tests/test_thing.py": "import thing\n\ndef test_value():\n    assert thing.VALUE == 1\n",
     "decisions/0001.md": "# a decision\n",
     "pyproject.toml": PYPROJECT.format("0.2.0"),
+    "requirements.lock": LOCK.format("0.2.0"),
     "CHANGES.md": "# Changes\n\n## 0.2.0\n\n- VALUE is 1\n\n## 0.1.0\n\n- the first export\n",
     "procedures/001.md": "what was done on the first installation\n",
     "deployment/0001.md": "this installation's notes\n",
@@ -53,6 +60,7 @@ def world(tmp_path):
         (repo / name).write_text(text)
     (repo / "tools").mkdir()
     shutil.copy(TOOL, repo / "tools" / "export-preview")
+    shutil.copy(LOCK_TOOL, repo / "tools" / "lock-libraries")
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "first")
@@ -106,6 +114,9 @@ def _pyproject(world, tree: str, text: str | None) -> None:
         _git(repo, "commit", "-q", "-m", "no pyproject.toml")
     else:
         _commit(repo, "pyproject.toml", text)
+        # A release whose number is raised has its lock made again for it.
+        if number := re.search(r'(?m)^version = "([^"]*)"$', text):
+            _commit(repo, "requirements.lock", LOCK.format(number.group(1)))
 
 
 def _refused(done: subprocess.CompletedProcess, *says: str) -> None:
@@ -209,9 +220,10 @@ def test_against_shows_only_what_changed_since_the_last_export(world, monkeypatc
     assert done.returncode == 0, done.stdout
     assert (tmp / "out" / "tests" / "__pycache__").is_dir()  # the bytecode is there, to be left out
     shown = done.stdout.split("against the last export:\n")[1]
-    # CHANGES.md, pyproject.toml and new.py, each named from the top of its tree; no file of .git or __pycache__/.
+    # CHANGES.md, pyproject.toml, the lock made again for the release, and new.py, each named from the top of
+    # its tree; no file of .git or __pycache__/.
     assert " {last => this}/pyproject.toml " in shown and "this/src/thing/new.py" in shown, shown
-    assert " 3 files changed," in shown, shown
+    assert " {last => this}/requirements.lock " in shown and " 4 files changed," in shown, shown
 
 
 def test_against_is_required(world):
@@ -314,6 +326,34 @@ def test_changes_md_without_a_section_for_the_release_is_refused(world, text):
 def test_an_empty_section_for_the_release_is_refused(world, text):
     _commit(world[1], "CHANGES.md", text)
     _refused(_run(world), "CHANGES.md's section for 0.2.0 is empty")
+
+
+# --- the release's lock (ADR-0029, "Not settled here", settled 2026-11-15) ---------------------------
+
+def test_a_clean_export_says_its_lock_is_this_releases(world):
+    done = _run(world)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "CHANGES.md has its section; requirements.lock is this release's" in done.stdout.splitlines()[1]
+
+
+def test_a_lock_made_for_another_release_is_refused_saying_how_to_make_it_again(world):
+    # Every release has its lock made again, at the newest versions: a lock left from the release before
+    # is how libraries would grow old unnoticed.
+    _commit(world[1], "requirements.lock", LOCK.format("0.1.9"))
+    _refused(_run(world), "requirements.lock was made for 0.1.9, and this tree is 0.2.0", "run tools/lock-libraries")
+
+
+def test_a_lock_that_does_not_hold_what_pyproject_names_is_refused(world):
+    _commit(world[1], "requirements.lock", LOCK.format("0.2.0").replace("1.27.0", "1.26.0"))
+    _refused(_run(world), "pyproject.toml names hatchling==1.27.0, and the lock has hatchling 1.26.0")
+
+
+@pytest.mark.parametrize("name, says", [("requirements.lock", "has no requirements.lock"),
+                                        ("tools/lock-libraries", "has no tools/lock-libraries")])
+def test_an_export_without_its_lock_or_the_tool_that_checks_it_is_refused(world, name, says):
+    _git(world[1], "rm", "-q", name)
+    _git(world[1], "commit", "-q", "-m", f"no {name}")
+    _refused(_run(world), says)
 
 
 def test_a_section_heading_may_go_on_after_the_number(world):

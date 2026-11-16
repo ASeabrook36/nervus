@@ -195,6 +195,15 @@ form token.
 unreadable line has no client, host or tool, so only a text
 search, or no filter, can find it.
 
+*Mended 2026-11-15: the host filter finds a machine by whatever its record calls it.* It matched
+a record's `host` and nothing else. Since ADR-0022 a call may name a VM by its id, and its records
+then hold `vmid` and no host: the column was empty for it and no filter found it (procedure 034).
+An enrollment names its machine as `name`, and the operator's work on a machine in the UI as
+`target`, so neither was found by the machine either. The column now shows each machine a row is
+about, a VM as `vmid 104`, and the filter finds a row by any of them, a VM also by its id alone.
+A token's own actions also use `target`, and a token may bear a machine's name: those rows are
+not about the machine, and are not found by it.
+
 ### F. A live view
 
 ADR-0012 decision 2 left this to piece 3: "if the audit viewer wants a live tail, that is

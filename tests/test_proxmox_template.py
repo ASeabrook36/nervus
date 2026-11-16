@@ -112,6 +112,24 @@ def test_storage_and_bridge_default_to_proxmoxs_own_and_can_be_chosen():
     assert "DISK_STORAGE=fast" in lines and "BRIDGE=vmbr1" in lines
 
 
+def test_a_clone_gets_the_hosts_own_processor_unless_another_model_is_chosen():
+    # ADR-0017 question F, amended 2026-11-15. The template set no model, so a clone got the
+    # hypervisor's old default, on which newer programs cannot run (procedure 032).
+    assert settings()["CPU_MODEL"] == "host"
+    chosen = run("--print-settings", env={**os.environ, "CPU_MODEL": "x86-64-v3"})
+    assert "CPU_MODEL=x86-64-v3" in chosen.stdout.splitlines()
+    script = TOOL.read_text()
+    create = script[script.index("qm create"):script.index("|| die \"qm create failed\"")]
+    assert '--cpu "$CPU_MODEL"' in create  # the VM is built with it, so every clone has it
+    assert "grep -qx \"cpu: $CPU_MODEL\"" in script  # and the build checks that the template does
+
+
+@pytest.mark.parametrize("model", ["host; rm -rf /", "host,flags=+aes", "x86 64", "-cpu", "a" * 65])
+def test_a_processor_model_that_is_not_one_word_is_refused(model):
+    done = run("--print-settings", env={**os.environ, "CPU_MODEL": model})
+    assert done.returncode == 1 and "CPU_MODEL" in done.stdout
+
+
 def test_no_node_name_is_built_in():
     """ADR-0019: the node it must run on is named by whoever runs it."""
     assert "EXPECTED_NODE=${NODE:-}" in TOOL.read_text()

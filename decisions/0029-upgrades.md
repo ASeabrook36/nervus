@@ -20,6 +20,11 @@ operator's word** ("Yes, fix it"): that move's work found that a step failing be
 the start left nervus stopped. What can stop an upgrade now comes before the stop, and from the stop
 until nervus is judged up, any way the run ends goes back: steps 1, 2, 4, 6, 7 and 10 below, question
 7, and verification 10, observed in tests and on a throwaway machine (procedure 053).
+**Amended 2026-11-15, decided by the operator:** the two things this record left. The libraries
+below nervus's own get a lock file ("Not settled here", now settled). And step 7's finding is
+answered: the backup made before an upgrade is kept until the next upgrade. Migrations themselves
+wait for the first release that needs one, as question 6a decided; that is the decision, not an
+open step.
 **Date:** 2026-11-01
 **Asked for by:** the operator, item 6 of the order before friends are invited: "An upgrade path for
 a friend taking a newer export."
@@ -539,6 +544,10 @@ installation keeps its layout, and so its owners, until its move (question 11).
 - **What cannot be audited does not happen** (ADR-0001 s10): an upgrade's start, its end and going
   back are operator records in the audit log, as a restore's are (ADR-0027); an upgrade whose first
   record cannot be written does not begin. The audit log is never rolled back, nor edited.
+  *Since 2026-11-15 the end with nervus up on neither release is on record too, on `--upgrade` and
+  on `--back`. As first built that end, the one that most needs a record, was told to the terminal
+  alone (found 2026-11-06). It is written by the release current at that moment, as every record
+  is; one from before the stage `down` writes it as `back`, its reason beginning "NERVUS IS DOWN".*
 - **A database newer than nervus knows is refused** (`database.py`), and so is a backup's (ADR-0027
   question 5). **A table added keeps the version** (ADR-0014 decision F).
 - **The deployment record is not exported** (ADR-0019 decision H), so the friends' upgrade lives in
@@ -565,6 +574,43 @@ installation keeps its layout, and so its owners, until its move (question 11).
   the index changed. It changes the install and the export as much as the upgrade, so it is a
   question of its own, raised here and not resolved. An upgrade that fails on such a library goes
   back by itself (question 7), so the upgrade need not wait for it.
+
+  **Settled 2026-11-15, decided by the operator: a lock file.** Asked whether to add one, the
+  operator first asked: "So in my mind, the idea of locking things to a particular version of
+  dependencies makes it seem like it could get out our date really easily because if I'm not going
+  through and making sure to update every single dependency in package, then it's just gonna stay
+  locked there and anybody who wants to install this it's gonna need to install a bunch of old
+  libraries eventually. But again, I don't come from this world so I don't know whether this is
+  normal practice or best practice for self or individual created software like this. So I really
+  am in need of your input."
+
+  The session's answer. The eight named libraries are already at exact versions until a release
+  moves them; the lock applies that rule to what they need in turn. An installed nervus changes
+  its libraries only at an upgrade, lock or no lock, so the lock changes only what a new install
+  or an upgrade fetches: the set the release's tests ran, in place of the day's. Old libraries are
+  cured by a release either way, so the lock is made again, at the newest versions, for every
+  release, and the export refuses a release whose lock was not made for it. A lock kept in the
+  repository is standard practice for software that is installed and run; the advice against one
+  is for libraries other software builds on. And the installer runs as root on the machine that
+  holds nervus's keys, where libraries fetched unpinned are the one place a broken or tampered
+  upload gets in unseen. What a lock does not change: a fix in any library reaches an
+  installation only through a release.
+
+  Asked again, the operator chose **"Yes, add it (Recommended)"**. So:
+  - **`requirements.lock`, at the top of the repository:** every library an install fetches, at
+    one exact version with the SHA-256 of each of its files: nervus's eight, what they need in
+    turn, and what builds nervus's own package; for every system, and every Python the installer
+    accepts.
+  - **Made by `tools/lock-libraries`,** with `uv`, at the newest versions `pyproject.toml`'s eight
+    allow, for one release: its first lines name the release it was made for.
+  - **The installer, the upgrade and the hand steps install from it** with pip's hash-checking
+    mode, and then nervus's own package with nothing more fetched. A file whose content differs
+    from the lock's stops the install, or the upgrade before nervus is stopped. A tree whose lock
+    is not its release's is refused before anything changes.
+  - **The export refuses a release whose lock was not made for its number,** or whose lock does
+    not hold `pyproject.toml`'s eight at their versions (ADR-0018 decision E's checks gain it).
+  - **The tests run on the lock's set:** one of them compares the libraries it runs with against
+    the lock.
 
 ## Consequences
 
@@ -704,6 +750,13 @@ result is recorded before the first change.
    migration, their tests, and `restore` accepting the older database, under this record. It must then
    answer procedure 051's finding 5: a backup made the same day after the upgrade removes the one copy of
    the database the older release can read, which going back and the guide send a person to.
+   **Finding 5 answered 2026-11-15, decided by the operator, ahead of the first migration.** Asked how
+   the backup made before an upgrade should be kept: **"Until the next upgrade (Recommended)"**, over
+   keeping it so only where the upgrade raises the database's version. The backup an upgrade makes is
+   kept under a name of its own, which the daily keeping never removes (ADR-0027 question 4), for as
+   long as the release before is kept for going back: the next upgrade that comes up removes it, having
+   made its own. `install.sh --back`'s refusal and the guide name it. What is left of this step is the
+   migrations themselves, which wait for the first release that needs one, as question 6a decided.
 8. ~~**The first installation** (question 11), as decided: a procedure of its own, after the trial.~~
    **Done 2026-11-06** (procedure 052), rehearsed first on a throwaway machine to its limits. One reading
    of question 11: its venv was copied, not moved, with the release's own package installed in the copy.

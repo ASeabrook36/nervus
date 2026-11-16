@@ -28,6 +28,12 @@ What it holds to:
   nothing older (question 4, as the operator decided). Only after a backup is
   made, never after one failed; a file whose name is not a backup's is never
   touched.
+- Kept beside those: the backup made before an upgrade, until the next upgrade
+  comes up (ADR-0029 step 7, decided 2026-11-15). The daily keeping held it
+  only while it was its day's newest, so a second backup that day removed it
+  (procedure 051, finding 5). It is given a second name, which names the
+  release upgraded to and which no keeping, in this release or an earlier
+  one, reads as a backup's: so nothing removes it but the upgrade after.
 """
 
 from __future__ import annotations
@@ -61,6 +67,10 @@ RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]{58}")
 FORMAT = 1
 NAME = re.compile(r"nervus-backup-(\d{8}T\d{6}Z)\.tar\.gz\.age")
 STAMP = "%Y%m%dT%H%M%SZ"
+# A release, as its folder is named (ADR-0029 question 3a), and a kept backup's name: the backup's
+# own, with the release it was made before an upgrade to. Never matched by NAME.
+RELEASE = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}-[0-9a-f]{12}"
+KEPT_NAME = re.compile(r"nervus-backup-(\d{8}T\d{6}Z)\.before-(" + RELEASE + r")\.tar\.gz\.age")
 CHUNK = 1 << 20
 
 # Question 4, as the operator decided: (how many, within how many days).
@@ -139,12 +149,108 @@ def made_at(name: str) -> datetime | None:
     """When a backup was made, from its name; None for a name that is not a
     backup's. Read from the name, not the file's date, which a copy changes."""
     found = NAME.fullmatch(name)
-    if found is None:
-        return None
+    return _stamped(found.group(1)) if found else None  # an impossible date is not a backup's name
+
+
+def _stamped(stamp: str) -> datetime | None:
     try:
-        return datetime.strptime(found.group(1), STAMP).replace(tzinfo=timezone.utc)
+        return datetime.strptime(stamp, STAMP).replace(tzinfo=timezone.utc)
     except ValueError:
-        return None  # the shape matches but the date is impossible: not a backup's name
+        return None  # the shape matches but the date is impossible
+
+
+def kept_name(name: str, release: str) -> str:
+    """The second name the backup `name` is kept under for an upgrade to
+    `release`. Only a backup's own name and a release's own name make one, so
+    neither can carry a path."""
+    if made_at(name) is None:
+        raise BackupFailed(f"{name!r} is not a backup's name, so it cannot be kept")
+    if not re.fullmatch(RELEASE, release):
+        raise BackupFailed(f"{release!r} is not a release's name, such as 0.0.0-42c0b5a132ef")
+    return name.removesuffix(".tar.gz.age") + f".before-{release}.tar.gz.age"
+
+
+def kept(name: str) -> tuple[datetime, str] | None:
+    """When a kept backup was made and the release it was made before an
+    upgrade to, from its name; None for any other name."""
+    found = KEPT_NAME.fullmatch(name)
+    made = _stamped(found.group(1)) if found else None
+    return None if made is None else (made, found.group(2))
+
+
+def keep_for_upgrade(folder: Path, name: str, release: str) -> Path:
+    """Give the backup `name`, in `folder`, its kept name for an upgrade to
+    `release`: the same file under a second name, or a copy where the file
+    system gives a file only one. Asked twice, it is kept once. Raises
+    BackupFailed, and then nothing was made."""
+    source, dest = folder / name, folder / kept_name(name, release)
+    try:
+        # A file, and in this folder: a link to one kept elsewhere is not the backup an upgrade just made.
+        if source.is_symlink():
+            raise plainfile.NotAFile(f"{source} is a link, not a file")
+        with plainfile.open_file(source) as backup:
+            was = os.fstat(backup.fileno())
+            try:
+                os.link(source, dest, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            except OSError:
+                _copy(backup, dest)
+                return dest
+        now = os.lstat(dest)
+        if (now.st_dev, now.st_ino) != (was.st_dev, was.st_ino):
+            raise BackupFailed(f"{dest.name} is here already and is not {name}; remove it, or keep nothing")
+    except OSError as exc:
+        raise BackupFailed(f"cannot keep {name} for the upgrade: {exc}") from exc
+    return dest
+
+
+def _copy(backup, dest: Path) -> None:
+    """The open backup's bytes at `dest`, a new file as private as a backup
+    is; nothing left if it cannot be written whole."""
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as copy:
+            os.fchmod(copy.fileno(), 0o600)
+            backup.seek(0)
+            shutil.copyfileobj(backup, copy, CHUNK)
+            copy.flush()
+            os.fsync(copy.fileno())
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def _kept_in(folder: Path) -> list[tuple[Path, str]]:
+    """Each kept backup in `folder` and the release it was kept for, oldest first."""
+    found = [(made, path, release) for path in folder.iterdir() if (named := kept(path.name)) is not None
+             for made, release in [named]]
+    return [(path, release) for _, path, release in sorted(found)]
+
+
+def only_kept_for(folder: Path, release: str) -> list[str]:
+    """An upgrade to `release` is up: remove every kept backup but its own.
+    Returns the names removed."""
+    removed = []
+    for path, its in _kept_in(folder):
+        if its != release:
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
+
+def drop_kept_for(folder: Path, release: str, but: str | None = None) -> list[str]:
+    """An upgrade to `release` went back, and nervus runs as before: remove
+    the backup kept for it, which the release running needs no second name
+    for. Or, with `but`, the upgrade is being tried again: remove what
+    earlier tries kept for it, sparing the one of that name, just kept.
+    Returns the names removed."""
+    removed = []
+    for path, its in _kept_in(folder):
+        if its == release and path.name != but:
+            path.unlink()
+            removed.append(path.name)
+    return removed
 
 
 def to_keep(made: list[datetime], now: datetime) -> set[datetime]:

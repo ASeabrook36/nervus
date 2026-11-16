@@ -56,6 +56,9 @@
 # if anything it needs is missing, if this folder has uncommitted changes or a
 # release number not of the form 0.2.0, or, without --upgrade, if nervus is
 # already installed here: it then says which release runs and how to upgrade.
+# It needs Python itself, to read this folder. On a machine that has none, and
+# has apt-get, it asks first to install python3 and python3-venv, those alone,
+# and then shows its plan and waits again, as on any machine.
 #
 # NERVUS_INSTALL_ROOT puts every system path under a folder, for its tests only.
 set -euo pipefail
@@ -77,7 +80,9 @@ TREE=$(cd "$(dirname "$0")" && pwd)
 say() { printf '%s\n' "$*"; }
 ok() { printf '  ok    %s\n' "$*"; }
 complain() { printf 'install.sh: %s\n' "$*" >&2; }
-die() { complain "$*"; exit 1; }
+# STAYS: what this run installed before its plan, said with whatever stops it before the install begins.
+STAYS=
+die() { complain "$*${STAYS:+ ($STAYS)}"; exit 1; }
 
 # --- arguments --------------------------------------------------------------------
 
@@ -92,7 +97,7 @@ while [ $# -gt 0 ]; do
     --restore) RESTORE=${2:-}; shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
     --back) BACK=1; shift ;;
-    -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -112,9 +117,13 @@ if [ -n "$RESTORE" ]; then
 fi
 if [ -z "$UPGRADE$BACK" ]; then
   [ -n "$ADDRESS" ] || die "give --address, the address your clients and VMs reach nervus at (see --help)"
+fi
+# check_address: --address is an IP address, as Python reads one. Called once Python is known to be
+# here: checked among the arguments, a machine without Python was told its address was not one.
+check_address() {
   python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$ADDRESS" 2>/dev/null \
     || die "--address $ADDRESS is not an IP address"
-fi
+}
 for n in ${NAMES[@]+"${NAMES[@]}"}; do
   [[ $n =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "--name $n is not a DNS name"
 done
@@ -162,8 +171,17 @@ build_release() {
   # The venv is built where it stays and filled by its own pip, never through the link: its scripts
   # name the path they were installed at, so a venv cannot be moved (procedure 050).
   python3 -m venv "$REL/.venv"
-  "$REL/.venv/bin/pip" install --quiet "$REL" \
-    || die "pip could not install nervus and its libraries into $REL/.venv, as it says above; the package index may be out of reach. $UNFINISHED"
+  # Its libraries from the release's lock: every one at the version this release's tests ran, and
+  # each file checked against the SHA-256 the lock names, so one that differs stops here (ADR-0029,
+  # settled 2026-11-15). What builds nervus's package is among them.
+  "$REL/.venv/bin/pip" install --quiet --require-hashes -r "$REL/requirements.lock" \
+    || die "pip could not install nervus's libraries into $REL/.venv, each checked against requirements.lock, as it says above: the package index may be out of reach, or a file there is not the one this release was tested with. $UNFINISHED"
+  # Then nervus itself, from the release's own folder, with nothing more fetched.
+  "$REL/.venv/bin/pip" install --quiet --no-deps --no-index --no-build-isolation "$REL" \
+    || die "pip could not build and install nervus itself into $REL/.venv, as it says above. $UNFINISHED"
+  local fit
+  fit=$("$REL/.venv/bin/pip" check 2>&1) \
+    || { printf '%s\n' "$fit" >&2; die "the libraries installed into $REL/.venv do not fit together, as pip says above: requirements.lock is not this release's. $UNFINISHED"; }
 }
 
 # never_ran_here: an install was begun here and nervus has never run: the installer's folders, and
@@ -312,6 +330,8 @@ PY
 }
 
 # ports_of <drop-in>: MCP_PORT and UI_PORT, which judge_up asks nervus on; fails if it gives none.
+# A release may move them, so they are read again for each release nervus is judged on: going back,
+# from the drop-in of the release it returns to (put_back).
 ports_of() {
   MCP_PORT=$(sed -n 's/^.*--bind-port \([0-9][0-9]*\).*$/\1/p' <<<"$1" | tail -n 1)
   UI_PORT=$(sed -n 's/^.*--ui-port \([0-9][0-9]*\).*$/\1/p' <<<"$1" | tail -n 1)
@@ -355,7 +375,7 @@ hold_off_backups() {
   for i in $(seq 1 600); do systemctl is-active --quiet nervus-backup.service || break; sleep 1; done
 }
 
-GOES_BACK= SWITCHED= STARTED= COPY_DB=
+GOES_BACK= SWITCHED= STARTED= COPY_DB= KEPT_BEFORE_STOP=
 
 # ending: how a run that has held off the backups ends, however it ends. Before the stop and once nervus
 # is judged up, it only lets the backups go on; between them it goes back first (question 7). Nothing
@@ -367,6 +387,11 @@ ending() {
     set +eu
     "$GOES_BACK"
     status=1
+  fi
+  # An upgrade that ended before it stopped nervus never began: the backup it had kept for itself is
+  # an ordinary backup again. (One that stopped nervus drops or leaves its own, by how it ends.)
+  if [ -n "$KEPT_BEFORE_STOP" ]; then
+    "$REL/.venv/bin/nervus-ctl" --unit "$UNIT" upgrade-backup drop "$RELEASE" >/dev/null 2>&1 || true
   fi
   systemctl start nervus-backup.timer || true
   exit "$status"
@@ -397,7 +422,23 @@ put_back() {
   elif [ -n "$COPY_DB" ]; then
     rm -f "$COPY_DB"
   fi
+  # Asked on the ports of the drop-in now in place, which is what systemd starts it with: the release
+  # it returns to, not the one it came from, which may have moved them and would then be asked where
+  # nothing listens, and nervus called down while it answers. If that drop-in cannot be read, on the
+  # ports of the one it had, which were read before anything changed.
+  ports_of "$(cat "$DROPIN" 2>/dev/null)" || ports_of "$OLD_DROPIN" || true
   start_and_judge
+}
+
+# record_down <from> <to> <why>: the record of a run that ends with nervus up on neither release. An
+# upgrade's end is an operator record (ADR-0029, "Settled already"), and nervus-ctl writes one with
+# nervus stopped. By the nervus-ctl of the release current now, which may be one from before the stage
+# "down": it refuses the word, and the same is then said with a stage every release knows, its reason
+# beginning NERVUS IS DOWN. Nothing here stops the run: it is on its last chance already.
+record_down() {
+  "$VENV/bin/nervus-ctl" --unit "$UNIT" upgrade-record down "$1" "$2" --why "$3" >/dev/null 2>&1 \
+    || "$VENV/bin/nervus-ctl" --unit "$UNIT" upgrade-record back "$1" "$2" --why "NERVUS IS DOWN: $3" >/dev/null \
+    || say "  NOTE  nervus is down, and the record of that could not be written to its audit log"
 }
 
 # database_version: the version of nervus's database, read as nervus's account; nothing if it has
@@ -448,6 +489,7 @@ kept_release() {
 if [ -n "$PROXMOX" ]; then
   [ "$(id -u)" = 0 ] || [ -n "$R" ] || die "run it as root"
   grep -qxF "$MARKER" "$DROPIN" 2>/dev/null || die "nervus was not installed by install.sh here; add the flags by hand (docs/install.md)"
+  check_address
   grep -q -- '--proxmox ' "$DROPIN" && die "the drop-in already has --proxmox; nothing changed"
   [ -f "$OPT/secrets/proxmox.yaml" ] || die "no $OPT/secrets/proxmox.yaml yet: run tools/proxmox-access on the Proxmox host first"
   "$VENV/bin/python" - "$OPT/hosts.yaml" <<'PY' || die "no entry in hosts.yaml is marked 'hypervisor: proxmox' yet (docs/install.md, A Proxmox host)"
@@ -498,12 +540,16 @@ if [ -n "$BACK" ]; then
   [[ $DB_KEPT =~ ^[0-9]+$ ]] || die "$FOLDER/src/nervus/database.py gives no SCHEMA_VERSION; nothing changed"
   DB_NOW=$(database_version) || die "the database, $STATE/nervus.db, cannot be read as nervus's account; nothing changed"
   if [ -n "$DB_NOW" ] && [ "$DB_NOW" -gt "$DB_KEPT" ]; then
-    die "the database's version, $DB_NOW, is newer than $KEPT knows, $DB_KEPT: a migration has run since the upgrade, so going back is refused. Only the backup made before the upgrade holds a database that release can use, and restoring it loses everything done since (docs/install.md, Backups); nothing changed"
+    # That backup is kept until the next upgrade, under a name that says which upgrade it was made
+    # before (ADR-0029 step 7). Looked for as nervus's account, in its own folder; named if it is there.
+    BEFORE=$(runuser -u nervus -- ls "$STATE/backups" 2>/dev/null | grep -F -- ".before-$NOW.tar.gz.age" | tail -n 1 || true)
+    die "the database's version, $DB_NOW, is newer than $KEPT knows, $DB_KEPT: a migration has run since the upgrade, so going back is refused. Only the backup made before the upgrade holds a database that release can use${BEFORE:+: it is kept as $STATE/backups/$BEFORE}, and restoring it loses everything done since (docs/install.md, Backups); nothing changed"
   fi
 
   OLD_DROPIN=$(cat "$DROPIN")
   NEW_DROPIN=$(dropin_for "$FOLDER/deploy/nervus.service") \
     || die "$DROPIN is not as install.sh writes it, so going back cannot write it again: put it right; nothing changed"
+  ports_of "$OLD_DROPIN" || die "$DROPIN gives no --bind-port or no --ui-port to check nervus on if it has to return to $NOW; nothing changed"
   ports_of "$NEW_DROPIN" || die "$KEPT's command line gives no --bind-port or no --ui-port to check nervus on; nothing changed"
   [ -f "$OPT/secrets/tls-root.crt" ] \
     || die "no $OPT/secrets/tls-root.crt, nervus's root, which nervus is checked against once it starts; nothing changed"
@@ -543,6 +589,7 @@ if [ -n "$BACK" ]; then
         || say "  NOTE  nervus is back, but its record of returning could not be written to its audit log"
       complain "going back did not finish, so nervus returned to $NOW by itself, $AS_BEFORE. Why: $NOT_UP. nervus's journal (journalctl -u nervus) is left for reading"
     else
+      record_down "$KEPT" "$NOW" "not up on $KEPT ($NOT_UP), nor, returned, on $NOW ($WHY)"
       complain "NERVUS IS DOWN: it was not up on $KEPT ($NOT_UP), nor, returned, on $NOW ($WHY). Read its journal: journalctl -u nervus -n 50. Restoring a backup on this machine is docs/install.md, Backups"
     fi
   }
@@ -592,26 +639,53 @@ else
 fi
 
 MISSING=() PACKAGES=()
+# missing_commands: what nervus needs besides Python and this machine lacks, added to MISSING, and
+# the packages that hold them to PACKAGES.
+missing_commands() {
+  command -v ssh-keygen >/dev/null 2>&1 || { MISSING+=("ssh-keygen"); PACKAGES+=(openssh-client); }
+  command -v useradd >/dev/null 2>&1 || { MISSING+=("useradd"); PACKAGES+=(passwd); }
+  command -v runuser >/dev/null 2>&1 || { MISSING+=("runuser"); PACKAGES+=(util-linux); }
+  command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 || { MISSING+=("age"); PACKAGES+=(age); }
+}
+
+# Python first. install.sh needs it itself before it can read this tree: to check --address, and to
+# name the release (tools/release-name). A machine without one is given it at a yes of its own, and
+# then read as any other. ADR-0023 question 5a promised it Python; checked with the Python it lacked,
+# its address was called no address instead, and naming its release would have stopped it next.
 if ! command -v python3 >/dev/null 2>&1; then
-  MISSING+=("python3, 3.11 or later"); PACKAGES+=(python3 python3-venv)
-elif ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+  if ! command -v apt-get >/dev/null 2>&1; then
+    MISSING+=("python3, 3.11 or later")
+    missing_commands
+    die "missing, and no apt-get to install them with: ${MISSING[*]}. Install them, then run it again"
+  fi
+  say ""
+  say "This machine has no Python, which install.sh needs itself before it can read this folder and"
+  say "show its plan. It will first run:"
+  say "  apt-get update, then apt-get install python3 python3-venv"
+  say "Nothing else changes until it has shown its whole plan and you have said yes to that too."
+  confirm
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv
+  command -v python3 >/dev/null 2>&1 || die "apt-get installed python3, yet there is no python3 to run here"
+  ok "installed python3 python3-venv"
+  STAYS="python3 and python3-venv, installed first, stay installed"
+fi
+[ -n "$UPGRADE" ] || check_address
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
   die "Python $(python3 -c 'import platform; print(platform.python_version())') is too old; nervus needs 3.11 or later"
 elif ! python3 -c 'import venv, ensurepip' 2>/dev/null; then
   MISSING+=("Python's venv"); PACKAGES+=(python3-venv)
 fi
-command -v ssh-keygen >/dev/null 2>&1 || { MISSING+=("ssh-keygen"); PACKAGES+=(openssh-client); }
-command -v useradd >/dev/null 2>&1 || { MISSING+=("useradd"); PACKAGES+=(passwd); }
-command -v runuser >/dev/null 2>&1 || { MISSING+=("runuser"); PACKAGES+=(util-linux); }
-command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 || { MISSING+=("age"); PACKAGES+=(age); }
+missing_commands
 if [ ${#MISSING[@]} -gt 0 ] && ! command -v apt-get >/dev/null 2>&1; then
   die "missing, and no apt-get to install them with: ${MISSING[*]}. Install them, then run it again"
 fi
 
 # The folder the code goes in is named for its release, the number and the code of exactly what
 # will be installed: a clone's committed tree, or the plain copy (ADR-0029 question 3a).
-# release-name runs on the machine's own python3, so it comes after the checks above: the address
-# check ran python3, and the version check refused one older than 3.11, which has no tomllib to
-# read pyproject.toml with.
+# release-name runs on the machine's own python3, so it comes after the checks above: Python is
+# here by now, and the version check refused one older than 3.11, which has no tomllib to read
+# pyproject.toml with.
 if [ -e "$TREE/.git" ]; then
   NAMED=$(git -C "$TREE" archive HEAD | python3 -I "$TREE/tools/release-name" --full --archive) \
     || die "this clone's release cannot be named (release-name says why, above); nothing changed"
@@ -621,6 +695,10 @@ else
 fi
 read -r RELEASE NUMBER _ <<<"$NAMED"
 REL=$OPT/releases/$RELEASE
+# Its lock is this release's: made for its number, and holding what pyproject.toml names. A release
+# is installed from its lock or not at all.
+python3 -I "$TREE/tools/lock-libraries" --check "$TREE" >/dev/null \
+  || die "this tree's requirements.lock is not its release's (lock-libraries says why, above); nothing changed"
 
 find_installed
 if never_ran_here; then unfinished_install >&2; exit 1; fi
@@ -645,6 +723,8 @@ if [ -n "$UPGRADE" ]; then
   OLD_DROPIN=$(cat "$DROPIN")
   NEW_DROPIN=$(dropin_for "$TREE/deploy/nervus.service") \
     || die "$DROPIN is not as install.sh writes it, so the upgrade cannot write it again: put it right, or upgrade by hand (docs/install.md); nothing changed"
+  ports_of "$OLD_DROPIN" \
+    || die "$DROPIN gives no --bind-port or no --ui-port to check nervus on if it has to go back; nothing changed"
   ports_of "$NEW_DROPIN" \
     || die "the new release's command line gives no --bind-port or no --ui-port to check nervus on; nothing changed"
   [ -f "$OPT/secrets/tls-root.crt" ] \
@@ -697,8 +777,10 @@ PY
   fi
   [ ${#PACKAGES[@]} -gt 0 ] && say "  - apt-get update, then apt-get install ${PACKAGES[*]} (missing: ${MISSING[*]})"
   [ -e "$REL" ] && say "  - $REL, here already and not the release running, removed first"
-  say "  - the new release built beside the running one, root's, in $REL, while nervus serves on"
-  say "  - a backup first, by the running release, into $STATE/backups; the recovery key: $CHECKED"
+  say "  - the new release built beside the running one, root's, in $REL, while nervus serves on,"
+  say "    its libraries fetched from the package index, each file checked against requirements.lock"
+  say "  - a backup first, by the running release, into $STATE/backups, and kept until the next upgrade;"
+  say "    the recovery key: $CHECKED"
   say "  - nervus stopped and started on the new release, which takes a few seconds: each client's"
   say "    session ends and it connects again, and a call in flight then is cut"
   if [ -n "$COPY_DB" ]; then
@@ -721,6 +803,7 @@ PY
   say "    it goes back to $WAS by itself"
   say ""
   confirm
+  STAYS=
 
   if [ ${#PACKAGES[@]} -gt 0 ]; then
     apt-get update
@@ -752,6 +835,20 @@ PY
     || die "the backup did not succeed, as it says: $MADE. Nothing was stopped: nervus runs on, on $WAS"
   BACKUP=$(sed -n 's/^made \([^ ]*\) .*$/\1/p' <<<"$MADE" | head -n 1)
   ok "a backup by the running release: ${BACKUP:-$MADE}"
+  # That backup kept until the next upgrade, under a second name the daily keeping never removes. The
+  # keeping holds only a day's newest, so a second backup the same day removed this one; and where an
+  # upgrade raises the database's version, this is the only backup the release before can read
+  # (ADR-0029 step 7). Asked of the release just built, which knows how: the one running may be from
+  # before it did. It must succeed, as the backup must, and nothing is stopped yet.
+  [ -n "$BACKUP" ] \
+    || die "the backup's name could not be read from what nervus-ctl said ($MADE), so it cannot be kept until the next upgrade. Nothing was stopped: nervus runs on, on $WAS"
+  KEPT_BACKUP=$("$REL/.venv/bin/nervus-ctl" --unit "$UNIT" upgrade-backup keep "$RELEASE" "$BACKUP" 2>&1) \
+    || die "the backup could not be kept until the next upgrade, as it says: $KEPT_BACKUP. Nothing was stopped: nervus runs on, on $WAS"
+  KEPT_BEFORE_STOP=1
+  # The name it is kept as is the one to check: a backup later the same day removes the daily one.
+  KEPT_AS=$(sed -n 's/^kept [^ ]* as \([^ ,]*\), until .*$/\1/p' <<<"$KEPT_BACKUP" | head -n 1)
+  case $BACKUP in */*) CHECK=${KEPT_AS:+${BACKUP%/*}/$KEPT_AS} ;; *) CHECK=$KEPT_AS ;; esac
+  ok "that backup kept until the next upgrade, whatever the daily keeping removes meanwhile${KEPT_AS:+, as $KEPT_AS}"
   "$VENV/bin/nervus-ctl" --unit "$UNIT" upgrade-record begin "$WAS" "$RELEASE" >/dev/null \
     || die "the upgrade's first record could not be written to nervus's audit log, so it does not begin (ADR-0001 s10). Nothing was stopped: nervus runs on, on $WAS"
 
@@ -764,13 +861,19 @@ PY
     if put_back "$WAS"; then
       "$VENV/bin/nervus-ctl" --unit "$UNIT" upgrade-record back "$WAS" "$RELEASE" --why "$NOT_UP" >/dev/null \
         || say "  NOTE  nervus is back, but its record of going back could not be written to its audit log"
+      # The backup kept for this upgrade goes: nervus runs again on the release that made it, which needs
+      # no second name for it. By the release that was built, the only one sure to know how. Where nervus
+      # is down, below, it stays: a restore would start from it.
+      "$REL/.venv/bin/nervus-ctl" --unit "$UNIT" upgrade-backup drop "$RELEASE" >/dev/null 2>&1 || true
       complain "the upgrade did not finish, so nervus went back to $WAS by itself, $AS_BEFORE. Why: $NOT_UP. $REL and nervus's journal (journalctl -u nervus) are left for reading; the next upgrade removes the folder"
     else
+      record_down "$WAS" "$RELEASE" "not up on $RELEASE ($NOT_UP), nor, gone back, on $WAS ($WHY)"
       complain "NERVUS IS DOWN: it was not up on $RELEASE ($NOT_UP), nor, gone back, on $WAS ($WHY). Read its journal: journalctl -u nervus -n 50. The backup made first is $BACKUP; restoring it on this machine is docs/install.md, Backups"
     fi
   }
   NOT_UP="systemctl could not stop nervus, as it says above"
   goes_back_with upgrade_goes_back
+  KEPT_BEFORE_STOP=
   systemctl stop nervus
   if [ -n "$COPY_DB" ]; then
     NOT_UP="the database could not be copied before its version rises, as it says above"
@@ -795,6 +898,9 @@ copy = sqlite3.connect(sys.argv[2]); sqlite3.connect(sys.argv[1]).backup(copy); 
     for old in "$OPT/releases"/*; do
       case ${old##*/} in "$RELEASE"|"$WAS") ;; *) rm -rf "$old" ;; esac
     done
+    # And the backup kept for this upgrade alone: those kept for earlier ones go with their releases.
+    "$VENV/bin/nervus-ctl" --unit "$UNIT" upgrade-backup only "$RELEASE" >/dev/null \
+      || say "  NOTE  nervus is up, but a backup kept for an earlier upgrade could not be removed"
     "$VENV/bin/nervus-ctl" --unit "$UNIT" upgrade-record up "$WAS" "$RELEASE" >/dev/null \
       || say "  NOTE  nervus is up, but the upgrade's last record could not be written to its audit log"
     say ""
@@ -807,8 +913,8 @@ copy = sqlite3.connect(sys.argv[2]); sqlite3.connect(sys.argv[1]).backup(copy); 
     fi
     [ -z "$RECOVERY" ] || { say ""; printf '%s\n' "$RECOVERY" | sed 's/^/  /'; }
     say ""
-    say "Check the backup made before the upgrade with the recovery key, as after every upgrade:"
-    say "  sudo $VENV/bin/nervus-ctl backup --check ${BACKUP:-<its name>}"
+    say "Check the backup made before the upgrade, kept until the next one, with the recovery key, as after every upgrade:"
+    say "  sudo $VENV/bin/nervus-ctl backup --check ${CHECK:-${BACKUP:-<its name>}}"
     exit 0
   fi
   NOT_UP=$WHY
@@ -821,6 +927,7 @@ say ""
 say "It will install nervus $NUMBER from $SOURCE:"
 [ ${#PACKAGES[@]} -gt 0 ] && say "  - apt-get update, then apt-get install ${PACKAGES[*]} (missing: ${MISSING[*]})"
 say "  - the account nervus, no login; the code and its own venv in $REL, root's, and $VENV a link to that venv"
+say "  - its libraries fetched from the package index, each file checked against requirements.lock"
 say "  - folders $OPT/secrets (0700), $OPT/transfer and $LOGDIR (0750), owned by nervus, which can change nothing else"
 say "  - an empty inventory ($OPT/hosts.yaml) and token file ($OPT/secrets/tokens.yaml, 0600)"
 if [ -n "$RESTORE" ]; then
@@ -837,6 +944,7 @@ say "  - the off switch, $STATE/switches.yaml, nothing switched off"
 say "  - then start nervus, serving HTTPS on 8000 (clients) and 8443 (web UI)"
 say ""
 confirm
+STAYS=
 
 # --- 3. install ----------------------------------------------------------------------
 

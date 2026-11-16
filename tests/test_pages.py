@@ -440,6 +440,17 @@ def test_the_list_shows_one_row_per_call_and_opens_each():
     assert "audit?host=node-b" in _links(page) and "audit?tool=exec" in _links(page)
 
 
+def test_the_list_names_a_vm_by_its_id_and_links_each_machine_to_its_own_filter():
+    # ADR-0022: a call that names a VM by `vmid` has no host; one made through the hypervisor has both.
+    by_id = _row({"id": "r2", "phase": "intent", "ts": T0, "tool": "exec", "token_id": "codex-anywhere",
+                  "vmid": 104, "command": "uptime"})
+    through = _row({"id": "r3", "phase": "intent", "ts": T0, "tool": "export", "token_id": "codex-anywhere",
+                    "host": "hv", "vmid": 104, "path": "/var/log/x"})
+    page = pages.page_audit(rows=[by_id, through], query=Query(), older=None, paged=False, until=T0, form_token="tok")
+    assert _links(page).count("audit?host=vmid+104") == 2 and _links(page).count("audit?host=hv") == 1
+    assert "vmid 104" in "".join(Parsed(page).text)
+
+
 def test_the_list_cuts_a_long_value_and_says_how_much_is_hidden():
     """ADR-0013 decision C."""
     page = pages.page_audit(rows=[_call_row("printf " + "A" * 32850 + "\nsecond line")], query=Query(),

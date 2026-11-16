@@ -268,7 +268,8 @@ def _list_row(row: Row) -> Markup:
         when=_second(row.when),
         client=_filter_link("client", row.client),
         tool=_filter_link("tool", row.tool),
-        host=_filter_link("host", row.host),
+        # Each machine the row is about, a link to its own filter; each is Markup, made by render().
+        host=Markup(" · ".join(_filter_link("host", name) for name in row.machines)),
         shown=shown,
         left_out=render(' <span class="left-out">{note}</span>', note=left_out) if left_out else Markup(""),
         outcome=row.outcome,
@@ -955,9 +956,11 @@ def page_backups(backups: list[BackupFile], last_check: str, has_key: bool, tier
     first, to download; a button that makes one now; when a check last passed,
     and the command that makes one, which needs the recovery key and so is
     never done here; and where copies go for the tier declared."""
-    rows = join(render('<tr><td><code>{name}</code></td><td>{made}</td><td>{size}</td>'
+    rows = join(render('<tr><td><code>{name}</code>{kept}</td><td>{made}</td><td>{size}</td>'
                        '<td><a href="backups?{query}">Download</a></td></tr>\n',
                        name=b.name, made=_when(b.made_at), size=f"{b.size / 1e6:.1f} MB",
+                       kept=render('<br><span class="muted">made before the upgrade to {release}, and kept until '
+                                   'the next upgrade</span>', release=b.kept_before) if b.kept_before else Markup(""),
                        query=urlencode({"download": b.name})) for b in backups) if backups else Markup(
         '<tr><td colspan="4" class="muted">None yet.</td></tr>\n')
     make = render("""<form method="post" action="backups">
@@ -973,8 +976,8 @@ def page_backups(backups: list[BackupFile], last_check: str, has_key: bool, tier
         """<h1>Backups</h1>
 {restored}{notice}<section>
 <p>nervus backs itself up once a day, keeping a backup a day for a week, one a week for a month and
-one a month for a year. Each is locked to the recovery key, whose private half only you hold: nervus
-cannot open its own backups.</p>
+one a month for a year, and the one made before the last upgrade until the next. Each is locked to
+the recovery key, whose private half only you hold: nervus cannot open its own backups.</p>
 {make}<div class="table">
 <table>
 <thead><tr><th>Backup</th><th>Made</th><th>Size</th><th></th></tr></thead>

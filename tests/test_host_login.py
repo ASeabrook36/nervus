@@ -181,6 +181,33 @@ class Standins:
     def path(self):
         return f"{self.bin}:/usr/bin:/bin"
 
+    def no_curl(self, *, apt="installs"):
+        """The machine has no curl anywhere on its PATH, which from here is this folder and one of links
+        to the few real commands the root command uses. Its apt-get records its arguments and what was on
+        its standard input, and then brings curl ("installs"), or fails ("fails"), or there is none
+        ("missing")."""
+        (self.bin / "curl").unlink()
+        real = self.bin.parent / "machine-real"
+        real.mkdir()
+        for name in ("sh", "dash", "bash", "mktemp", "rm", "cp", "cat", "printf", "env", "chmod", "true", "sleep"):
+            if found := shutil.which(name, path="/usr/bin:/bin"):
+                (real / name).symlink_to(found)
+        self.only = f"{self.bin}:{real}"
+        self.apt_calls = self.bin.parent / "apt-calls"
+        if apt == "missing":
+            return
+        curl = ('printf "%s\\n" "$@" > ' + shlex.quote(str(self.args)) + '\n'
+                'out=\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+                f'cp {shlex.quote(str(self.downloaded))} "$out"\n')
+        self._exe("apt-get", f'echo "$DEBIAN_FRONTEND apt-get $* [$(cat)]" >> {shlex.quote(str(self.apt_calls))}\n'
+                             + ('[ "$1" = install ] && { echo "E: Unable to locate package curl" >&2; exit 100; }\nexit 0\n'
+                                if apt == "fails" else
+                                f'[ "$1" = install ] && {{ printf \'#!/bin/sh\\n%s\' {shlex.quote(curl)} > {shlex.quote(str(self.bin / "curl"))}; '
+                                f'chmod 755 {shlex.quote(str(self.bin / "curl"))}; }}\nexit 0\n'))
+
+    def apt_called(self):
+        return self.apt_calls.read_text().splitlines() if self.apt_calls.exists() else []
+
 
 class World:
     def __init__(self, tmp_path, monkeypatch, playing):
@@ -721,6 +748,24 @@ async def test_the_scripts_step_lines_appear_in_the_run_as_they_come_before_it_e
     assert run.done and "agent has nervus key" in run.lines and run.lines[-1] == "agent has nervus key"
 
 
+async def test_a_machine_without_curl_shows_installing_curl_among_its_steps_and_enrolls(world, monkeypatch):
+    world.stand.no_curl()
+    monkeypatch.setenv("PATH", world.stand.only)
+    run, _, _ = await world.enroll()
+    assert "installing curl" in run.lines, run.lines
+    assert run.lines.index("installing curl") < len(run.lines) - 1  # then the script's own steps
+    assert "could not reach nervus" not in run.outcome
+
+
+async def test_a_machine_without_curl_or_apt_get_is_told_that_not_that_nervus_is_out_of_reach(world, monkeypatch):
+    world.stand.no_curl(apt="missing")
+    monkeypatch.setenv("PATH", world.stand.only)
+    run, _, _ = await world.enroll()
+    assert run.outcome == ("this machine has no curl, which fetches nervus's script, and no apt-get to install it "
+                           "with: install curl, then add the machine again. Nothing here was changed")
+    assert not run.enrolled
+
+
 async def test_a_machine_that_cannot_reach_nervus_says_so_naming_the_url_without_its_code(world):
     world.stand.curl(reachable=False)
     run, value, _ = await world.enroll()
@@ -917,9 +962,73 @@ def test_values_holding_quotes_reach_curl_exactly(tmp_path, shell):
     assert done.stderr == f"nervus enrollment: this machine could not reach nervus at {ODD_SHOWN}, so nothing here was changed\n"
 
 
+def _run_root_without_curl(stand, shell, tmp_path, stdin="a line left on standard input\n"):
+    return subprocess.run([shutil.which(shell), "-c", root_command(_url("C0DE"), PIN, SHOWN)], input=stdin,
+                          capture_output=True, text=True, env={"PATH": stand.only, "TMPDIR": str(tmp_path)}, timeout=30)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_machine_without_curl_is_given_it_by_apt_get_and_then_runs_the_two_lines(tmp_path, shell):
+    # ADR-0026 question 10. Such a machine was told "this machine could not reach nervus": true, and not
+    # the cause. nervus is root there, and its script installs tmux the same way.
+    stand = Standins(tmp_path)
+    stand.script("echo the script ran\n")
+    stand.no_curl()
+    done = _run_root_without_curl(stand, shell, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "nervus enrollment: installing curl\nthe script ran\n"
+    # As the script installs tmux: the lists first, nothing asked, and nothing of standard input reaches apt-get.
+    assert stand.apt_called() == ["noninteractive apt-get update -q []", "noninteractive apt-get install -y -q curl []"]
+    assert stand.curl_args()[:3] == ["-fsSk", "--pinnedpubkey", PIN]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_machine_with_curl_is_asked_nothing_of_apt_get(tmp_path, shell):
+    stand = Standins(tmp_path)
+    stand.script("echo the script ran\n")
+    calls = tmp_path / "apt-calls"
+    stand._exe("apt-get", f'echo called >> {calls}\n')
+    done = _run_root(stand, shell, tmp_path)
+    assert done.returncode == 0 and done.stdout == "the script ran\n" and not calls.exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_without_curl_or_apt_get_it_says_so_and_changes_nothing(tmp_path, shell):
+    stand = Standins(tmp_path)
+    stand.script("echo the script ran\n")
+    stand.no_curl(apt="missing")
+    done = _run_root_without_curl(stand, shell, tmp_path)
+    assert done.returncode == 1 and done.stdout == ""
+    assert done.stderr == ("nervus enrollment: this machine has no curl, which fetches nervus's script, and no "
+                           "apt-get to install it with: install curl, then add the machine again. Nothing here "
+                           "was changed\n")
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_curl_that_apt_get_cannot_install_says_so_and_runs_nothing(tmp_path, shell):
+    stand = Standins(tmp_path)
+    stand.script("echo the script ran\n")
+    stand.no_curl(apt="fails")
+    done = _run_root_without_curl(stand, shell, tmp_path)
+    assert done.returncode == 1 and "the script ran" not in done.stdout
+    assert done.stderr.splitlines()[-1] == ("nervus enrollment: apt-get could not install curl, which fetches "
+                                            "nervus's script: install it, then add the machine again")
+    assert "could not reach nervus" not in done.stderr
+
+
 def test_the_command_nervus_runs_is_the_two_lines_as_the_adr_gives_them():
     pin_arg = shlex.quote(PIN)
     assert root_command("https://h/e/C0DE", PIN, "https://h/e/<code>") == (
+        "if ! command -v curl >/dev/null 2>&1; then "
+        "command -v apt-get >/dev/null 2>&1 || { echo 'nervus enrollment: this machine has no curl, which fetches "
+        "nervus'\"'\"'s script, and no apt-get to install it with: install curl, then add the machine again. "
+        "Nothing here was changed' >&2; exit 1; }; "
+        "echo 'nervus enrollment: installing curl'; "
+        "DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null >/dev/null "
+        "&& DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl </dev/null >/dev/null "
+        "&& command -v curl >/dev/null 2>&1 "
+        "|| { echo 'nervus enrollment: apt-get could not install curl, which fetches nervus'\"'\"'s script: "
+        "install it, then add the machine again' >&2; exit 1; }; fi; "
         "t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; "
         f"curl -fsSk --pinnedpubkey {pin_arg} -o \"$t\" https://h/e/C0DE "
         "|| { echo 'nervus enrollment: this machine could not reach nervus at https://h/e/<code>, "

@@ -255,6 +255,80 @@ def test_each_filter_shows_exactly_the_rows_that_match(log):
             assert got == expected, (query, limit)
 
 
+# --- the machine a row is about, whatever its record calls it (decision E, the Host filter) --------
+
+
+def _vm_call(log, vmid, command):
+    run_id = log.record_intent("exec", {"token_id": "claude-code-ops", "client": "claude-code", "project": "nervus",
+                                        "vmid": vmid, "user": "agent", "cwd": "~", "command": command})
+    log.record_result(run_id, "exec", {"exit_code": 0, "duration_s": 0.1, "vm_note": "enrolled"})
+
+
+def _found(log, host):
+    return [r.subject for r in read_page(log.path, Query(host=host)).rows]
+
+
+def test_a_call_that_names_a_vm_by_its_id_shows_it_and_is_found_by_it(log):
+    # ADR-0022: a call may name a VM by `vmid`, and its records then name no host. The viewer's Host
+    # column was empty for such a call, and no machine filter found it (procedure 034).
+    _call(log, "on a host", host="node-a")
+    _vm_call(log, 104, "in a vm")
+    _vm_call(log, 1040, "in another vm")
+    row, = read_page(log.path, Query(host="vmid 104")).rows
+    assert row.subject == "in a vm" and row.host == "vmid 104" and row.machines == ("vmid 104",)
+    assert _found(log, "104") == ["in a vm"]  # its id alone, as a person would type it
+    assert _found(log, "vmid 10") == [] and _found(log, "10") == []  # a whole id, never its beginning
+    assert _found(log, "node-a") == ["on a host"] and _found(log, "vmid node-a") == []
+
+
+def test_a_refused_call_that_named_a_vm_is_found_by_it(log):
+    log.record_refusal("exec", {"token_id": "t", "host": None, "vmid": 104,
+                                "reason": "VMs need nervus's Proxmox settings (--proxmox)"})
+    row, = read_page(log.path, Query(host="vmid 104")).rows
+    assert row.kind == "refused" and row.machines == ("vmid 104",)
+
+
+def test_a_call_through_the_hypervisor_for_a_vm_is_found_by_either(log):
+    # An export of a VM's file names the hypervisor's entry and the VM; an upload gives the id as text.
+    log.record_intent("export", {"token_id": "t", "request_key": "k1", "host": "hv", "vmid": 104, "path": "/var/log/x"})
+    log.record_intent("upload", {"token_id": "t", "request_key": "k2", "vmid": "104",
+                                 "destination": {"vmid": "104", "path": "/root/x"}})
+    export, upload = reversed(read_page(log.path).rows)
+    assert export.machines == ("hv", "vmid 104") and export.host == "hv" and upload.machines == ("vmid 104",)
+    assert len(read_page(log.path, Query(host="vmid 104")).rows) == 2
+    assert [r.tool for r in read_page(log.path, Query(host="hv")).rows] == ["export"]
+
+
+@pytest.mark.parametrize("vmid", [True, None, "", "abc", "1" * 40, 1.5, [104], {"id": 104}])
+def test_what_is_not_a_vms_id_names_no_machine(log, vmid):
+    log.record_refusal("exec", {"token_id": "t", "host": None, "vmid": vmid, "reason": "not a VM id"})
+    row, = read_page(log.path).rows
+    assert row.machines == () and row.host == ""
+
+
+def test_enrolling_a_machine_and_an_operators_work_on_it_are_found_by_its_name(log):
+    # Their records name the machine as `name` or as `target`, not as `host`. A token's actions use
+    # `target` too, and a token may bear a machine's name: those are not about the machine.
+    run_id = log.record_intent("enroll", {"actor": "operator", "action": "login", "code_id": "c0de", "name": "web",
+                                          "address": "192.0.2.9", "level": "standard", "login": "alice"})
+    log.record_result(run_id, "enroll", {"enrolled": True, "outcome": "enrolled web, standard", "exit_status": 0})
+    log.record_operator("connect", {"target": "web", "machine_address": "192.0.2.9", "level": "standard"}, tool="ui")
+    log.record_operator("enrollment_code", {"target": "web", "code_id": "c0de", "level": "standard"}, tool="ui")
+    log.record_operator("move_machine", {"target": "web", "from": "192.0.2.9", "to": "192.0.2.10"}, tool="ui")
+    log.record_operator("remove_machine", {"target": "web", "level": "standard"}, tool="ui")
+    log.record_refusal("ui", {"actor": "operator", "page": "machines", "action": "connect", "target": "web",
+                              "reason": "nervus is locked down, so it enrolls nothing"})
+    log.record_operator("lock", {"target": "web", "kill_work": False}, tool="ui")
+    log.record_operator("lock", {"target": "web", "kill_work": False})  # nervus-ctl's
+    log.record_refusal("ui", {"actor": "operator", "page": "clients", "action": "off", "target": "web",
+                              "reason": "There is no token web."})
+    rows = read_page(log.path, Query(host="web")).rows
+    assert [(r.kind, r.tool, (r.entries[0].record or {}).get("action")) for r in rows] == [
+        ("refused", "ui", "connect"), ("operator", "ui", "remove_machine"), ("operator", "ui", "move_machine"),
+        ("operator", "ui", "enrollment_code"), ("operator", "ui", "connect"), ("call", "enroll", "login")]
+    assert all(r.machines == ("web",) for r in rows)
+
+
 def test_search_looks_in_every_field_ignoring_case(log):
     _call(log, "rm -rf /tmp/Build — done")
     r = log.record_intent("proxmox", {"token_id": "t", "method": "POST", "path": "/x", "params": {"node": "Hv"}})

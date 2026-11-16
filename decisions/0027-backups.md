@@ -188,6 +188,11 @@ carries the whole audit log, so at the first installation's rate (Context, point
 280 MB today and, estimated, 1.5 to 2 GB after a year, against about 700 MB for 7. Question 8 is
 where that is watched; the space a backup folder takes shows in `nervus-ctl status`.
 
+**Amended 2026-11-15 by ADR-0029 step 7, decided by the operator** ("Until the next upgrade
+(Recommended)"): beside this keeping, the backup made before an upgrade is kept, under a name of its
+own, until the next upgrade comes up. This keeping held it only while it was its day's newest, so a
+second backup the same day removed it (procedure 051, finding 5).
+
 ### 5. How a restore is done
 
 - **a. One command, on a nervus installed from the same release or a newer one:
@@ -609,7 +614,9 @@ a pipe, never a file.
    composes itself, with paths a client gave; a client's command goes on standard input and is not
    there (procedure 049). **Where copies go,
    answered the same day ("Yes, build it later"):** the installation's everyday computer pulls each
-   backup, as question 3a allows; built apart from this step.
+   backup, as question 3a allows; built apart from this step. **Asked again 2026-11-15, whether to
+   build it now: "Not now".** It stays unbuilt by that decision. Until it is built, a copy leaves
+   nervus's machine when the person downloads one from the Backups page (question 3a's first way).
 
 ## Verification
 

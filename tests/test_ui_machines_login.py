@@ -109,10 +109,18 @@ class World:
         if not self.audit.path.exists():
             return []
         rows = [json.loads(line) for line in self.audit.path.read_text().splitlines()]
-        return [r for r in rows if r.get("tool") == "ui" and r.get("action") == action]
+        # What was done, by its action: a refusal names the action it refused, and is not one of these.
+        return [r for r in rows if r.get("tool") == "ui" and r.get("phase") == "operator" and r.get("action") == action]
 
     def nothing_made(self):
         return self.codes.recent() == [] and (self.login is None or self.login.started == [])
+
+    def refusals(self):
+        """Every refusal the UI recorded, oldest first."""
+        if not self.audit.path.exists():
+            return []
+        rows = [json.loads(line) for line in self.audit.path.read_text().splitlines()]
+        return [r for r in rows if r.get("tool") == "ui" and r.get("phase") == "refused"]
 
 
 @pytest.fixture
@@ -204,6 +212,28 @@ def test_connect_in_lockdown_connects_to_nothing(world):
     page = world.connect()
     assert page.status_code == 400 and "nervus is locked down, so it enrolls nothing" in page.text
     assert world.login.asked == [] and world.nothing_made()
+
+
+def test_connect_and_the_login_refused_in_lockdown_are_each_on_record(world):
+    # Procedure 040, step 14: "no record of the lockdown refusals". Nothing was attempted, and nothing said so.
+    world.login.is_locked = True
+    assert world.connect().status_code == world.log_in().status_code == 400
+    connect, login = world.refusals()
+    assert [(r["page"], r["action"], r["target"], r["machine_address"], r["level"]) for r in (connect, login)] == [
+        ("machines", "connect", "box", ADDRESS, "standard"), ("machines", "login", "box", ADDRESS, "standard")]
+    assert connect["reason"] == login["reason"] == "nervus is locked down, so it enrolls nothing"
+
+
+@pytest.mark.parametrize("fields, says", [(dict(login="not an account"), "Give the admin account"),
+                                          (dict(password=""), "Give that account's password"),
+                                          (dict(host_key="not a key"), "Not connected")])
+def test_a_refused_login_is_on_record_without_its_password_or_anything_else_typed_in_it(world, fields, says):
+    assert world.log_in(**fields).status_code == 400
+    record, = world.refusals()
+    assert (record["action"], record["target"]) == ("login", "box") and says in record["reason"]
+    assert set(record) <= {"id", "phase", "ts", "tool", "actor", "page", "action", "target", "machine_address",
+                           "level", "reason", "address"}
+    assert not _audit_holds(world) and "not an account" not in world.audit.path.read_text()
 
 
 def test_a_machine_that_cannot_be_reached_says_why_on_the_machines_page(world):

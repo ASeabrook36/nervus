@@ -169,6 +169,15 @@ That restores the property decision 3 gives away: a history the agent cannot era
   project folder.
 - The read key is a plain file. It can only read the log, so anyone who can read the key gains
   nothing more.
+- **A pull that fails while nervus's machine answers is an alarm, after an hour.** *Amended
+  2026-11-15, decided by the operator.* A pull that cannot reach nervus's machine is not an alarm:
+  the copy's machine may be asleep or away, and the next pull catches up. As first built, every
+  failure counted as that, a refused key and another machine answering in nervus's place included,
+  so a copy that had stopped for good said nothing (procedure 013). Asked whether it should raise
+  an alarm, and after how long, the operator chose **"Nervus answers, pull fails (Recommended)"**:
+  an alarm once pulls have failed for an hour while nervus's machine itself answers on the
+  network, and silence while it does not. Not chosen: that, and also an alarm after seven days
+  without a pull for any reason; and no alarm.
 
 On the first installation the copy is on the operator's own laptop, pulled once a minute
 (deployment note 0009, procedure 013).

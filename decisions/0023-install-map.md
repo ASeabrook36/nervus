@@ -167,6 +167,13 @@ on purpose and were destroyed; the docs say not to do that with a real nervus.
   Ubuntu 26.04.1, Python 3.14.4, its `sudo` and coreutils Rust rewrites, the installer, nervus, a
   backup and an upgrade, as the docs say; read-only there through Ubuntu's own bubblewrap profile
   (ADR-0024 question 9, as amended).
+  *Mended 2026-11-15:* a machine with no Python at all was not installed what it lacked. The
+  installer needs Python itself, to check `--address` and to name the release, and used it for
+  both before it looked whether Python was there: such a machine was told its address was not an
+  IP address (found 2026-11-01, at ADR-0029 step 2). It now looks for Python first; where there
+  is none and `apt` exists it says so, asks, and installs Python alone, then reads the machine,
+  shows its plan and asks again, as on any other. Nothing but Python is installed before the
+  plan's own yes, and whatever stops it after that says Python stays installed.
 - b. Debian and Ubuntu by name, refusing everything else.
 - c. Also Fedora and its family, with `dnf`.
 

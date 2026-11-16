@@ -21,7 +21,7 @@ import yaml
 
 from nervus import ctl, identity
 from nervus.audit import AuditLog
-from nervus.backup import backup_name
+from nervus.backup import backup_name, kept, made_at
 from nervus.database import Database
 from nervus.tls import generate_own_authority
 
@@ -383,6 +383,106 @@ async def test_accept_keys_with_nothing_replaced_changes_nothing(first):
     before = first.tree()
     rc, out = await first.ctl("accept-keys", ask=lambda _: "ssh_key")
     assert rc == 0 and "nothing changed" in out and first.tree() == before
+
+
+# --- the backup made before an upgrade, kept until the next (ADR-0029 step 7) -------------------
+#
+# install.sh --upgrade asks for each of these, with the nervus-ctl of the release it has just built.
+
+NEXT, AFTER = "0.3.0-09bcc2ef1cd8", "0.4.0-1b2c3d4e5f60"
+
+
+def _kept_records(nervus):
+    return [(r["stage"], r.get("file"), r.get("kept_as"), r.get("removed")) for r in nervus.records()
+            if r.get("action") == "upgrade_backup"]
+
+
+async def test_the_backup_an_upgrade_made_is_kept_and_still_checks_and_restores_by_its_kept_name(first, systemctl):
+    from nervus.backup import kept_name
+    await first.ctl("backup")
+    made, = first.backups()
+    rc, out = await first.ctl("upgrade-backup", "keep", NEXT, str(made))  # the path `nervus-ctl backup` printed
+    assert rc == 0, out
+    kept_path = made.with_name(kept_name(made.name, NEXT))
+    assert kept_path.is_file() and f"kept {made.name} as {kept_path.name}" in out
+    assert _kept_records(first) == [("keep", made.name, kept_path.name, None)]
+    await asyncio.sleep(1.1)  # a backup's name is its second
+    rc, out = await first.ctl("backup")  # as the timer, the button or a second upgrade would, the same day
+    assert rc == 0 and kept_path.is_file(), out
+    rc, out = await first.ctl("backup", "--check", kept_path.name)
+    assert rc == 0 and "the check passed" in out, out
+    rc, out = await first.ctl("restore", kept_path.name, ask=lambda _: "restore")
+    assert rc == 0 and "restored." in out, out
+
+
+async def test_an_upgrade_that_is_up_leaves_only_its_own_kept_backup_and_one_that_went_back_drops_its_own(first):
+    from nervus.backup import kept_name
+    await first.ctl("backup")
+    made, = first.backups()
+    for release in (NEXT, AFTER):
+        assert (await first.ctl("upgrade-backup", "keep", release, made.name))[0] == 0
+    rc, out = await first.ctl("upgrade-backup", "drop", AFTER)  # that upgrade went back
+    assert rc == 0 and {p.name for p in first.backups()} == {made.name, kept_name(made.name, NEXT)}, out
+    assert (await first.ctl("upgrade-backup", "keep", AFTER, made.name))[0] == 0
+    rc, out = await first.ctl("upgrade-backup", "only", AFTER)  # and tried again, it came up
+    assert rc == 0 and {p.name for p in first.backups()} == {made.name, kept_name(made.name, AFTER)}, out
+    assert [(stage, removed) for stage, _, _, removed in _kept_records(first) if stage != "keep"] == [
+        ("drop", [kept_name(made.name, AFTER)]), ("only", [kept_name(made.name, NEXT)])]
+    assert (await first.ctl("upgrade-backup", "only", AFTER))[0] == 0  # nothing more to remove is no failure
+
+
+async def test_an_upgrade_tried_again_keeps_its_new_backup_in_place_of_the_earlier_tries(first):
+    # The first try kept its backup and stopped before nervus was stopped; nothing dropped it.
+    from nervus.backup import kept_name
+    await first.ctl("backup")
+    earlier, = first.backups()
+    assert (await first.ctl("upgrade-backup", "keep", NEXT, earlier.name))[0] == 0
+    await asyncio.sleep(1.1)  # a backup's name is its second
+    await first.ctl("backup")
+    again = next(p for p in first.backups() if made_at(p.name) and p != earlier)
+    rc, out = await first.ctl("upgrade-backup", "keep", NEXT, again.name)
+    assert rc == 0 and f"removed {kept_name(earlier.name, NEXT)}" in out, out
+    assert [p.name for p in first.backups() if kept(p.name)] == [kept_name(again.name, NEXT)]
+    assert ("superseded", None, None, [kept_name(earlier.name, NEXT)]) in _kept_records(first)
+
+
+@pytest.mark.parametrize("args, says", [
+    (("keep", NEXT), "keep needs the backup"),
+    (("keep", "0.3", "nervus-backup-20261028T163000Z.tar.gz.age"), "not a release's name"),
+    (("keep", NEXT, "notes.txt"), "not a backup's name"),
+    (("keep", NEXT, "nervus-backup-20261028T163000Z.tar.gz.age"), "cannot keep"),  # no such backup here
+    (("keep", NEXT, "/etc/nervus-backup-20261028T163000Z.tar.gz.age"), "not in nervus's backup folder"),
+    (("only", "0.3"), "not a release's name"),
+    (("drop", NEXT, "nervus-backup-20261028T163000Z.tar.gz.age"), "takes a release alone"),
+])
+async def test_what_cannot_be_kept_is_refused_saying_why_and_nothing_is_made(first, args, says):
+    await first.ctl("backup")
+    before = first.backups()
+    rc, out = await first.ctl("upgrade-backup", *args)
+    assert rc == 1 and says in out, out
+    assert first.backups() == before
+
+
+async def test_a_keeping_that_cannot_be_recorded_does_not_happen(first):
+    from nervus.backup import kept_name
+    await first.ctl("backup")
+    made, = first.backups()
+    log = first.service.audit_log
+    log.rename(log.with_name("audit.kept"))
+    log.mkdir()  # a folder where the log should be: every write to it fails
+    rc, out = await first.ctl("upgrade-backup", "keep", NEXT, made.name)
+    assert rc == 1 and first.backups() == [made], out
+
+
+async def test_status_names_the_backup_kept_from_before_the_upgrade(first, monkeypatch):
+    from nervus.backup import kept_name
+    monkeypatch.setattr(ctl, "running_jobs", _no_jobs)
+    await first.ctl("backup")
+    made, = first.backups()
+    await first.ctl("upgrade-backup", "keep", NEXT, made.name)
+    _, out = await first.ctl("status")
+    assert "backups: 1 in" in out  # the daily ones, counted as before
+    assert f"kept from before the upgrade to {NEXT}, until the next: {kept_name(made.name, NEXT)}" in out
 
 
 # --- status --------------------------------------------------------------------------

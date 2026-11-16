@@ -11,6 +11,9 @@ so the record shows what was not chosen.
 The draft was **revised the same day** after the operator's comments on the first one (VMs may
 live for a minute or for years; efficiency means tokens and complexity as well as speed) and the
 measurement that followed: questions B, C, F, G, I, J and L changed before the decision.
+**Amended 2026-11-15, decided by the operator** (question F, "Amended 2026-11-15"): the template
+gives its clones the host's own processor model, and what a clone carries over from the template
+is said in the `proxmox` tool's own description.
 **Date:** 2026-10-15
 **Rewritten:** 2026-10-17, under ADR-0019 F, to name no installation. No decision changed; the
 clone's sizes are nervus's defaults. The original, with the first installation's host and
@@ -309,6 +312,28 @@ A clone may live for a minute or for years (Context), so the defaults assume nei
    upgrade, which a 60-second test pays for nothing.
 
 *Recommended: 1.*
+
+**Amended 2026-11-15, decided by the operator.** Two things a clone takes from its template, each
+found by a trial and neither decided until now, put to the operator together:
+
+- **The processor model.** The template set none, so a clone got the hypervisor's default model:
+  an old baseline, without instructions that newer programs are built for. One such program,
+  tried in a clone, ran without end until that VM was given a newer model (procedure 032). Asked
+  which model the template should set, the operator chose **"The host's own (Recommended)"**, over
+  a fixed baseline (`x86-64-v3`). The template is built with `cpu: host`: a clone sees the
+  processor its host has, so what the hardware can run, runs. It is the usual choice for a single
+  host. Its cost is that a running VM cannot be moved live to a host with another processor, so,
+  like the bridge and the storage, it can be set when the template is built (`CPU_MODEL`). A
+  default, not a limit, as size and memory are.
+- **The template's protection, tag and description.** A clone inherits all three (order of work,
+  step 3): the hypervisor copies a template's configuration, and the template itself must keep
+  `protection: 1` (question E). The recipe has the clone-maker set its own (step 4), and each
+  trial since set them by hand (procedures 042, 047). Asked how a clone should lose them, the
+  operator chose **"Say it where agents read (Recommended)"**, over nervus clearing them itself
+  after a clone. The hypervisor's behaviour stays, and a VM meant to last keeps its protection.
+  The `proxmox` tool's own description, which every client is shown, says what the recipe says:
+  on a clone, set `protection=0` for a VM you will destroy, and your own tag and description. The
+  tool stays a pass-through.
 
 **On the home network.** The default bridge is usually the home network, so a clone can reach
 everything the host's other VMs can. With no

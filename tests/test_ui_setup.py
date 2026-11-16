@@ -175,6 +175,20 @@ def test_what_does_not_apply_is_refused_and_says_why(browser, store, audit, fiel
     assert store.declared() == [] and _ui_records(audit, "declare_internal", "withdraw_internal") == []
 
 
+@pytest.mark.parametrize("fields, target, why", [
+    ({"action": "tier", "tier": "4"}, "4", "is not a tier"),
+    ({"action": "declare", "network": "not a range"}, "not a range", "is not an address range"),
+    ({"action": "withdraw", "network": "5.6.7.0/24"}, "5.6.7.0/24", "is not declared internal"),
+])
+def test_a_refused_form_on_the_setup_page_is_recorded_with_what_was_asked_and_why(browser, audit, fields, target, why):
+    # ADR-0012 decision 6, as amended 2026-11-15: no refused form left a record, on any page.
+    assert _post(browser, **fields).status_code == 400
+    lines = [json.loads(line) for line in audit.path.read_text().splitlines()]
+    record, = [r for r in lines if r.get("phase") == "refused"]
+    assert (record["tool"], record["page"], record["action"], record["target"]) == ("ui", "setup", fields["action"], target)
+    assert why in record["reason"]
+
+
 def test_a_private_machine_carries_no_banner(db, audit):
     browser = _signed_in(db, audit, check("0.0.0.0", interfaces=lambda: ["192.168.1.10"]))
     _post(browser, action="tier", tier="1")

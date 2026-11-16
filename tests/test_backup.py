@@ -20,6 +20,7 @@ import nervus
 from nervus import backup
 from nervus.audit import AuditLog
 from nervus.backup import BackupFailed, Pieces, backup_name, make_backup, made_at, prune, recipient, to_keep
+from nervus.backup import drop_kept_for, keep_for_upgrade, kept, kept_name, only_kept_for
 from nervus.database import Database
 
 NOW = datetime(2026, 10, 28, 16, 30, tzinfo=timezone.utc)
@@ -408,6 +409,124 @@ def test_a_second_backup_in_the_same_second_is_refused_and_says_why(install, key
     with pytest.raises(BackupFailed, match="made this same second"):
         make_backup(install.pieces, key[1], install.folder, install.audit, now=NOW)
     assert len(list(install.folder.iterdir())) == 1
+
+
+# --- the backup made before an upgrade, kept until the next (ADR-0029 step 7) -------------------
+#
+# Procedure 051, finding 5: the keeping holds a day's newest, so a second backup the same day removed
+# the one made before the upgrade. Where that upgrade raised the database's version, it was the only
+# backup the release before could read, and going back and the guide send a person to it.
+
+R1, R2 = "0.2.0-42c0b5a132ef", "0.3.0-09bcc2ef1cd8"
+
+
+def _backup_file(folder: Path, when=NOW, content=b"made before the upgrade") -> Path:
+    path = folder / backup_name(when)
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return path
+
+
+def test_a_kept_backup_has_a_name_of_its_own_which_no_keeping_reads_as_a_backups():
+    name = kept_name(backup_name(NOW), R2)
+    assert name == "nervus-backup-20261028T163000Z.before-0.3.0-09bcc2ef1cd8.tar.gz.age"
+    assert made_at(name) is None  # so the daily keeping, in this release and in every one before it, leaves it
+    assert kept(name) == (NOW, R2)
+    assert kept(backup_name(NOW)) is None and kept("notes.txt") is None and kept(name + ".partial") is None
+    assert kept("nervus-backup-20261301T000000Z.before-0.3.0-09bcc2ef1cd8.tar.gz.age") is None  # no such day
+
+
+@pytest.mark.parametrize("name, release", [
+    (backup_name(NOW), "0.3-09bcc2ef1cd8"), (backup_name(NOW), "0.3.0-09BCC2EF1CD8"), (backup_name(NOW), "../x"),
+    (backup_name(NOW), "0.3.0-09bcc2ef1cd8/x"), ("notes.txt", R2), ("../" + backup_name(NOW), R2),
+    (kept_name(backup_name(NOW), R1), R2),
+])
+def test_only_a_backup_and_a_release_by_their_own_names_make_a_kept_name(name, release):
+    with pytest.raises(BackupFailed):
+        kept_name(name, release)
+
+
+def test_a_backup_kept_for_an_upgrade_outlives_a_later_backup_the_same_day(tmp_path):
+    before = _backup_file(tmp_path)
+    kept_path = keep_for_upgrade(tmp_path, before.name, R2)
+    assert kept_path == tmp_path / kept_name(before.name, R2)
+    later = _backup_file(tmp_path, NOW + timedelta(hours=1), b"made after it")
+    assert prune(tmp_path, NOW + timedelta(hours=1), keep=later) == [before.name]  # as ever: not its day's newest
+    assert kept_path.read_bytes() == b"made before the upgrade" and stat.S_IMODE(kept_path.stat().st_mode) == 0o600
+    # Nor a year of keeping after it.
+    for day in range(1, 400):
+        prune(tmp_path, NOW + timedelta(days=day), keep=_backup_file(tmp_path, NOW + timedelta(days=day), b"x"))
+    assert kept_path.read_bytes() == b"made before the upgrade"
+
+
+def test_keeping_twice_is_keeping_once(tmp_path):
+    before = _backup_file(tmp_path)
+    assert keep_for_upgrade(tmp_path, before.name, R2) == keep_for_upgrade(tmp_path, before.name, R2)
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([before.name, kept_name(before.name, R2)])
+
+
+@pytest.mark.parametrize("what", ["nothing", "a folder", "a pipe", "a link to a file elsewhere"])
+def test_what_is_not_a_backup_in_the_folder_is_not_kept(tmp_path, what):
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    source = folder / backup_name(NOW)
+    if what == "a folder":
+        source.mkdir()
+    elif what == "a pipe":
+        os.mkfifo(source)
+    elif what == "a link to a file elsewhere":
+        (tmp_path / "elsewhere").write_bytes(b"not a backup")
+        source.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(BackupFailed):
+        keep_for_upgrade(folder, source.name, R2)
+    assert not (folder / kept_name(source.name, R2)).exists()
+
+
+def test_where_a_second_name_cannot_be_given_the_backup_is_copied(tmp_path, monkeypatch):
+    # Not every file system gives a file two names.
+    def no_links(*args, **kwargs):
+        raise OSError(1, "Operation not permitted")
+    monkeypatch.setattr(os, "link", no_links)
+    before = _backup_file(tmp_path)
+    kept_path = keep_for_upgrade(tmp_path, before.name, R2)
+    assert kept_path.read_bytes() == before.read_bytes() and stat.S_IMODE(kept_path.stat().st_mode) == 0o600
+    assert kept_path.stat().st_ino != before.stat().st_ino
+
+
+def test_once_an_upgrade_is_up_only_the_backup_kept_for_it_stays(tmp_path):
+    first = keep_for_upgrade(tmp_path, _backup_file(tmp_path, NOW - timedelta(days=30)).name, R1)
+    second = keep_for_upgrade(tmp_path, _backup_file(tmp_path).name, R2)
+    (tmp_path / "notes.txt").write_bytes(b"mine")
+    daily = sorted(p.name for p in tmp_path.iterdir() if made_at(p.name))
+    assert only_kept_for(tmp_path, R2) == [first.name]
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([*daily, second.name, "notes.txt"])
+    assert only_kept_for(tmp_path, R2) == []
+
+
+def test_an_upgrade_that_went_back_drops_the_backup_kept_for_it_and_no_other(tmp_path):
+    first = keep_for_upgrade(tmp_path, _backup_file(tmp_path, NOW - timedelta(days=30)).name, R1)
+    second = keep_for_upgrade(tmp_path, _backup_file(tmp_path).name, R2)
+    assert drop_kept_for(tmp_path, R2) == [second.name] and first.exists() and not second.exists()
+    assert drop_kept_for(tmp_path, R2) == [] and len(list(tmp_path.iterdir())) == 3
+
+
+def test_dropping_for_a_release_can_spare_the_one_just_kept(tmp_path):
+    # An upgrade tried again makes a new backup: the one kept for the earlier try is superseded.
+    earlier = keep_for_upgrade(tmp_path, _backup_file(tmp_path, NOW - timedelta(hours=2)).name, R2)
+    again = keep_for_upgrade(tmp_path, _backup_file(tmp_path).name, R2)
+    other = keep_for_upgrade(tmp_path, _backup_file(tmp_path, NOW - timedelta(days=30)).name, R1)
+    assert drop_kept_for(tmp_path, R2, but=again.name) == [earlier.name]
+    assert again.exists() and other.exists() and not earlier.exists()
+
+
+def test_the_listing_gives_a_kept_backup_with_the_release_it_was_made_before(tmp_path):
+    from nervus.restore import listing
+    before = _backup_file(tmp_path, NOW - timedelta(days=30))
+    kept_path = keep_for_upgrade(tmp_path, before.name, R2)
+    before.unlink()  # long since removed by the daily keeping
+    newest = _backup_file(tmp_path)
+    assert [(b.name, b.kept_before) for b in listing(tmp_path)] == [(newest.name, None), (kept_path.name, R2)]
+    assert listing(tmp_path)[1].made_at == (NOW - timedelta(days=30)).timestamp()
 
 
 def test_made_at_returns_none_for_a_shaped_name_with_an_impossible_date():

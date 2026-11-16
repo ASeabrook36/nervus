@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncssh
@@ -729,6 +730,23 @@ async def test_an_upgrades_start_its_end_and_its_going_back_are_operator_records
         [("upgrade", stage, WAS, NOW, "not up")], out.getvalue()
 
 
+async def test_an_upgrade_that_ends_with_nervus_down_has_a_stage_of_its_own(ui):
+    # Neither release came up: the end that most needs a record (ADR-0029, "Settled already"). It is
+    # written with nervus stopped, as every upgrade record can be.
+    _, unit, _ = ui
+    out = io.StringIO()
+    assert await ctl.run(["--unit", str(unit), "upgrade-record", "down", WAS, NOW,
+                          "--why", "not up on either"], out=out) == 0, out.getvalue()
+    record, = _operator_records(ctl.read_unit(unit))
+    assert (record["action"], record["stage"], record["why"]) == ("upgrade", "down", "not up on either")
+
+
+def test_the_stages_every_release_has_known_keep_their_names_and_come_first():
+    # A later release's installer calls an earlier release's nervus-ctl, so a stage is never renamed or
+    # removed; "down", added later, is the one an installer must be ready to have refused.
+    assert ctl.UPGRADE_STAGES[:3] == ("begin", "up", "back") and "down" in ctl.UPGRADE_STAGES
+
+
 @pytest.mark.parametrize("was, now", [("0.2.0", NOW), (WAS, "0.3.0-09BCC2EF1CD8"), (WAS, "0.3-09bcc2ef1cd8"),
                                       ("../0.2.0-42c0b5a132ef", NOW), (WAS, "0.3.0-09bcc2ef1cd8 x")])
 async def test_an_upgrade_record_names_two_releases_or_records_nothing(ui, was, now):
@@ -747,6 +765,21 @@ def test_as_root_an_upgrade_record_is_written_as_the_units_account(ui, as_root):
     assert ctl.upgrade_record(svc, "begin", WAS, NOW, None, io.StringIO()) == 0
     assert _operator_actions(svc.audit_log) == ["upgrade"]
     assert as_root and all(a == {"user": 4242, "group": 4343, "extra_groups": []} for a in as_root)
+
+
+def test_as_root_a_backup_is_kept_as_the_units_account(ui, as_root, tmp_path):
+    # install.sh runs it as root: the second name is made in a folder of nervus's, so by nervus's account.
+    from nervus.backup import backup_name, kept_name
+    _, unit, _ = ui
+    svc = ctl.read_unit(unit)
+    folder = svc.database.parent / "backups"
+    folder.mkdir()
+    made = folder / backup_name(datetime.now(timezone.utc))
+    made.write_bytes(b"a backup")
+    assert ctl.upgrade_backup(svc, "keep", NOW, made.name, io.StringIO()) == 0
+    assert (folder / kept_name(made.name, NOW)).read_bytes() == b"a backup"
+    assert _operator_actions(svc.audit_log) == ["upgrade_backup"]
+    assert len(as_root) == 2 and all(a == {"user": 4242, "group": 4343, "extra_groups": []} for a in as_root)
 
 
 # --- the recovery key, piped where there is no terminal (procedure 054, finding 4) --------------------

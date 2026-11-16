@@ -31,6 +31,54 @@ log, a second record nervus cannot edit.
 switch any client off at once, or all of them, and read the audit log (ADR-0003, ADR-0013,
 ADR-0014).
 
+## How it works
+
+**Where everything sits.** Your agents never hold an SSH key. Each has a token of its own; nervus holds
+the one key, checks what each token may reach, and writes every call down.
+
+```mermaid
+flowchart LR
+    subgraph clients["Where your agents run"]
+        c1["Claude Code"]
+        c2["Codex"]
+        c3["Cursor"]
+    end
+    you(["You, in a browser"])
+    n["nervus, on a small machine of its own:<br/>checks each token,<br/>holds the only SSH key,<br/>writes every call to its audit log"]
+    subgraph fleet["Your machines"]
+        m1["A server"]
+        m2["Another server"]
+        px["A Proxmox host and its VMs,<br/>if you have one"]
+    end
+
+    c1 -- "a token of its own,<br/>over HTTPS" --> n
+    c2 --> n
+    c3 --> n
+    you -- "web UI: off switch,<br/>audit log, clients, machines" --> n
+    n -- "SSH, as an account<br/>the machine gave it" --> m1
+    n --> m2
+    n --> px
+```
+
+**One call, start to finish.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Your agent
+    participant N as nervus
+    participant L as Audit log
+    participant M as One of your machines
+    A->>N: Run this command on that machine (with its token)
+    Note over N: Refused here if the client is switched off<br/>or the machine is not on its list
+    N->>L: Who, what and where, written before anything runs
+    N->>M: Logs in over SSH with a certificate that names the client
+    M-->>N: Exit code and output
+    N->>L: How it ended
+    N-->>A: Exit code and bounded output
+    Note over M: The machine's own SSH log is a second record,<br/>which nervus cannot edit
+```
+
 ## What works, and what does not yet
 
 **Works:** everything in the table, a backup of nervus once a day that only you can open, restored with
@@ -118,6 +166,15 @@ client the fewest machines at the lowest level its work needs: read-only unless 
 something.
 
 ## Getting started
+
+```mermaid
+flowchart LR
+    s1["Install it:<br/>one command"] --> s2["Sign in,<br/>say where<br/>it runs"]
+    s2 --> s3["Add machines:<br/>read-only,<br/>standard or full"]
+    s3 --> s4["Give each<br/>client a token"]
+    s4 --> s5["Check your<br/>recovery key<br/>opens a backup"]
+    s5 --> s6(["Agents work;<br/>you read<br/>the audit log"])
+```
 
 1. Install it: **`docs/install.md`**. If you hand it to your own AI agent, it is written to be
    followed step by step, with a check after each.

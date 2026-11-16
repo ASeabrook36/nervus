@@ -157,6 +157,45 @@ def test_a_download_is_recorded_first_and_gives_the_backup(browser, folder, audi
         assert c.execute("SELECT kind, file FROM backup_event").fetchall() == [("downloaded", name)]
 
 
+# --- the backup made before an upgrade, kept until the next (ADR-0029 step 7) -------------------
+
+KEPT_FOR = "0.3.0-09bcc2ef1cd8"
+
+
+def test_the_page_shows_the_backup_kept_from_before_the_upgrade_and_says_how_long_it_stays(browser, folder):
+    from nervus.backup import keep_for_upgrade
+    old = folder.add(hours_old=30 * 24, data=b"from before the upgrade")
+    kept_name = keep_for_upgrade(folder.path, old, KEPT_FOR).name
+    (folder.path / old).unlink()  # long gone from the daily keeping
+    new = folder.add(hours_old=1)
+    page = browser.get("/backups").text
+    assert page.index(new) < page.index(kept_name) and f'href="backups?download={kept_name}"' in page
+    assert f"made before the upgrade to {KEPT_FOR}, and kept until the next upgrade" in page
+    assert "and the one made before the last upgrade until the next" in page  # the keeping, said whole
+    assert "No backup of nervus" not in page  # the newest is an hour old
+
+
+def test_the_kept_backup_downloads_as_any_other_recorded_first(browser, folder, audit, db):
+    from nervus.backup import keep_for_upgrade
+    kept_name = keep_for_upgrade(folder.path, folder.add(hours_old=48, data=b"the locked bytes"), KEPT_FOR).name
+    response = browser.get("/backups", params={"download": kept_name})
+    assert response.status_code == 200 and response.content == b"the locked bytes"
+    [record] = _records(audit, "backup_download")
+    assert record["file"] == kept_name
+    with db.transaction(write=False) as c:
+        (kind, file, made), = c.execute("SELECT kind, file, made_at FROM backup_event").fetchall()
+    assert (kind, file) == ("downloaded", kept_name) and abs(made - (time.time() - 48 * 3600)) < 5
+
+
+@pytest.mark.parametrize("name", ["nervus-backup-20261028T163000Z.before-0.3.0-09bcc2ef1cd8.tar.gz.age",
+                                  "nervus-backup-20261028T163000Z.before-..-..-nervus.db.tar.gz.age",
+                                  "x.before-0.3.0-09bcc2ef1cd8.tar.gz.age"])
+def test_only_a_kept_backup_the_folder_holds_can_be_downloaded(browser, folder, audit, name):
+    folder.add(hours_old=1)
+    assert browser.get("/backups", params={"download": name}).status_code == 404
+    assert not _records(audit, "backup_download")
+
+
 def test_a_download_needs_a_session(db, audit, folder):
     name = folder.add(hours_old=1, data=b"the locked bytes")
     stranger = TestClient(build_ui(db, audit, secure=True, backups=folder.backups()), base_url=ORIGIN)
@@ -199,6 +238,17 @@ def test_the_button_needs_nervuss_own_page(browser, folder):
     assert browser.post("/backups", data={"form_token": "forged", "action": "make"},
                         headers={"Origin": ORIGIN}).status_code == 403
     assert folder.made == []
+
+
+def test_a_form_the_backups_page_refuses_is_recorded(browser, audit):
+    # ADR-0012 decision 6, as amended 2026-11-15: no refused form left a record, on any page.
+    posted = browser.post("/backups", data={"form_token": _form_token(browser), "action": "unmake"},
+                          headers={"Origin": ORIGIN})
+    assert posted.status_code == 400
+    lines = [json.loads(line) for line in audit.path.read_text().splitlines()]
+    record, = [r for r in lines if r.get("phase") == "refused"]
+    assert (record["tool"], record["page"], record["action"]) == ("ui", "backups", "unmake")
+    assert record["reason"] == "That is not an action nervus knows."
 
 
 def test_a_backup_that_fails_says_why(browser, folder):

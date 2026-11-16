@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import getpass
 import json
@@ -71,7 +72,7 @@ import yaml
 
 import nervus
 from nervus import certs, identity, jobs, plainfile, restore, ssh
-from nervus.backup import recipient
+from nervus.backup import kept_name, recipient
 from nervus.auth import load_tokens
 from nervus.certs import CertificateAuthority
 from nervus.config import ConfigError, load_hosts
@@ -838,7 +839,10 @@ def accept_keys(service: Service, out, ask) -> int:
 
 
 # What an upgrade records, and a release's name as its folder has it (ADR-0029 question 3a).
-UPGRADE_STAGES = ("begin", "up", "back")
+# "down": the run ended with nervus up on neither release. The first three are every release's; "down"
+# came after them, and an installer writes each record with the nervus-ctl of the release current at
+# that moment, so it is ready to have the word refused by an older one (install.sh, record_down).
+UPGRADE_STAGES = ("begin", "up", "back", "down")
 RELEASE_NAME = re.compile(r"(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}-[0-9a-f]{12}")
 
 
@@ -847,7 +851,9 @@ def upgrade_record(service: Service, stage: str, was: str, now: str, why: str | 
     back are operator records, and an upgrade whose first record cannot be
     written does not begin (ADR-0001 s10). install.sh --upgrade writes each
     with the nervus-ctl of the release running then, so a later release's
-    installer calls an earlier release's: its arguments keep this shape."""
+    installer calls an earlier release's: its arguments keep this shape.
+    Its end with nervus down on both releases is one too, written with
+    nervus stopped, as each of these can be."""
     for release in (was, now):
         if not RELEASE_NAME.fullmatch(release):
             print(f"nervus-ctl: {release!r} is not a release's name, such as 0.0.0-42c0b5a132ef; nothing recorded",
@@ -858,10 +864,86 @@ def upgrade_record(service: Service, stage: str, was: str, now: str, why: str | 
     return 0
 
 
+# Run in a child process by upgrade_backup, as nervus's account, whose folder the backups are in. It
+# prints one JSON object: what was kept or removed, or why not.
+_KEPT_BACKUP = """
+import json, sys
+from pathlib import Path
+from nervus.backup import BackupFailed, drop_kept_for, keep_for_upgrade, only_kept_for
+request = json.loads(sys.stdin.read())
+folder = Path(request["folder"])
+try:
+    if request["stage"] == "keep":
+        kept_as = keep_for_upgrade(folder, request["file"], request["release"]).name
+        # What an earlier try at this upgrade kept is superseded by this one.
+        print(json.dumps({"kept_as": kept_as, "removed": drop_kept_for(folder, request["release"], but=kept_as)}))
+    elif request["stage"] == "only":
+        print(json.dumps({"removed": only_kept_for(folder, request["release"])}))
+    else:
+        print(json.dumps({"removed": drop_kept_for(folder, request["release"])}))
+except (BackupFailed, OSError) as exc:
+    print(json.dumps({"error": str(exc)}))
+"""
+
+KEPT_STAGES = ("keep", "only", "drop")
+
+
+def upgrade_backup(service: Service, stage: str, release: str, file: str | None, out) -> int:
+    """ADR-0029 step 7: the backup made before an upgrade to `release`, kept
+    apart from the daily keeping until the next upgrade comes up. install.sh
+    --upgrade asks for each stage, with the nervus-ctl of the release it has
+    built: `keep`, before nervus is stopped, gives that backup a second name
+    the daily keeping never removes; `only`, once nervus is up on the release,
+    removes the backups kept for earlier upgrades; `drop`, when the upgrade
+    went back, removes the one kept for it. Each is done as nervus's account,
+    and is an operator record: a keeping whose record cannot be written does
+    not happen (ADR-0001 s10); what was removed is recorded after."""
+    folder = restore.backups_folder(service)
+    if not RELEASE_NAME.fullmatch(release):
+        print(f"nervus-ctl: {release!r} is not a release's name, such as 0.0.0-42c0b5a132ef; nothing changed", file=out)
+        return 1
+    request = {"stage": stage, "release": release, "folder": str(folder)}
+    if stage != "keep":
+        if file is not None:
+            print(f"nervus-ctl: upgrade-backup {stage} takes a release alone; nothing changed", file=out)
+            return 1
+        removed = _as_account(service, _KEPT_BACKUP, [], "removing kept backups", stdin=json.dumps(request))["removed"]
+        if removed:
+            operator_record(service, "upgrade_backup", {"stage": stage, "before": release, "removed": removed})
+        for name in removed:
+            print(f"removed {name}, kept for another upgrade", file=out)
+        return 0
+    if file is None:
+        print("nervus-ctl: keep needs the backup to keep: upgrade-backup keep <release> <backup>; nothing changed",
+              file=out)
+        return 1
+    name = Path(file).name
+    if "/" in file and os.path.realpath(Path(file).parent) != os.path.realpath(folder):
+        print(f"nervus-ctl: {file} is not in nervus's backup folder, {folder}; nothing changed", file=out)
+        return 1
+    kept_as = kept_name(name, release)
+    record = operator_record(service, "upgrade_backup", {"stage": "keep", "before": release, "file": name,
+                                                         "kept_as": kept_as})
+    try:
+        done = _as_account(service, _KEPT_BACKUP, [], "keeping the backup", stdin=json.dumps({**request, "file": name}))
+    except ConfigError as exc:
+        with contextlib.suppress(ConfigError):
+            operator_record(service, "upgrade_backup", {"stage": "keep_failed", "before": release, "file": name,
+                                                        "keep_record": record, "reason": str(exc)})
+        raise
+    print(f"kept {name} as {kept_as}, until the upgrade after the one to {release}", file=out)
+    if done["removed"]:
+        operator_record(service, "upgrade_backup", {"stage": "superseded", "before": release, "removed": done["removed"]})
+    for gone in done["removed"]:
+        print(f"removed {gone}, kept by an earlier try at this upgrade", file=out)
+    return 0
+
+
 def backup_lines(service: Service) -> list[str]:
     """What `status` says of backups (question 4 and 7a)."""
     folder = restore.backups_folder(service)
-    backups = restore.listing(folder)
+    listed = restore.listing(folder)
+    backups = [b for b in listed if b.kept_before is None]
     lines = []
     if not service.recovery_key.exists():
         lines.append("WARNING: no recovery key, so no backup can be made: nervus-ctl recovery-key")
@@ -869,7 +951,10 @@ def backup_lines(service: Service) -> list[str]:
         hours = (time.time() - backups[0].made_at) / 3600
         lines.append(f"backups: {len(backups)} in {folder}, {sum(b.size for b in backups) / 1e6:.1f} MB; "
                      f"newest {backups[0].name}, {hours:.0f} hours old")
-    if warning := restore.stale(backups):
+    for b in listed:
+        if b.kept_before is not None:
+            lines.append(f"kept from before the upgrade to {b.kept_before}, until the next: {b.name}")
+    if warning := restore.stale(listed):
         lines.append(f"WARNING: {warning} Make one: nervus-ctl backup")
     try:
         events = database_change(service, "backup_events")["events"]
@@ -930,12 +1015,17 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--replace", action="store_true", help="replace the recovery key there is")
     sub.add_parser("start-empty", help="start with an empty database, or a new audit log, on purpose")
     sub.add_parser("accept-keys", help="accept a key of nervus's replaced on purpose")
-    p = sub.add_parser("upgrade-record", help="record an upgrade's start, its end or its going back "
-                                              "(install.sh --upgrade does)")
+    p = sub.add_parser("upgrade-record", help="record an upgrade's start, its end, its going back, or that it "
+                                              "left nervus down (install.sh --upgrade does)")
     p.add_argument("stage", choices=UPGRADE_STAGES)
     p.add_argument("was", metavar="FROM", help="the release upgraded from, as its folder is named")
     p.add_argument("now", metavar="TO", help="the release upgraded to")
-    p.add_argument("--why", help="why it went back")
+    p.add_argument("--why", help="why it went back, or is down")
+    p = sub.add_parser("upgrade-backup", help="keep the backup made before an upgrade until the next one, or remove "
+                                              "those kept for other upgrades (install.sh --upgrade does)")
+    p.add_argument("stage", choices=KEPT_STAGES)
+    p.add_argument("release", metavar="RELEASE", help="the release upgraded to, as its folder is named")
+    p.add_argument("file", metavar="BACKUP", nargs="?", help="for keep: the backup made before the upgrade")
     return parser
 
 
@@ -959,6 +1049,8 @@ async def run(argv: list[str], out=sys.stdout, ask=input, secret=read_secret) ->
             return accept_keys(service, out, ask)
         if args.command == "upgrade-record":
             return upgrade_record(service, args.stage, args.was, args.now, args.why, out)
+        if args.command == "upgrade-backup":
+            return upgrade_backup(service, args.stage, args.release, args.file, out)
         if args.command == "signin":
             return signin(service, out)
         if args.command == "signout":

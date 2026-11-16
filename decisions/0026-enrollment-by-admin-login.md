@@ -10,6 +10,8 @@ recommended"). Each question keeps its options, so the record shows what was not
 same day, each as recommended** ("Ask again", "Same 'another key' words"). **Question 9 added 2026-10-24**, found
 by procedure 040's trial, and **decided by the operator the same day, as recommended** ("Prefer ed25519"). Every
 step of the order of work done; deployed 2026-10-24 (procedure 041).
+**Question 10 added 2026-11-15**, from a finding of procedure 040's trial left open since, and **decided by the
+operator the same day, as recommended** ("Install curl itself (Recommended)").
 **Date:** 2026-10-22
 **Asked for by:** the operator, 2026-10-22: from nervus's web page, give a machine's "IP address or
 the host name … and nervus would just reach out to that machine and attempt to make a connection
@@ -260,6 +262,25 @@ learn to ignore the check. The key shown was the machine's own; nothing reached 
 and what `ssh-keygen -lF` shows first; b leaves most owners checking an RSA key, and c gives them
 more to compare for no more safety, since the comparison after the script covers every key.
 
+### 10. A machine without `curl`
+
+*Added 2026-11-15, found by procedure 040 (steps 3 and 11) and left open since.* The two lines fetch
+nervus's script with `curl`, so nervus's root command does too. On a machine without `curl` that
+command failed as an unreachable nervus does, and the owner was told "this machine could not reach
+nervus": true, and not the cause. Two of that trial's three machines had no `curl`. The script
+itself says "curl is not installed", but it cannot be fetched to say so.
+
+- **a. nervus installs `curl` itself, as its script installs tmux:** by `apt-get`, saying so in the
+  run's lines, then goes on. It is root on the machine by then, at the owner's word, and adding a
+  machine this way exists so that the owner needs no shell there. Where the machine has no
+  `apt-get`, it changes nothing and says that `curl` is missing and must be installed.
+- b. nervus changes nothing, says the machine has no `curl`, and gives the command that installs
+  it; the owner installs it on the machine and adds the machine again.
+
+*Recommended: a.* **Decided 2026-11-15: a** ("Install curl itself (Recommended)"). The two lines,
+which the owner runs with `curl` in hand, are unchanged; `docs/install.md` says a machine added by
+login needs an SSH server, and `curl` only for the two lines.
+
 ## Settled already
 
 - **The address is required** this way: nervus must know where to connect. ADR-0024 decision 4a's
@@ -402,6 +423,11 @@ ordinary user where possible.
      ```
      with `<pin>`, `<url>` and `<message>` each `shlex.quote`d, `<message>` being `f"nervus
      enrollment: this machine could not reach nervus at {shown}, so nothing here was changed"`.
+     *Since 2026-11-15 (question 10) the line begins with one more step:* where `command -v curl`
+     finds none, `apt-get update` and `apt-get install curl`, as the script's own `need` installs
+     tmux, after the step line `nervus enrollment: installing curl`, with nothing on either
+     command's standard input; without `apt-get`, or if it fails, a line saying which, exit 1, and
+     nothing fetched.
      `shown` is the URL with `<code>` in place of the code (`enroll_url(host, port, "<code>")`), so
      the code is never shown. Why each part: `mktemp`, so no copy is left in a folder for a later run
      to find (procedure 037's fault); the trap, so the copy is removed on every way out; `</dev/null`,

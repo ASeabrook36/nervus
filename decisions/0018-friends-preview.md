@@ -1,6 +1,7 @@
 # ADR-0018: a friends preview, exported from this repository with what is particular to the operator taken out
 
-**Status:** Proposed (Accepted when the verification below is observed). **Decided by the
+**Status:** **Accepted by the operator, 2026-11-15**, its verification observed on the public
+repository (procedure 064). **Decided by the
 operator on 2026-10-15**, in a Claude Code session: question A in the operator's own words
 (quoted below); B and the rest as recommended; C and D differently from the recommendation, as
 marked at each. Each question keeps its options, so the record shows what was not chosen.

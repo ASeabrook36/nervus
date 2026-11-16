@@ -1,6 +1,12 @@
 # ADR-0005: nervus will be published, and agentless push is the architecture
 
 **Status:** Proposed (Accepted when the verification below is observed)
+**Confirmed by the operator, 2026-11-15** ("Yes, in that order (Recommended)"): what is left
+before nervus is published more widely is three projects, in this order: client sign-in
+(ADR-0006), the connector (ADR-0008), and the container image (ADR-0005 decision 1). This record
+stays Proposed until the third is built: its verification items 2 and 5 are worded for that image.
+Item 1 was observed for the public repository on 2026-11-15 (procedure 064), item 3 as ADR-0024
+verification 2, and item 4 as ADR-0007 verification 7.
 **Date:** 2026-09-12
 **Extends:** ADR-0001, which scoped nervus to one operator, one fleet, one LAN
 **Decided by:** the operator, 2026-09-12

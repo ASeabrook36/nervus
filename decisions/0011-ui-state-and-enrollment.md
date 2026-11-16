@@ -1,6 +1,11 @@
 # ADR-0011: Phase 2 step 3 — where nervus keeps what the UI changes, and how enrollment works
 
-**Status:** Proposed (Accepted when the verification below is observed). **Decisions 1 to
+**Status:** Proposed (Accepted when the verification below is observed).
+**Confirmed by the operator, 2026-11-15** ("Yes, in that order (Recommended)"): what is left
+before nervus is published more widely is three projects, in this order: client sign-in
+(ADR-0006), the connector (ADR-0008), and the container image (ADR-0005 decision 1). This record
+stays Proposed until the first is built: its verification item 3 is about that sign-in's grants.
+What else it asked for is built, under ADR-0003, ADR-0012, ADR-0014 and ADR-0024. **Decisions 1 to
 3 were made by the operator on 2026-10-05**, in a Claude Code session; decision 3's place
 in the order is the session's proposal, which the operator did not object to. **Questions A
 and B were decided by the operator on 2026-10-06**, as the session recommended (below).

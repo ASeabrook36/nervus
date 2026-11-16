@@ -72,13 +72,15 @@ needs no copy anywhere else (ADR-0007 decision 8, as ADR-0025 amended it).
 - **A machine for nervus, where the table above says**: on a separate computer, a small container
   or VM is enough. Linux with systemd, and Python 3.11 or later; tested on Debian 13 with Python
   3.13, Ubuntu 24.04 with Python 3.12 and Ubuntu 26.04 with Python 3.14. Root there, once, to run
-  the installer.
+  the installer. A machine with no Python at all, as a small container can be, is asked first
+  whether the installer may install it, where the machine has `apt-get`.
 - **This repository on that machine**: a clone, or a copy (see "By hand" for an archive). The
   installer installs exactly the committed tree it sits in.
 - **An admin login on each machine nervus will reach, once**: root's, or an account that can use
   `sudo`, with its password, given in the web UI (step 3); or root there, to run two lines
-  instead. Linux with an SSH server and `curl`; nervus installs what else the level needs, and
-  `tmux` for background jobs. After that nervus needs no password anywhere, and keeps none.
+  instead. Linux with an SSH server; nervus installs what else the level needs, `tmux` for
+  background jobs, and, by the login, `curl` where the machine has none. After that nervus needs
+  no password anywhere, and keeps none.
 - **SSH from nervus's machine to each of them.**
 - **A client:** Claude Code, Codex or Cursor (`docs/clients.md`).
 - **A place to keep the recovery key**, which opens nervus's backups: a password manager, or paper.
@@ -258,7 +260,9 @@ or a copy left from an earlier try, changes nothing. If anything fails, the scri
 make new ones. If nervus does not add the machine, the script takes nervus's key off again; at full,
 on the machine nervus runs on, it refuses before changing anything.
 
-**What a machine needs:** Linux with an SSH server and `curl`. For Connect, also a password login
+**What a machine needs:** Linux with an SSH server. For the two lines, also `curl`, which fetches
+them; by Connect, nervus installs `curl` itself where it is missing and the machine has `apt-get`,
+and says so among its steps. For Connect, also a password login
 over SSH for root or for an account that can use `sudo`; most machines refuse root's password over
 SSH (OpenSSH's `PermitRootLogin`), so an account with `sudo` is the usual one. A machine you would
 rather set up yourself is done by hand ("By hand: a machine nervus reaches"); a Mac is not covered
@@ -342,7 +346,8 @@ expected:
   it can stop nervus and rewrite its audit log, so give it to none, or to the one you would trust
   with nervus itself.
 - `tools/proxmox-template`: a VM template agents can clone and use through the API alone
-  (ADR-0017).
+  (ADR-0017). Its clones are given the host's own processor model, so what the hardware can run,
+  runs in them; in a cluster of unlike hosts, name a model they share (`CPU_MODEL=x86-64-v3`).
 
 Then mark the hypervisor entry in the inventory (`hypervisor: proxmox`, as the example shows; and
 `issue: never` on a root entry, if you made one), and **on nervus**, once `tools/proxmox-access`
@@ -387,7 +392,10 @@ at one moment. Not the code, which a newer tree installs again, and not files pa
 
 **How it is kept.** nervus writes each backup into `/var/lib/nervus/backups`, readable by nervus
 alone, locked to the recovery key, once a day and whenever you press the button. It keeps one a day
-for a week, one a week for a month and one a month for a year, and nothing older. Each carries the
+for a week, one a week for a month and one a month for a year, and nothing older. Beside those it
+keeps the backup made before the last upgrade, until the next upgrade: its name ends
+`.before-<the release upgraded to>.tar.gz.age`, and the Backups page and `nervus-ctl status` say
+which it is. Each carries the
 whole audit log, so they grow with it; `nervus-ctl status` says how much space they take. A day
 without a new backup is a warning on every page of the web UI and in `nervus-ctl status`.
 
@@ -540,9 +548,13 @@ As at install, in a root shell leave `sudo` off. Then:
   packages it adds; the drop-in, if it changes; whether the database's version moves; what the off
   switch says; and when the recovery key last opened a backup.
 - It builds the new release beside the running one, in `/opt/nervus/releases/`, while nervus serves
-  on. If its libraries cannot be fetched it stops there, with nervus running as it was. Anything the
+  on. Its libraries are the ones the release's `requirements.lock` names, each file checked against
+  the hash named there: the set the release's tests ran. If they cannot be fetched, or one is not
+  the file named, it stops there, with nervus running as it was. Anything the
   new release needs that this installation lacks, such as a key, is made here too.
-- It makes a backup, by the running release, and goes no further without one.
+- It makes a backup, by the running release, and goes no further without one. That backup is kept
+  until the next upgrade, whatever the daily keeping removes meanwhile: it is the one made by the
+  release you could go back to.
 - It stops nervus, switches to the new release and starts it, which takes a few seconds. What
   clients see then is in `docs/clients.md`, "After nervus is upgraded".
 - It checks that nervus is up as its clients need it, not merely running: steady under systemd,
@@ -554,7 +566,8 @@ As at install, in a root shell leave `sudo` off. Then:
   upgrade's start and how it ended.
 
 **Afterwards**, as it ends by saying: check the backup it made with the recovery key, as step 5 says,
-and do what `CHANGES.md` says each client must do, which is often nothing.
+by the name it is kept under, which its last line gives; and do what `CHANGES.md` says each client
+must do, which is often nothing.
 
 **Going back**, if the new release is up but not what you want. In the same copy, or any with this
 script, since it installs nothing from it:
@@ -570,7 +583,8 @@ the one release before is kept. The database stays as it is: the older release i
 does not know, and the newer finds them as it left them if you upgrade again, which is the way
 forward. **It is refused once a release has raised the database's version**, as the upgrade's plan
 says one is about to, since the older release could not read it: only the backup made before the
-upgrade holds a database it can use, and restoring that loses everything done since ("Backups"). It
+upgrade holds a database it can use, and restoring that loses everything done since ("Backups").
+That backup is kept until the next upgrade, and the refusal names it. It
 is refused too while nervus's off switch cannot be read, since every release refuses every client then.
 
 Never install a newer tree over an installation in any other way: its release's folder would then
@@ -618,7 +632,9 @@ tar -xzf nervus.tar.gz -C /opt/nervus/releases/new --no-same-owner && rm -f /opt
 release=$(python3 -I /opt/nervus/releases/new/tools/release-name /opt/nervus/releases/new) && mv /opt/nervus/releases/new "/opt/nervus/releases/$release"
 useradd --system --home-dir /opt/nervus --shell /usr/sbin/nologin nervus
 python3 -m venv "/opt/nervus/releases/$release/.venv"
-"/opt/nervus/releases/$release/.venv/bin/pip" install "/opt/nervus/releases/$release"
+"/opt/nervus/releases/$release/.venv/bin/pip" install --require-hashes -r "/opt/nervus/releases/$release/requirements.lock"
+"/opt/nervus/releases/$release/.venv/bin/pip" install --no-deps --no-index --no-build-isolation "/opt/nervus/releases/$release"
+"/opt/nervus/releases/$release/.venv/bin/pip" check
 ln -s "releases/$release/.venv" /opt/nervus/.venv
 install -d -m 0700 -o nervus -g nervus /opt/nervus/secrets
 install -d -m 0750 -o nervus -g nervus /opt/nervus/transfer
@@ -633,7 +649,10 @@ files, such as `0.2.0-42c0b5a132ef`. Below, `<release>` is that name: `ls /opt/n
 prints it. The tree's own `hosts.yaml` is not the installation's, which is written below. The venv
 is built inside the release's folder and filled by its own `pip`, since a venv's scripts name the
 path they were installed at and it cannot be moved; `/opt/nervus/.venv` is a link to it, so the
-service and every command in this guide keep their paths. The code is root's, unpacked as root's
+service and every command in this guide keep their paths. Its libraries come from the package index,
+each at the version `requirements.lock` names and each file checked against the hash it names, so
+what is installed is the set this release's tests ran; nervus itself is then installed from the
+release's own folder, with nothing more fetched. The code is root's, unpacked as root's
 whoever owned the archive, and the account `nervus` can read it but change none of it, nor the link
 (ADR-0029 question 12): the account owns only its folders above, the inventory and token file
 below, and the keys it makes.

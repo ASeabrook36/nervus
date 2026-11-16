@@ -1,6 +1,10 @@
 # ADR-0006: clients sign in with OAuth, so no credential sits where every app can read it
 
 **Status:** Proposed (Accepted when the verification below is observed)
+**Confirmed by the operator, 2026-11-15** ("Yes, in that order (Recommended)"): what is left
+before nervus is published more widely is three projects, in this order: client sign-in
+(ADR-0006), the connector (ADR-0008), and the container image (ADR-0005 decision 1). This record
+is the first of them: unbuilt, and Proposed until it is built and observed.
 **Date:** 2026-09-16
 **Extends:** ADR-0001 s6 (clients and tokens) and s7 (consumer integration); ADR-0005 s4
 (client management in the web UI)

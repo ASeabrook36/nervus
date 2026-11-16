@@ -24,7 +24,11 @@ untracked goes out. In order, stopping at the first thing that fails:
      "## <number>", which may go on after a space, with something under it before the next
      "## ". The section's first line, which says "Not yet exported." until then, is "Exported
      <the day>." and nothing else in the commit an export is made from: tests/test_changes.py,
-     run in step 7, requires it.
+     run in step 7, requires it. And the result's requirements.lock must be this release's
+     (ADR-0029, settled 2026-11-15): made for this number, and holding what pyproject.toml
+     names, as the result's own tools/lock-libraries --check says. A release whose lock was
+     left from the one before is refused: its libraries are made again, at the newest
+     versions, for every release.
   5. Checks every file against the map's check list (secrets/preview-map.yaml, never in the
      repository). A hit stops it: the fix is made in this repository, at the source. Nothing is
      rewritten (ADR-0018's amendment: a check, not a rewrite). The map may allow a line, under
@@ -137,6 +141,19 @@ def changes(out: Path, number: str) -> None:
         raise Stop(f"CHANGES.md's section for {number} is empty; say in it what changed, in this repository")
 
 
+def lock(out: Path) -> None:
+    """The release's lock is its own, by the result's own copy of the tool that makes it."""
+    tool = out / "tools" / "lock-libraries"
+    if not tool.is_file():
+        raise Stop("the export has no tools/lock-libraries, which checks its requirements.lock; it is part of "
+                   "this repository")
+    done = subprocess.run([sys.executable, "-I", str(tool), "--check", str(out)], capture_output=True, text=True,
+                          check=False)
+    if done.returncode:
+        why = done.stderr.strip().removeprefix("lock-libraries: ").replace(str(out), "the export")
+        raise Stop(f"{why}; in this repository, run tools/lock-libraries, commit what it makes, and export that commit")
+
+
 def release(out: Path, previous: Path) -> tuple[str, str]:
     number = release_number(out, "the export", "set [project] version in pyproject.toml, in this repository")
     last = release_number(previous, f"the last export ({previous})",
@@ -146,6 +163,7 @@ def release(out: Path, previous: Path) -> tuple[str, str]:
         raise Stop(f"the release number {number} is not above the last export's, {last}; "
                    "raise it in pyproject.toml, in this repository")
     changes(out, number)
+    lock(out)
     return number, last
 
 
@@ -266,7 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         sha = build(args.commit, out)
         say(f"1-3. built from {sha[:7]}: the deployment record left out, the preview's own files added")
         number, last = release(out, previous)
-        say(f"4.   release {number}, above the last export's {last}; CHANGES.md has its section")
+        say(f"4.   release {number}, above the last export's {last}; CHANGES.md has its section; "
+            "requirements.lock is this release's")
         passed = check(out, checks, allowed)
         say(f"5.   the check list ({len(checks)} entries) found nothing"
             + (f"; passed over, as the map allows: {', '.join(passed)}" if passed else ""))

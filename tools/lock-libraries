@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""lock-libraries -- make, or check, requirements.lock (ADR-0029, "Not settled here", settled
+2026-11-15).
+
+    tools/lock-libraries [TREE]            make TREE's requirements.lock again; needs uv
+    python3 -I tools/lock-libraries --check [TREE]
+                                           say whether TREE's lock is its release's; changes nothing
+
+TREE is this repository's top folder unless given.
+
+pyproject.toml names nervus's own libraries, each at one exact version. What those need in turn was
+whatever the package index offered on the day of an install, so two installs of one release could
+differ, and a friend could install a set no test ran on. requirements.lock names every library an
+install fetches: nervus's own, what they need in turn, and what builds nervus's package
+([build-system] requires), each at one exact version, with the SHA-256 of each of its files. The
+installer installs from it with pip's hash-checking mode, so an install is the set the release's
+tests ran, and a file that differs from the one named stops it.
+
+A lock is made for one release, and says which in its opening lines. It is made again, at the
+newest versions pyproject.toml allows, for every release: that is how libraries move, and the
+export refuses a release whose lock was not made for it. It is never edited by hand.
+
+Making asks uv (https://docs.astral.sh/uv/) to resolve for every system and every Python that
+pyproject.toml's requires-python admits, from the oldest, so one lock serves each machine the
+installer accepts. It needs the package index. What it made is checked, as --check checks, before
+it replaces the lock that was there.
+
+--check needs nothing beyond Python's standard library: install.sh runs it with the machine's own
+Python before it changes anything, and the export and the tests run it too. It holds that:
+- the lock says it was made for the release pyproject.toml names;
+- each library pyproject.toml names, and what builds nervus's package, is one exact version there,
+  and the lock holds that version of it;
+- every line of the lock is a library at one exact version, and each has a hash.
+
+Exit 0: made, or the lock is this release's. Exit 1: refused, saying why on standard error, with
+nothing changed. Exit 2: it could not run (its arguments).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+LOCK = "requirements.lock"
+MADE_FOR = re.compile(r"^# Made for nervus (\S+) on ", re.M)
+PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)")
+HEADER = """\
+# requirements.lock: every library an install of nervus fetches, each at one exact version, each of
+# its files named by its SHA-256, so that an install is the set this release's tests ran (ADR-0029).
+# Made for nervus {number} on {day}, by tools/lock-libraries with {uv}.
+# Not written by hand. To move a library, change pyproject.toml if it is named there, and run
+# tools/lock-libraries again: every release has its lock made again, at the newest versions.
+"""
+
+
+class Refused(Exception):
+    """The lock is not this release's, or could not be made; the message says why."""
+
+
+def name_of(library: str) -> str:
+    """A library's name as the package index compares names (PEP 503)."""
+    return re.sub(r"[-_.]+", "-", library).lower()
+
+
+def named(tree: Path) -> tuple[str, list[tuple[str, str, str]], str]:
+    """From pyproject.toml: the release's number; each library it names, and what builds nervus's
+    package, as (name, version, as written); and the oldest Python it takes."""
+    try:
+        project = tomllib.loads((tree / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refused(f"cannot read {tree / 'pyproject.toml'}: {exc}") from exc
+    try:
+        number = project["project"]["version"]
+        asked = list(project["project"].get("dependencies", [])) + list(project["build-system"]["requires"])
+        oldest = re.fullmatch(r">=\s*(\d+\.\d+)", project["project"]["requires-python"]).group(1)
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise Refused(f"{tree / 'pyproject.toml'} does not name a version, its build requirements and a "
+                      f"requires-python of the form >=3.11 ({exc!r})") from exc
+    exact = []
+    for requirement in asked:
+        found = PIN.fullmatch(requirement.strip())
+        if not found:
+            raise Refused(f"pyproject.toml's {requirement} is not one exact version (name==version), so no lock "
+                          "can be held to it")
+        exact.append((name_of(found.group(1)), found.group(2), requirement.strip()))
+    return number, exact, oldest
+
+
+def locked(text: str) -> dict[str, str]:
+    """Each library a lock holds, by name, with its version. Refuses a lock with a line that is not a
+    library at one exact version, or with a library that has no hash."""
+    found: dict[str, str] = {}
+    current, hashes = None, 0
+
+    def close() -> None:
+        if current is not None and hashes == 0:
+            raise Refused(f"{LOCK}'s {current} has no --hash, so its files would be installed unchecked")
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line.startswith((" ", "\t")):
+            if current is None or not re.fullmatch(r"--hash=sha256:[0-9a-f]{64}( \\)?", stripped):
+                raise Refused(f"{LOCK} has a line that is neither a library nor one of its hashes: {stripped!r}")
+            hashes += 1
+            continue
+        close()
+        pin = PIN.match(stripped)
+        rest = stripped[pin.end():] if pin else ""
+        if not pin or not re.fullmatch(r"( ;[^\\]*)?( \\)?", rest):
+            raise Refused(f"{LOCK} has a line that is not a library at one exact version: {stripped!r}")
+        current, hashes = name_of(pin.group(1)), 0
+        found[current] = pin.group(2)
+    close()
+    return found
+
+
+def check(tree: Path, text: str | None = None) -> str:
+    """The release the lock in `tree` is for, if it is that tree's release's lock; else Refused.
+    `text` is a lock just made, not yet in place."""
+    number, exact, _ = named(tree)
+    if text is None:
+        try:
+            text = (tree / LOCK).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise Refused(f"{tree} has no {LOCK}: make it with tools/lock-libraries") from None
+        except (OSError, ValueError) as exc:
+            raise Refused(f"cannot read {tree / LOCK}: {exc}") from exc
+    made_for = MADE_FOR.search(text)
+    if made_for is None:
+        raise Refused(f"{LOCK} does not say which release it was made for: make it again with tools/lock-libraries")
+    if made_for.group(1) != number:
+        raise Refused(f"{LOCK} was made for {made_for.group(1)}, and this tree is {number}: every release has its "
+                      "lock made again, with tools/lock-libraries")
+    holds = locked(text)
+    for name, version, written in exact:
+        if name not in holds:
+            raise Refused(f"pyproject.toml names {written}, and the lock has no {name}: make it again with "
+                          "tools/lock-libraries")
+        if holds[name] != version:
+            raise Refused(f"pyproject.toml names {written}, and the lock has {name} {holds[name]}: make it again "
+                          "with tools/lock-libraries")
+    return number
+
+
+def make(tree: Path) -> str:
+    """Make the tree's lock again with uv, check it, and put it in place. Returns what to say."""
+    number, exact, oldest = named(tree)
+    uv = shutil.which("uv")
+    if uv is None:
+        raise Refused("uv is not installed, and it makes the lock: install it (https://docs.astral.sh/uv/), "
+                      "then run this again; nothing changed")
+    version = subprocess.run([uv, "--version"], capture_output=True, text=True).stdout.split("(")[0].strip() or "uv"
+    build = [written for _, _, written in exact[len(exact) - len(_build_requires(tree)):]]
+    with tempfile.TemporaryDirectory() as work:
+        build_in, out = Path(work) / "build.in", Path(work) / "lock"
+        build_in.write_text("".join(f"{line}\n" for line in build))
+        done = subprocess.run(
+            [uv, "pip", "compile", str(tree / "pyproject.toml"), str(build_in), "--universal", "--generate-hashes",
+             "--python-version", oldest, "--upgrade", "--no-header", "--no-annotate", "--quiet", "-o", str(out)],
+            capture_output=True, text=True, cwd=work)
+        if done.returncode != 0 or not out.is_file():
+            raise Refused(f"uv could not make the lock: {(done.stderr or done.stdout).strip() or 'no reason given'}; "
+                          "nothing changed")
+        text = HEADER.format(number=number, day=datetime.date.today().isoformat(), uv=version) + out.read_text()
+    check(tree, text)
+    # Written beside and renamed over: the lock is the old one or the new one, never half of one.
+    fd, beside = tempfile.mkstemp(dir=tree, prefix=f".{LOCK}.", suffix=".new")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(beside, 0o644)
+        os.replace(beside, tree / LOCK)
+    except BaseException:
+        Path(beside).unlink(missing_ok=True)
+        raise
+    return f"{LOCK} made for nervus {number}: {len(locked(text))} libraries, with {version}"
+
+
+def _build_requires(tree: Path) -> list[str]:
+    return list(tomllib.loads((tree / "pyproject.toml").read_text(encoding="utf-8"))["build-system"]["requires"])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="lock-libraries", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--check", action="store_true", help="say whether the lock is this release's; changes nothing")
+    parser.add_argument("tree", nargs="?", type=Path, default=Path(__file__).resolve().parent.parent)
+    args = parser.parse_args()
+    try:
+        if args.check:
+            print(f"{LOCK} is nervus {check(args.tree)}'s, and holds what pyproject.toml names")
+        else:
+            print(make(args.tree))
+    except Refused as exc:
+        print(f"lock-libraries: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

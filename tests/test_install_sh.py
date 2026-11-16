@@ -92,9 +92,21 @@ STANDINS = {
         '    [ -e "$NERVUS_INSTALL_ROOT/.backup-has-key" ] && printf "age1%058d\\n" 1 > "$s/recovery.pub"\n'
         '    systemctl start nervus; echo "restored. Lockdown is on.";;\n'
         '  *" --last-check "*) echo "last check passed 2026-11-03 10:00, of nervus-2026-11-03T100000Z.age";;\n'
+        # upgrade-backup: which nervus-ctl was asked, by its path under the machine; .keep-fails, .only-fails.
+        '  *" upgrade-backup "*) echo "upgrade-backup asked of ${CALLED_AS#$NERVUS_INSTALL_ROOT}" >> "$LOG"\n'
+        '    for stage in keep only; do case " $* " in *" upgrade-backup $stage "*)\n'
+        '      [ -e "$NERVUS_INSTALL_ROOT/.$stage-fails" ] && { echo "nervus-ctl: cannot keep: disk full"; exit 1; };; esac; done\n'
+        # keep says what it kept the backup as, in the words of the real nervus-ctl.
+        '    case " $* " in *" upgrade-backup keep "*) echo "kept nervus-2026-11-04T120000Z.age as '
+        'nervus-2026-11-04T120000Z.before-it.age, until the upgrade after the one to it";; *) echo "kept";; esac;;\n'
         '  *" backup "*) [ -e "$NERVUS_INSTALL_ROOT/.backup-fails" ] && { echo "nervus-ctl: the backup failed: disk full"; exit 1; }\n'
         '    echo "made nervus-2026-11-04T120000Z.age (1.0 MB), locked to the recovery key age1000…";;\n'
         '  *" upgrade-record "*) [ -e "$NERVUS_INSTALL_ROOT/.record-fails" ] && { echo "nervus-ctl: cannot write"; exit 1; }\n'
+        # .no-down-stage: the nervus-ctl of a release from before the stage "down", refusing it as argparse does.
+        '    case " $* " in *" upgrade-record down "*) [ -e "$NERVUS_INSTALL_ROOT/.no-down-stage" ] && {\n'
+        '      echo "nervus-ctl upgrade-record: error: argument stage: invalid choice: down" >&2; exit 2; };; esac\n'
+        '    [ -e "$NERVUS_INSTALL_ROOT/.down-record-fails" ] && case " $* " in *"NERVUS IS DOWN"*|*" upgrade-record down "*)\n'
+        '      echo "nervus-ctl: cannot write"; exit 1;; esac\n'
         '    echo "recorded";;\n'
         '  *) echo "  https://ui.test:8443/signin?link=ONE-TIME";;\n'
         'esac'),
@@ -144,10 +156,16 @@ class Machine:
         no_venv = 'case "$*" in *ensurepip*) exit 1;; esac\n' if not venv else ""
         make_venv = (
             'if [ "$1" = -m ] && [ "$2" = venv ]; then d=$3; echo "venv $d" >> "$LOG"; mkdir -p "$d/bin"\n'
-            '  printf \'#!/bin/bash\\necho "$0 $*" >> "$LOG"\\n[ -e "$NERVUS_INSTALL_ROOT/.pip-fails" ] || exit 0\\n'
+            '  printf \'#!/bin/bash\\necho "$0 $*" >> "$LOG"\\n'
+            # .pip-hashes-differ: a file that is not the one the lock names; .pip-check-fails: a set that does not fit.
+            'case " $* " in *" --require-hashes "*) [ -e "$NERVUS_INSTALL_ROOT/.pip-hashes-differ" ] && {\\n'
+            '  echo "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE." >&2; exit 1; };;\\n'
+            '  " check ") [ -e "$NERVUS_INSTALL_ROOT/.pip-check-fails" ] && {\\n'
+            '  echo "nervus 0.1.0 has requirement mcp==2.2.0, but you have mcp 2.1.0."; exit 1; };; esac\\n'
+            '[ -e "$NERVUS_INSTALL_ROOT/.pip-fails" ] || exit 0\\n'
             'echo "ERROR: No matching distribution found for mcp" >&2; exit 1\\n\' > "$d/bin/pip"\n'
             f'  printf \'#!/bin/bash\\nexec {VENV_BIN}/nervus "$@"\\n\' > "$d/bin/nervus"\n'
-            f'  printf \'#!/bin/bash\\nexec {self.bin}/nervus-ctl-standin "$@"\\n\' > "$d/bin/nervus-ctl"\n'
+            f'  printf \'#!/bin/bash\\nCALLED_AS="$0" exec {self.bin}/nervus-ctl-standin "$@"\\n\' > "$d/bin/nervus-ctl"\n'
             f'  printf \'#!/bin/bash\\necho "$0 $*" >> "$LOG"\\n'
             f'if [ "${{1##*/}}" = ensure-switches ]; then a=(); for x in "$@"; do '
             f'[ "$x" = --owner ] && {{ skip=1; continue; }}; [ -n "$skip" ] && {{ skip=; continue; }}; a+=("$x"); done; '
@@ -156,6 +174,7 @@ class Machine:
         # tools/check-up: nervus answers, unless the release the link names has a .down-<release>.
         # (or the machine has a .down: nervus answers on no release). Each asking is logged.
         check_up = ('case "$*" in *tools/check-up*) echo "check-up" >> "$LOG"\n'
+                    '  echo "check-up asked on ${@: -2:1} ${@: -1}" >> "$LOG"\n'  # the two ports it was given
                     '  cur=$(readlink "$NERVUS_INSTALL_ROOT/opt/nervus/.venv")\n'
                     '  cur=${cur#releases/}; cur=${cur%/.venv}\n'
                     '  if [ -e "$NERVUS_INSTALL_ROOT/.down" ] || [ -e "$NERVUS_INSTALL_ROOT/.down-$cur" ]; then '
@@ -203,9 +222,13 @@ def _own_files() -> set[str]:
 
 
 def _numbered(tree: Path, number: str) -> None:
-    """The tree's release number made `number`."""
+    """The tree's release number made `number`, and its lock, where it has one, a lock made for that
+    release, as tools/lock-libraries makes one for each."""
     pyproject = tree / "pyproject.toml"
     pyproject.write_text(re.sub(r'(?m)^version = ".*"$', f'version = "{number}"', pyproject.read_text()))
+    lock = tree / "requirements.lock"
+    if lock.is_file():
+        lock.write_text(re.sub(r"(?m)^# Made for nervus \S+ on ", f"# Made for nervus {number} on ", lock.read_text()))
 
 
 def _tree(tmp: Path, git=True) -> Path:
@@ -501,8 +524,7 @@ def test_the_release_goes_in_one_folder_named_for_its_number_and_its_code(instal
 
 def test_the_folder_takes_the_trees_own_number(machine, tmp_path):
     tree = _tree(tmp_path / "seven", git=False)
-    pyproject = tree / "pyproject.toml"
-    pyproject.write_text(re.sub(r'(?m)^version = ".*"$', 'version = "0.7.0"', pyproject.read_text(), count=1))
+    _numbered(tree, "0.7.0")
     done = machine.run(tree, "--address", "192.0.2.5", "--yes")
     assert done.returncode == 0, done.stdout + done.stderr
     assert _release(machine).name.startswith("0.7.0-")
@@ -589,7 +611,12 @@ def test_the_venv_is_made_and_filled_at_its_final_path_by_its_own_pip(installed)
     rel = _release(m)
     log = m.logged()
     assert [line for line in log if line.startswith("venv ")] == [f"venv {rel}/.venv"]
-    assert [line for line in log if "/bin/pip " in line] == [f"{rel}/.venv/bin/pip install --quiet {rel}"]
+    # Its libraries from the lock, each file checked against its hash; then nervus itself, with nothing
+    # more fetched; then that the set fits together (ADR-0029, settled 2026-11-15).
+    assert [line for line in log if "/bin/pip " in line] == [
+        f"{rel}/.venv/bin/pip install --quiet --require-hashes -r {rel}/requirements.lock",
+        f"{rel}/.venv/bin/pip install --quiet --no-deps --no-index --no-build-isolation {rel}",
+        f"{rel}/.venv/bin/pip check"]
 
 
 def test_the_units_and_the_off_switch_come_from_the_release(installed):
@@ -738,6 +765,70 @@ def test_a_release_number_not_in_its_form_is_refused_and_nothing_changes(machine
     assert "'0.2', is not three numbers with no leading zeros" in done.stderr
     assert "release cannot be named" in done.stderr and "nothing changed" in done.stderr
     assert "It will install" not in done.stdout and machine.changed() == []
+
+
+# --- a machine with no Python at all (ADR-0023 question 5a) ---------------------------------------
+
+def _without_python(m) -> None:
+    """The machine has no python3. Its apt-get, where it has one, brings python3 when asked for it."""
+    kept = m.root.parent / "python3-kept"
+    shutil.move(m.bin / "python3", kept)
+    _script(m.bin / "apt-get", f'for p in "$@"; do [ "$p" = python3 ] && cp -p {kept} "$(dirname "$0")/python3"; done\n'
+            + STANDINS["apt-get"])
+
+
+def test_a_machine_with_no_python_is_given_python_first_and_then_read_as_any_other(machine, clone):
+    # Question 5a promised such a machine Python. It was told "--address 192.0.2.5 is not an IP address":
+    # the address was checked with the Python it lacked, and the release was named with it too.
+    _without_python(machine)
+    done = machine.run(clone, "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "is not an IP address" not in done.stderr
+    assert machine.logged()[:2] == ["apt-get update", "apt-get install -y python3 python3-venv"]
+    out = done.stdout
+    assert out.index("This machine has no Python") < out.index("installed python3 python3-venv") \
+        < out.index("It will install nervus") < out.index("nervus is installed and running.")
+
+
+def test_without_python_a_no_to_the_first_question_changes_nothing(machine, clone):
+    _without_python(machine)
+    done = machine.run(clone, "--address", "192.0.2.5", answer="no\n")
+    assert done.returncode == 1 and "nothing changed" in done.stderr and "stay installed" not in done.stderr
+    assert "apt-get install python3 python3-venv" in done.stdout  # it said what the yes would be for
+    assert machine.logged() == [] and machine.changed() == [] and not (machine.bin / "python3").exists()
+
+
+def test_without_python_a_no_to_the_plan_leaves_python_and_says_so(machine, clone):
+    # Two questions, two answers: the first is for Python alone, the second for the plan, as on any machine.
+    _without_python(machine)
+    done = machine.run(clone, "--address", "192.0.2.5", answer="yes\nno\n")
+    assert done.returncode == 1 and "It will install nervus" in done.stdout
+    assert "nothing changed (python3 and python3-venv, installed first, stay installed)" in done.stderr
+    assert machine.logged() == ["apt-get update", "apt-get install -y python3 python3-venv"]
+    assert machine.changed() == []
+
+
+def test_without_python_a_bad_address_is_refused_once_python_can_say_so(machine, clone):
+    _without_python(machine)
+    done = machine.run(clone, "--address", "nervus.test", "--yes")
+    assert done.returncode == 1 and "--address nervus.test is not an IP address" in done.stderr
+    assert "python3 and python3-venv, installed first, stay installed" in done.stderr and machine.changed() == []
+
+
+def test_without_python_or_apt_get_everything_missing_is_named_and_nothing_changes(machine, clone):
+    _without_python(machine)
+    (machine.bin / "apt-get").unlink()
+    (machine.bin / "ssh-keygen").unlink()
+    done = machine.run(clone, "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 1 and "missing, and no apt-get" in done.stderr
+    assert "python3, 3.11 or later" in done.stderr and "ssh-keygen" in done.stderr
+    assert "is not an IP address" not in done.stderr and machine.changed() == []
+
+
+def test_with_python_here_nothing_is_asked_before_the_plan(machine, clone):
+    done = machine.run(clone, "--address", "192.0.2.5", answer="yes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "This machine has no Python" not in done.stdout and done.stdout.count("Type yes to go ahead") == 1
 
 
 @pytest.mark.parametrize("answer, installs", [("no\n", False), ("", False), ("yes\n", True)])
@@ -962,13 +1053,58 @@ def test_a_failure_once_nervus_has_started_offers_no_removal(machine, clone):
     assert "did not finish" not in done.stderr and "rm -rf" not in done.stderr
 
 
+# --- the lock (ADR-0029, "Not settled here", settled 2026-11-15) --------------------------------
+
+@pytest.mark.parametrize("change, says", [
+    (lambda t: re.sub(r"(?m)^# Made for nervus \S+ on ", "# Made for nervus 9.9.9 on ", t), "was made for 9.9.9"),
+    (lambda t: re.sub(r"(?m)^mcp==\S+", "mcp==0.0.1", t), "the lock has mcp 0.0.1"),
+    (None, "has no requirements.lock"),
+])
+def test_a_tree_whose_lock_is_not_its_releases_is_refused_before_anything_changes(machine, tmp_path, change, says):
+    tree = _tree(tmp_path / "unlocked")
+    lock = tree / "requirements.lock"
+    if change is None:
+        lock.unlink()
+    else:
+        lock.write_text(change(lock.read_text()))
+    _commit(tree)
+    done = machine.run(tree, "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 1 and says in done.stderr, done.stdout + done.stderr
+    assert "nothing changed" in done.stderr and machine.changed() == [] and machine.logged() == []
+
+
+def test_a_library_that_is_not_the_one_the_lock_names_stops_the_install_before_nervus_is_built(machine, clone):
+    (machine.root / ".pip-hashes-differ").touch()
+    done = machine.run(clone, "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 1 and "DO NOT MATCH THE HASHES" in done.stderr  # pip's own words, shown
+    assert "is not the one this release was tested with" in done.stderr
+    assert len([line for line in machine.logged() if "/bin/pip " in line]) == 1  # nothing after it
+    assert os.listdir(machine.opt) == ["releases"]
+
+
+def test_libraries_that_do_not_fit_nervus_stop_the_install(machine, clone):
+    (machine.root / ".pip-check-fails").touch()
+    done = machine.run(clone, "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 1 and "but you have mcp 2.1.0" in done.stderr
+    assert "do not fit together" in done.stderr and os.listdir(machine.opt) == ["releases"]
+
+
+def test_an_upgrade_whose_library_is_not_the_locks_changes_nothing_and_nervus_serves_on(upgradable, clone, tmp_path):
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    (m.root / ".pip-hashes-differ").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and "is not the one this release was tested with" in done.stderr
+    assert _running(m) == was and "systemctl stop nervus" not in m.logged()
+
+
 def test_when_pip_fails_no_link_is_made_and_it_says_what_is_left(machine, clone):
     # The likeliest failure part-way: the package index out of reach.
     (machine.root / ".pip-fails").touch()
     done = machine.run(clone, "--address", "192.0.2.5", "--yes")
     assert done.returncode == 1
     assert "No matching distribution" in done.stderr  # pip's own reason, shown
-    assert "pip could not install nervus and its libraries" in done.stderr and "package index" in done.stderr
+    assert "pip could not install nervus's libraries" in done.stderr and "package index" in done.stderr
     assert "The account nervus and the service were not made" in done.stderr
     assert f"remove {machine.opt} (sudo rm -rf {machine.opt}) before running it again" in done.stderr
     assert os.listdir(machine.opt) == ["releases"]
@@ -1304,7 +1440,9 @@ def test_an_upgrade_builds_the_new_release_beside_the_old_and_switches_nervus_to
              "systemctl start nervus-backup.timer"]
     assert [line for line in log if line in order] == order
     assert "nervus is upgraded, from 0.1.0 to 0.2.0" in done.stdout
-    assert "backup --check nervus-2026-11-04T120000Z.age" in done.stdout
+    # The kept backup, which a backup later the same day does not remove, as it removes the daily one.
+    assert "backup --check nervus-2026-11-04T120000Z.before-it.age" in done.stdout
+    assert "backup --check nervus-2026-11-04T120000Z.age" not in done.stdout
 
 
 def test_the_plan_names_both_releases_what_changed_and_the_last_check_and_waits_for_yes(upgradable, clone, tmp_path):
@@ -1360,8 +1498,7 @@ def test_a_newer_archive_unpacked_upgrades_as_a_clone_does(upgradable, tmp_path)
     # A friend's newer archive, unpacked in a folder of its own: no git, its release named from its files.
     m = upgradable
     tree = _tree(tmp_path / "archive", git=False)
-    pyproject = tree / "pyproject.toml"
-    pyproject.write_text(re.sub(r'(?m)^version = ".*"$', 'version = "0.2.0"', pyproject.read_text()))
+    _numbered(tree, "0.2.0")
     done = m.run(tree, "--upgrade", "--yes")
     assert done.returncode == 0, done.stdout + done.stderr
     assert f"from the tree at {tree} (not a git clone)" in done.stdout and _running(m) == _named(tree)[0]
@@ -1553,6 +1690,69 @@ def test_the_words_the_upgrade_looks_for_are_the_ones_nervus_prints(tmp_path):
     assert "no inventory entry is marked" in done.stderr, done.stderr
 
 
+def _moves_its_ports(tree: Path) -> None:
+    """The tree's unit made to serve MCP on 9000 and the web UI on 9443; committed."""
+    service = tree / "deploy" / "nervus.service"
+    text = service.read_text()
+    assert "--bind-port 8000" in text and "--ui-port 8443" in text
+    service.write_text(text.replace("--bind-port 8000", "--bind-port 9000").replace("--ui-port 8443", "--ui-port 9443"))
+    _commit(tree)
+
+
+def _asked_on(m) -> list[str]:
+    """The ports nervus was asked on, each time it was judged, in order."""
+    return [line.removeprefix("check-up asked on ") for line in m.logged() if line.startswith("check-up asked on ")]
+
+
+def test_going_back_asks_the_release_before_on_its_own_ports(upgradable, clone, tmp_path):
+    # A release that moves nervus's ports and does not come up. The release before is asked on the ports
+    # it serves, not on those of the release it came from, or it is called down while it answers.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    _moves_its_ports(tree)
+    (m.root / f".down-{_named(tree)[0]}").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and f"went back to {was} by itself" in done.stderr, done.stdout + done.stderr
+    assert _asked_on(m) == ["9000 9443", "8000 8443"]
+
+
+def test_returning_from_a_release_kept_that_is_not_up_asks_this_release_on_its_own_ports(upgradable, clone, tmp_path):
+    # The same on --back: the release kept serves the old ports and does not come up, so nervus returns
+    # to the release it was on, which moved them, and is asked there.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    _moves_its_ports(tree)
+    now = _named(tree)[0]
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 0, done.stdout + done.stderr
+    m.log.write_text("")
+    (m.root / f".down-{was}").touch()
+    done = m.run(tree, "--back", "--yes")
+    assert done.returncode == 1 and f"returned to {now} by itself" in done.stderr, done.stdout + done.stderr
+    assert _asked_on(m) == ["8000 8443", "9000 9443"]
+
+
+@pytest.mark.parametrize("how", ["--upgrade", "--back"])
+def test_an_installation_whose_own_command_line_gives_no_port_is_refused_before_anything_changes(
+        upgradable, clone, tmp_path, how):
+    # Going back by itself must be able to ask the release it returns to. One whose command line names no
+    # port could not be asked, so the run stops before the stop, as for the new release's.
+    m = upgradable
+    tree = _newer(clone, tmp_path, "0.2.0")
+    if how == "--back":
+        assert m.run(tree, "--upgrade", "--yes").returncode == 0
+    for path in (m.unit, m.dropin):  # the unit installed and its copy in the drop-in, alike
+        text = path.read_text()
+        assert "    --bind-port 8000 \\\n" in text
+        path.write_text(text.replace("    --bind-port 8000 \\\n", ""))
+    m.log.write_text("")
+    before = _running(m)
+    done = m.run(tree, how, "--yes")
+    assert done.returncode == 1 and "gives no --bind-port or no --ui-port" in done.stderr, done.stdout + done.stderr
+    assert "nothing changed" in done.stderr and _running(m) == before
+    assert not any(line.startswith("systemctl stop") for line in m.logged())
+
+
 def test_if_neither_release_comes_up_it_says_nervus_is_down(upgradable, clone, tmp_path):
     m = upgradable
     was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
@@ -1560,6 +1760,72 @@ def test_if_neither_release_comes_up_it_says_nervus_is_down(upgradable, clone, t
     (m.root / f".down-{was}").touch()
     done = m.run(tree, "--upgrade", "--yes")
     assert done.returncode == 1 and "NERVUS IS DOWN" in done.stderr and "nervus-2026-11-04T120000Z.age" in done.stderr
+
+
+def _down_records(m) -> list[str]:
+    """The records of a run's end with nervus down, as nervus-ctl was asked for them, in order."""
+    return [line.removeprefix(f"nervus-ctl --unit {m.unit} upgrade-record ") for line in m.logged()
+            if " upgrade-record down " in line or "NERVUS IS DOWN" in line]
+
+
+def test_an_upgrade_that_leaves_nervus_down_puts_that_end_on_record(upgradable, clone, tmp_path):
+    # ADR-0029, "Settled already": an upgrade's end is an operator record, and this is the end that most
+    # needs one. nervus-ctl writes it without nervus running. Before, only the terminal was told.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    new = _named(tree)[0]
+    (m.root / f".down-{new}").touch()
+    (m.root / f".down-{was}").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and "NERVUS IS DOWN" in done.stderr, done.stdout + done.stderr
+    record, = _down_records(m)
+    assert record.startswith(f"down {was} {new} --why not up on {new} (") and f"nor, gone back, on {was} (" in record
+    assert "the MCP endpoint did not answer" in record  # why, for each release
+    assert "could not be written" not in done.stdout
+
+
+def test_going_back_that_leaves_nervus_down_puts_that_end_on_record(upgraded):
+    m, was, now, tree, *_ = upgraded
+    (m.root / f".down-{was}").touch()
+    (m.root / f".down-{now}").touch()
+    done = m.run(tree, "--back", "--yes")
+    assert done.returncode == 1 and "NERVUS IS DOWN" in done.stderr, done.stdout + done.stderr
+    record, = _down_records(m)
+    assert record.startswith(f"down {was} {now} --why not up on {was} (") and f"nor, returned, on {now} (" in record
+
+
+@pytest.mark.parametrize("how", ["--upgrade", "--back"])
+def test_a_release_from_before_the_stage_down_records_it_with_a_stage_it_knows(upgradable, clone, tmp_path, how):
+    # Each record is written by the nervus-ctl of the release current at that moment. Gone back to a release
+    # from before "down", that one refuses the word: the same is then said as "back", its reason beginning
+    # NERVUS IS DOWN, and the refused try shows nowhere.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    new = _named(tree)[0]
+    if how == "--back":
+        assert m.run(tree, "--upgrade", "--yes").returncode == 0
+        m.log.write_text("")
+    (m.root / f".down-{new}").touch()
+    (m.root / f".down-{was}").touch()
+    (m.root / ".no-down-stage").touch()
+    done = m.run(tree, how, "--yes")
+    assert done.returncode == 1 and "NERVUS IS DOWN" in done.stderr, done.stdout + done.stderr
+    tried, written = _down_records(m)
+    assert tried.startswith(f"down {was} {new} --why ")
+    assert written.startswith(f"back {was} {new} --why NERVUS IS DOWN: not up on ")
+    assert "invalid choice" not in done.stdout + done.stderr and "could not be written" not in done.stdout
+
+
+def test_a_down_record_that_cannot_be_written_says_so_and_stops_nothing(upgradable, clone, tmp_path):
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    (m.root / f".down-{_named(tree)[0]}").touch()
+    (m.root / f".down-{was}").touch()
+    (m.root / ".down-record-fails").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and "NERVUS IS DOWN" in done.stderr, done.stdout + done.stderr
+    assert "nervus is down, and the record of that could not be written to its audit log" in done.stdout
+    assert m.logged()[-1] == "systemctl start nervus-backup.timer"
 
 
 def test_going_back_puts_the_database_copy_back_where_its_version_rose(upgradable, clone, tmp_path):
@@ -1605,6 +1871,78 @@ def test_an_upgrade_from_two_releases_back_shows_both_sections(upgradable, clone
     plan, closing = done.stdout.split("nervus is upgraded")
     assert "## 0.3.0" in plan and "## 0.2.0" in plan and "## 0.1.0" not in plan
     assert "\n  0.3.0: pull the repository on each client machine." in closing and "\n  0.2.0: " in closing
+
+
+# --- the backup made before the upgrade, kept until the next (ADR-0029 step 7) -----------------
+
+def _kept_calls(m) -> list[str]:
+    """Each asking about the kept backup, as nervus-ctl was given it, with the nervus-ctl asked."""
+    log = m.logged()
+    return [f"{line.split(' upgrade-backup ', 1)[1]} [{log[i + 1].removeprefix('upgrade-backup asked of ')}]"
+            for i, line in enumerate(log) if line.startswith("nervus-ctl ") and " upgrade-backup " in line]
+
+
+def test_an_upgrade_has_its_backup_kept_until_the_next_by_the_release_it_built(upgradable, clone, tmp_path):
+    # Procedure 051, finding 5: a second backup the same day removed the one made before the upgrade.
+    # It is asked of the release just built, which knows how: the one running may be from before it did.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    new = _named(tree)[0]
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _kept_calls(m) == [
+        f"keep {new} nervus-2026-11-04T120000Z.age [/opt/nervus/releases/{new}/.venv/bin/nervus-ctl]",
+        f"only {new} [/opt/nervus/.venv/bin/nervus-ctl]"]
+    log = m.logged()
+    keep = next(i for i, line in enumerate(log) if " upgrade-backup keep " in line)
+    only = next(i for i, line in enumerate(log) if " upgrade-backup only " in line)
+    made = log.index(f"nervus-ctl --unit {m.unit} backup")
+    assert made < keep < log.index("systemctl stop nervus") < log.index("systemctl start nervus") < only
+    assert "that backup kept until the next upgrade" in done.stdout
+
+
+def test_a_backup_that_cannot_be_kept_stops_the_upgrade_before_anything_is_stopped(upgradable, clone, tmp_path):
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    (m.root / ".keep-fails").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and "could not be kept until the next upgrade" in done.stderr, done.stdout + done.stderr
+    assert "disk full" in done.stderr and "Nothing was stopped" in done.stderr
+    assert _running(m) == was and "systemctl stop nervus" not in m.logged()
+    assert m.logged()[-1] == "systemctl start nervus-backup.timer"
+
+
+def test_an_upgrade_that_goes_back_drops_the_backup_kept_for_it(upgradable, clone, tmp_path):
+    # nervus runs again on the release that made that backup, which needs no second name for it.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    new = _named(tree)[0]
+    (m.root / f".down-{new}").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and f"went back to {was} by itself" in done.stderr, done.stdout + done.stderr
+    assert _kept_calls(m) == [
+        f"keep {new} nervus-2026-11-04T120000Z.age [/opt/nervus/releases/{new}/.venv/bin/nervus-ctl]",
+        f"drop {new} [/opt/nervus/releases/{new}/.venv/bin/nervus-ctl]"]
+
+
+def test_with_nervus_down_the_backup_kept_stays(upgradable, clone, tmp_path):
+    # It is what a restore would start from.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    (m.root / f".down-{_named(tree)[0]}").touch()
+    (m.root / f".down-{was}").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and "NERVUS IS DOWN" in done.stderr
+    assert [call.split()[0] for call in _kept_calls(m)] == ["keep"]
+
+
+def test_older_kept_backups_that_cannot_be_removed_do_not_undo_an_upgrade_that_is_up(upgradable, clone, tmp_path):
+    m = upgradable
+    tree = _newer(clone, tmp_path, "0.2.0")
+    (m.root / ".only-fails").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 0 and _running(m) == _named(tree)[0], done.stdout + done.stderr
+    assert "a backup kept for an earlier upgrade could not be removed" in done.stdout
 
 
 def test_the_release_before_is_kept_and_any_older_removed(upgradable, clone, tmp_path):
@@ -1744,6 +2082,28 @@ def test_back_is_refused_once_a_migration_has_run_saying_why(upgradable, clone, 
     assert done.returncode == 1 and _snapshot(m.root) == before and _running(m) == _named(tree)[0]
     for says in ("a migration has run since the upgrade", "Only the backup made before the upgrade"):
         assert says in done.stderr, says
+    assert "it is kept as" not in done.stderr  # none is kept here: the stand-in nervus-ctl keeps nothing
+
+
+def test_the_refusal_to_go_back_names_the_backup_kept_from_before_the_upgrade(upgradable, clone, tmp_path):
+    # ADR-0029 step 7: the one backup the release before can read is kept until the next upgrade, by a
+    # name that says which upgrade it was made before.
+    m = upgradable
+    _database(m, version=1)
+    tree = _newer(clone, tmp_path, "0.2.0", schema=2)
+    now = _named(tree)[0]
+    _migrates_once_started(m, now, 2)
+    assert m.run(tree, "--upgrade", "--yes").returncode == 0
+    backups = m.root / "var" / "lib" / "nervus" / "backups"
+    backups.mkdir()
+    for name in (f"nervus-backup-20261104T120000Z.before-{now}.tar.gz.age",
+                 "nervus-backup-20261001T120000Z.before-0.0.9-000000000000.tar.gz.age",  # an earlier upgrade's
+                 "nervus-backup-20261105T120000Z.tar.gz.age"):
+        (backups / name).write_bytes(b"locked")
+    done = m.run(tree, "--back", "--yes")
+    assert done.returncode == 1 and "Only the backup made before the upgrade" in done.stderr
+    assert f"it is kept as {backups}/nervus-backup-20261104T120000Z.before-{now}.tar.gz.age" in done.stderr
+    assert "0.0.9" not in done.stderr
 
 
 def test_with_its_version_unchanged_going_back_keeps_the_database(upgradable, clone, tmp_path):
@@ -2154,13 +2514,42 @@ def test_a_terminal_that_has_gone_does_not_stop_it_going_back(upgradable, clone,
     was, tree = _running(m), _newer(clone, tmp_path, "0.2.0", unit="--example-new-option on")
     new, in_place = _named(tree)[0], _in_place(m)
     (m.root / f".down-{new}").touch()
+    # The last line it prints before it stops nervus: what it writes next, it writes after the stop.
+    reader = 'while read -r line; do case $line in *"that backup kept until the next upgrade"*) exit;; esac; done'
+    subprocess.run(["bash", "-c", f'bash "$0" "$@" | {{ {reader}; }}', str(tree / "install.sh"), "--upgrade", "--yes"],
+                   env=m.env(), capture_output=True, text=True, timeout=120)
+    log = m.logged()
+    assert "systemctl stop nervus" in log  # so it had begun
+    assert _running(m) == was and _in_place(m) == in_place and (m.root / ".active").exists()
+    assert any(line.startswith(f"nervus-ctl --unit {m.unit} upgrade-record back {was} {new} --why ") for line in log)
+    assert log[-1] == "systemctl start nervus-backup.timer"
+
+
+def test_a_terminal_that_goes_before_nervus_is_stopped_ends_the_upgrade_with_nothing_stopped_or_kept(
+        upgradable, clone, tmp_path):
+    # One line earlier: the run ends where its next line cannot be written, before the stop. nervus
+    # serves on, the daily backups go on, and the backup is not left kept for an upgrade that never began.
+    m = upgradable
+    was, tree = _running(m), _newer(clone, tmp_path, "0.2.0")
+    new, in_place = _named(tree)[0], _in_place(m)
     reader = 'while read -r line; do case $line in *"a backup by the running release"*) exit;; esac; done'
     subprocess.run(["bash", "-c", f'bash "$0" "$@" | {{ {reader}; }}', str(tree / "install.sh"), "--upgrade", "--yes"],
                    env=m.env(), capture_output=True, text=True, timeout=120)
     log = m.logged()
+    assert "systemctl stop nervus" not in log and not any(" upgrade-record " in line for line in log)
     assert _running(m) == was and _in_place(m) == in_place and (m.root / ".active").exists()
-    assert any(line.startswith(f"nervus-ctl --unit {m.unit} upgrade-record back {was} {new} --why ") for line in log)
+    assert [call.split()[0] for call in _kept_calls(m)] == ["keep", "drop"]
     assert log[-1] == "systemctl start nervus-backup.timer"
+
+
+def test_an_upgrade_that_cannot_write_its_first_record_keeps_no_backup_for_it(upgradable, clone, tmp_path):
+    m = upgradable
+    tree = _newer(clone, tmp_path, "0.2.0")
+    (m.root / ".record-fails").touch()
+    done = m.run(tree, "--upgrade", "--yes")
+    assert done.returncode == 1 and "first record could not be written" in done.stderr
+    assert [call.split()[0] for call in _kept_calls(m)] == ["keep", "drop"]
+    assert m.logged()[-1] == "systemctl start nervus-backup.timer"
 
 
 @pytest.mark.parametrize("step", SWITCH_STEPS)
@@ -2234,7 +2623,9 @@ def test_once_it_is_judged_up_a_later_failure_does_not_go_back(upgraded, clone, 
     done = m.run(tree, "--upgrade", "--yes")
     assert done.returncode != 0, done.stdout + done.stderr
     assert _running(m) == _named(tree)[0] and (m.root / ".active").exists()
-    assert "Going back" not in done.stdout and m.logged().count("systemctl stop nervus") == 1
+    # The installer's own line, at the start of a line, not the words: an upgrade shows the new release's
+    # CHANGES.md, indented, and it may use them.
+    assert not re.search(r"(?m)^Going back to ", done.stdout) and m.logged().count("systemctl stop nervus") == 1
     assert m.logged()[-1] == "systemctl start nervus-backup.timer"
 
 

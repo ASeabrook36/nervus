@@ -46,6 +46,14 @@
 # DISK_STORAGE (default local-lvm) and BRIDGE (default vmbr0), Proxmox's own
 # defaults, can be set the same way.
 #
+# CPU_MODEL (default host) is the processor model the template, and so every
+# clone of it, is given: `host` shows a VM the processor the Proxmox host has,
+# so whatever the hardware can run, runs. Without one, a VM gets Proxmox's old
+# default model, which lacks instructions newer programs are built for
+# (ADR-0017 question F, as amended 2026-11-15). A running VM with `host` cannot
+# be moved live to a host with another processor: in a cluster of unlike hosts,
+# name a model they share, such as CPU_MODEL=x86-64-v3.
+#
 # If it stops part-way, it says what it made and how to undo it.
 set -uo pipefail
 
@@ -63,6 +71,7 @@ ISO_DIR=/var/lib/vz/template/iso
 SEED_ISO=nervus-template-seed-$TEMPLATE_ID.iso
 DISK_STORAGE=${DISK_STORAGE:-local-lvm}
 BRIDGE=${BRIDGE:-vmbr0}
+CPU_MODEL=${CPU_MODEL:-host}
 DISK_SIZE=16G
 ROLE=NervusTemplateUse
 ROLE_PRIVS=VM.Audit,VM.Clone
@@ -107,6 +116,9 @@ EOF
 
 [[ $TEMPLATE_ID =~ ^[0-9]+$ ]] && [ "$TEMPLATE_ID" -ge 100 ] \
   || die "TEMPLATE_ID must be a VM id, a number of 100 or more; got '$TEMPLATE_ID'"
+# One word, as Proxmox names its models (host, x86-64-v3, Haswell-noTSX): never options after it.
+[[ $CPU_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+  || die "CPU_MODEL must be one of Proxmox's processor models by name, such as host or x86-64-v3; got '$CPU_MODEL'"
 
 # Proxmox's own cloud-init drive for the template, on DISK_STORAGE, in a `qm config`: named
 # `<storage>:vm-<id>-cloudinit` on a block storage (lvm-thin, ZFS) and
@@ -121,7 +133,7 @@ case "${1:-}" in
   --check-cloudinit-drive) has_cloudinit_drive "${2:?a qm config file}"; exit $? ;;
   --print-settings)
     for v in TEMPLATE_ID TEMPLATE_NAME IMAGE_FILE IMAGE_URL IMAGE_SHA512 ROLE ROLE_PRIVS \
-             DISK_STORAGE BRIDGE DISK_SIZE SEED_ISO TAG; do
+             DISK_STORAGE BRIDGE CPU_MODEL DISK_SIZE SEED_ISO TAG; do
       printf '%s=%s\n' "$v" "${!v}"
     done
     exit 0 ;;
@@ -235,7 +247,7 @@ fi
 say "5. building VM $TEMPLATE_ID"
 qm create "$TEMPLATE_ID" --name "$TEMPLATE_NAME" --tags "$TAG" --ostype l26 \
   --description "nervus VM template (ADR-0017), built by tools/proxmox-template on $(date -u +%F) from $IMAGE_FILE, SHA-512 ${IMAGE_SHA512:0:16}…. Clone it; do not change it." \
-  --cores 2 --memory 2048 --scsihw virtio-scsi-single \
+  --cores 2 --memory 2048 --cpu "$CPU_MODEL" --scsihw virtio-scsi-single \
   --scsi0 "$DISK_STORAGE:0,import-from=local:import/$IMAGE_FILE" --boot order=scsi0 \
   --ide2 "local:iso/$SEED_ISO,media=cdrom" --net0 "virtio,bridge=$BRIDGE" \
   --agent enabled=1 --serial0 socket --vga serial0 --onboot 0 \
@@ -298,10 +310,11 @@ qm config "$TEMPLATE_ID" > "$WORK/config"
 grep -qx 'template: 1' "$WORK/config" || die "not a template"
 grep -qx 'protection: 1' "$WORK/config" || die "protection is not set"
 grep -qx 'ciupgrade: 0' "$WORK/config" || die "ciupgrade is not 0"
+grep -qx "cpu: $CPU_MODEL" "$WORK/config" || die "the processor model is not $CPU_MODEL"
 grep -q '^agent: enabled=1' "$WORK/config" || die "the agent option is not on"
 has_cloudinit_drive "$WORK/config" || die "no cloud-init drive"
 ! grep -qE '^(ciuser|cipassword|sshkeys|cicustom):' "$WORK/config" || die "the template carries a cloud-init credential"
-ok "template: 1, protection: 1, cloud-init drive with DHCP, no credential"
+ok "template: 1, protection: 1, cpu: $CPU_MODEL, cloud-init drive with DHCP, no credential"
 
 # /pools lists pools without their members; each VM's own entry names its pool.
 pvesh get /cluster/resources --type vm --output-format json | json '

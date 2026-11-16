@@ -64,7 +64,15 @@ class World:
         if not self.audit.path.exists():
             return []
         rows = [json.loads(line) for line in self.audit.path.read_text().splitlines()]
-        return [r for r in rows if r.get("tool") == "ui" and r.get("action") == action]
+        # What was done, by its action: a refusal names the action it refused, and is not one of these.
+        return [r for r in rows if r.get("tool") == "ui" and r.get("phase") == "operator" and r.get("action") == action]
+
+    def refusals(self):
+        """Every refusal the UI recorded, oldest first."""
+        if not self.audit.path.exists():
+            return []
+        rows = [json.loads(line) for line in self.audit.path.read_text().splitlines()]
+        return [r for r in rows if r.get("tool") == "ui" and r.get("phase") == "refused"]
 
 
 @pytest.fixture
@@ -248,6 +256,63 @@ def test_a_change_posted_from_another_site_or_without_the_form_token_is_refused(
 def test_an_unknown_action_is_refused(world):
     world.enroll()
     assert world.act(action="explode", name="nas").status_code == 400
+
+
+# --- a refused form is on record (ADR-0012 decision 6, as amended 2026-11-15) ----------------
+#
+# Found by procedure 040: the Machines page refused Connect and the login in lockdown, and the audit
+# log held nothing of either. No refused form left a record, on any page.
+
+@pytest.mark.parametrize("fields, action, target, reason", [
+    (dict(action="add", name="Nas Box", level="standard"), "add", "Nas Box", "is not a name for a machine"),
+    (dict(action="add", name="node-a", level="standard"), "add", "node-a", "already a machine in hosts.yaml"),
+    (dict(action="move", name="nothing", address="192.0.2.1"), "move", "nothing", "no machine nothing"),
+    (dict(action="remove", name="nas", confirm="na"), "remove", "nas", "type its name exactly"),
+    (dict(action="explode", name="nas"), "explode", "nas", "not an action nervus knows"),
+])
+def test_a_refused_form_is_recorded_with_what_was_asked_and_why(world, fields, action, target, reason):
+    world.enroll()
+    assert world.act(**fields).status_code == 400
+    record, = world.refusals()
+    assert (record["actor"], record["page"], record["action"], record["target"]) == ("operator", "machines", action, target)
+    assert reason in record["reason"] and record["address"] == "testclient"
+    assert record.get("level") == fields.get("level") and record.get("machine_address") == fields.get("address")
+
+
+def test_an_action_that_is_not_a_word_is_recorded_as_none_nervus_knows(world):
+    # What a form calls its action is whatever was posted: only a name of an action goes into the record.
+    assert world.act(action="x" * 500 + "\n<script>", name="nas").status_code == 400
+    record, = world.refusals()
+    assert record["action"] == "(not an action nervus knows)"
+
+
+def test_a_post_from_another_site_or_without_the_form_token_is_recorded_where_a_session_carries_it(world):
+    world.enroll()
+    token = re.search(r'name="form_token" value="([^"]*)"', world.browser.get("/machines").text).group(1)
+    fields = {"action": "remove", "name": "nas", "confirm": "nas"}
+    world.browser.post("/machines", data={**fields, "form_token": token}, headers={"Origin": "https://evil.example"})
+    world.browser.post("/machines", data={**fields, "form_token": "x"}, headers={"Origin": ORIGIN})
+    other, unsigned = world.refusals()
+    assert (other["page"], other["action"]) == (unsigned["page"], unsigned["action"]) == ("machines", "remove")
+    assert "another site" in other["reason"] and "token" in unsigned["reason"]
+    assert "nas" not in json.dumps(other) and "nas" not in json.dumps(unsigned)  # nothing of a form nervus did not make
+
+
+def test_a_post_that_carries_no_session_is_refused_without_a_record(world):
+    # As a call with no token is: anyone who can reach the port could otherwise write to the audit log.
+    stranger = TestClient(build_ui(world.db, world.audit, secure=True, machines=world.machines), base_url=ORIGIN)
+    for origin in (ORIGIN, "https://evil.example"):
+        posted = stranger.post("/machines", data={"action": "remove", "name": "nas"}, headers={"Origin": origin})
+        assert posted.status_code == 403
+    assert world.refusals() == []
+
+
+def test_a_refusal_stands_without_its_record(world):
+    # It changes nothing, so there is nothing to undo: the page still says why.
+    world.enroll()
+    world.break_audit()
+    page = world.act(action="remove", name="nas", confirm="na")
+    assert page.status_code == 400 and "type its name exactly" in page.text and world.store.get("nas")
 
 
 # --- tokens may name enrolled machines (ADR-0024 decision 3) ------------------------------

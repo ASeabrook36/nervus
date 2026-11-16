@@ -1,6 +1,10 @@
 # ADR-0008: a home user authorises nervus themselves, with a first-party connector
 
-**Status:** Proposed (Accepted when the verification below is observed). **Amended
+**Status:** Proposed (Accepted when the verification below is observed).
+**Confirmed by the operator, 2026-11-15** ("Yes, in that order (Recommended)"): what is left
+before nervus is published more widely is three projects, in this order: client sign-in
+(ADR-0006), the connector (ADR-0008), and the container image (ADR-0005 decision 1). This record
+is the second of them: unbuilt, and Proposed until it is built and observed. **Amended
 2026-10-02** by ADR-0010, decided by the operator: decisions 2 and 9 and verification 3.
 What a connector pins, and a user compares, is nervus's public key, not its certificate;
 where this ADR still says "pinned certificate", read the key.
