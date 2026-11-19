@@ -20,6 +20,9 @@ import pytest
 
 from nervus import ctl
 from nervus.audit import AuditLog
+from nervus.database import Database
+from nervus.enrolled_hosts import EnrolledHostStore
+from nervus.enrollments import EnrollmentStore
 from nervus.jobs import job_status, start_job
 from nervus.ssh import connect
 from nervus.switches import load_switches, refusal
@@ -815,3 +818,95 @@ def test_with_a_terminal_the_key_is_read_there_by_getpass(monkeypatch):
                         if path == "/dev/tty" else real_open(path, flags, *rest))
     monkeypatch.setattr(ctl.getpass, "getpass", lambda prompt: f"read from the terminal after {prompt!r}")
     assert ctl.read_secret("the key: ") == "read from the terminal after 'the key: '"
+
+
+# --- jobs on every machine nervus reaches, not only hosts.yaml's (found 2026-11-19, procedure 066) ----
+#
+# nervus reaches three kinds of machine: those hosts.yaml describes, those added from the web UI's
+# Machines page (ADR-0024, ADR-0026), and VMs used by their id (ADR-0022), the last two kept in its
+# database with each machine's own pinned keys. status and lock --kill-work asked hosts.yaml's alone,
+# so a job on either of the others was neither listed nor stopped, and the off switch's "stop work"
+# left it running. In these tests the machine the jobs run on is in the database only.
+
+
+def _pinned_key(server) -> str:
+    """The test server's host key, "type base64", as nervus pins a machine's keys."""
+    return " ".join(Path(server.known_hosts_path).read_text().split()[1:3])
+
+
+@pytest.fixture
+def elsewhere(service):
+    """The installation above, its one reachable machine taken out of hosts.yaml, and nervus's database
+    made: each test then adds that machine to the database, as the UI or a call by vmid would."""
+    svc, unit, server = service
+    (svc.hosts).write_text(
+        "hosts:\n"
+        f"  - {{name: other, address: nervus-test.invalid, os: x, role: x, agent_user: {server.username}, status: onboarded}}\n")
+    Database(svc.database).open()
+    return service
+
+
+def _added_from_the_page(service_, name="m1", keys=None):
+    svc, _, server = service_
+    EnrolledHostStore(Database(svc.database)).add(
+        name, address=server.host, level="standard", host_keys=keys or [_pinned_key(server)],
+        machine_id="0" * 32, enrolled_by="operator")
+
+
+def _used_by_id(service_, vmid=104, keys=None):
+    """A VM nervus enrolled. Written to its table directly: EnrollmentStore rightly refuses a VM at a
+    loopback address, and the test's SSH server has no other."""
+    svc, _, server = service_
+    with Database(svc.database).transaction() as db:
+        db.execute("INSERT INTO enrolled_vm (vmid, address, host_keys, enrolled_at, enrolled_by, moved_at) "
+                   "VALUES (?, ?, ?, ?, ?, NULL)",
+                   (vmid, server.host, json.dumps(sorted(keys or [_pinned_key(server)])), 1.0, "t1"))
+    assert [v.vmid for v in EnrollmentStore(Database(svc.database)).all()] == [vmid]  # as nervus reads it
+
+
+@needs_tmux
+@pytest.mark.parametrize("kind, name", [("page", "m1"), ("vm", "vmid 104")])
+async def test_status_lists_jobs_on_machines_added_from_the_ui_and_vms_used_by_id(elsewhere, kind, name):
+    (_added_from_the_page if kind == "page" else _used_by_id)(elsewhere)
+    job = await _job(elsewhere, "t1")
+    rc, out = await _ctl(elsewhere, "status")
+    assert rc == 0, out
+    assert "jobs: 1" in next(l for l in out.splitlines() if l.startswith("t1 ")), out
+    assert f"    {name} {job}" in out
+    assert "could not read jobs on other:" in out  # hosts.yaml's machines are still asked
+    listed = _operator_records(elsewhere[0])[-1]
+    assert listed["action"] == "list_jobs" and listed["hosts"] == sorted(["other", name])
+
+
+@needs_tmux
+@pytest.mark.parametrize("kind, name", [("page", "m1"), ("vm", "vmid 104")])
+async def test_kill_work_stops_jobs_on_machines_added_from_the_ui_and_vms_used_by_id(elsewhere, kind, name):
+    (_added_from_the_page if kind == "page" else _used_by_id)(elsewhere)
+    mine, theirs = await _job(elsewhere, "t1"), await _job(elsewhere, "t2")
+    rc, out = await _ctl(elsewhere, "lock", "t1", "--kill-work", "--yes")
+    assert rc == 0, out
+    assert f"{name} {mine}: stopped" in out
+    assert not await _running(elsewhere, mine) and await _running(elsewhere, theirs)
+    assert _operator_records(elsewhere[0])[-1]["jobs"] == [f"{name}/{mine}"]
+
+
+@needs_tmux
+@pytest.mark.parametrize("kind, name", [("page", "m1"), ("vm", "vmid 104")])
+async def test_a_machine_in_the_database_is_reached_only_with_its_own_pinned_keys(elsewhere, kind, name):
+    # Another machine's key pinned: nervus-ctl does not log in, and says so; it repairs nothing.
+    other_key = asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode().split()
+    (_added_from_the_page if kind == "page" else _used_by_id)(elsewhere, keys=[" ".join(other_key[:2])])
+    job = await _job(elsewhere, "t1")
+    rc, out = await _ctl(elsewhere, "status")
+    assert rc == 0, out
+    assert f"could not read jobs on {name}:" in out and job not in out
+
+
+@needs_tmux
+async def test_when_the_database_cannot_be_read_status_says_so_and_still_asks_hosts_yaml(service):
+    # No database: the machines it would hold are not known, and status says so rather than nothing.
+    job = await _job(service, "t1")
+    rc, out = await _ctl(service, "status")
+    assert rc == 0, out
+    assert f"    h1 {job}" in out
+    assert "could not read jobs on the machines added from the web UI and the VMs used by id:" in out

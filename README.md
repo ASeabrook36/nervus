@@ -37,6 +37,7 @@ ADR-0014).
 the one key, checks what each token may reach, and writes every call down.
 
 ```mermaid
+%%{init: {"flowchart": {"diagramPadding": 200}}}%%
 flowchart LR
     subgraph clients["Where your agents run"]
         c1["Claude Code"]
@@ -63,6 +64,7 @@ flowchart LR
 **One call, start to finish.**
 
 ```mermaid
+%%{init: {"sequence": {"diagramMarginX": 230}}}%%
 sequenceDiagram
     autonumber
     participant A as Your agent
@@ -168,6 +170,7 @@ something.
 ## Getting started
 
 ```mermaid
+%%{init: {"flowchart": {"diagramPadding": 200}}}%%
 flowchart LR
     s1["Install it:<br/>one command"] --> s2["Sign in,<br/>say where<br/>it runs"]
     s2 --> s3["Add machines:<br/>read-only,<br/>standard or full"]

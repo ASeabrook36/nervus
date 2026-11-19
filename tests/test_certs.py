@@ -610,6 +610,10 @@ async def test_nervus_ctl_reaches_a_ca_only_machine_signed_for_its_own_records(s
         f"[Service]\nWorkingDirectory={root}\nExecStart=/opt/nervus/.venv/bin/nervus --hosts hosts.yaml "
         f"--tokens tokens.yaml --switches switches.yaml --known-hosts {server.known} --ssh-key {key} "
         f"--ssh-ca-key {ca.path} --audit-log {audit_log} --ssh-port {server.port}\n")
+    # nervus's database, as every installation has once nervus has started: nervus-ctl reads the
+    # machines added from the web UI and the VMs used by id from it, and says so when it cannot.
+    from nervus.database import Database
+    Database(ctl.read_unit(unit).database).open()
 
     out = io.StringIO()
     assert await ctl.run(["--unit", str(unit), "lock", "--all", "--kill-work", "--yes"], out=out) == 0

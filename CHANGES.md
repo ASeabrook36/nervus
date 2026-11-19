@@ -7,6 +7,26 @@ exported; until then it says "Not yet exported.", and what is still being built.
 heads: what you will see, what each client must do, and what the upgrade does on nervus's
 machine. An ADR named beside a change is the decision record behind it, in `decisions/`.
 
+## 0.2.2
+
+Exported 2026-11-19.
+
+**What you will see:**
+
+- `nervus-ctl status` lists, and `nervus-ctl lock --kill-work` stops, the jobs on every machine
+  nervus reaches. Before, they looked only at the machines in `hosts.yaml`, so a job on a machine
+  added from the web UI, or in a VM used by its id, was neither listed nor stopped by the off
+  switch. A VM is shown as `vmid 104`; a machine that does not answer within ten seconds is named
+  as not read (ADR-0003).
+- The README's three diagrams leave room at their right for GitHub's own zoom and pan buttons,
+  which covered part of each on a desktop screen. On a narrow one they may still sit over the
+  diagram, which those buttons then move.
+
+**What each client must do:** nothing.
+
+**What the upgrade does:** `sudo ./install.sh --upgrade`, from this release's copy on nervus's
+machine, as `docs/install.md`, "Upgrading", says.
+
 ## 0.2.1
 
 Exported 2026-11-16.

@@ -23,6 +23,9 @@ off.
   nervus re-reads on every request.
 - Stopping work is not reversible, so it is a separate, explicit choice
   (--kill-work). nervus-ctl lists the jobs first, then asks for confirmation.
+- Jobs are looked for on every machine nervus reaches: hosts.yaml's, those
+  added from the web UI, and each VM used by its id, shown as `vmid N`. A
+  machine that cannot be read is named, never passed over in silence.
 - `lock --all` is lockdown; `unlock --all` lifts lockdown and leaves clients
   that were switched off one by one still off.
 - Every action is written to the audit log with the actor "operator"
@@ -75,8 +78,9 @@ from nervus import certs, identity, jobs, plainfile, restore, ssh
 from nervus.backup import kept_name, recipient
 from nervus.auth import load_tokens
 from nervus.certs import CertificateAuthority
-from nervus.config import ConfigError, load_hosts
+from nervus.config import ConfigError, Host, load_hosts
 from nervus.database import LINK_SECONDS, audit_id
+from nervus.enroller import AGENT_USER, SSH_CONNECT_SECONDS, pinned_known_hosts
 from nervus.first_run import TIER_WORDS
 from nervus.switches import Switches, SwitchesSwapped, SwitchesUnreadable, change_switches, load_switches
 from nervus.tls import certificate_fingerprint, issuer_key_path, renewal_path, serving_path
@@ -212,12 +216,48 @@ def _jobs_by_run(audit_log: Path) -> dict[str, str]:
 
 
 async def _connect(service: Service, host, authority: CertificateAuthority):
-    """A login to one inventory entry, signed for the record certs.acting_for
-    names, then with the plain key for a machine not yet moved to the CA."""
+    """A login to one machine, signed for the record certs.acting_for names,
+    then with the plain key for a machine not yet moved to the CA. A machine
+    added from the web UI, or a VM used by its id, is trusted only with its own
+    pinned keys, as nervus trusts it; one of hosts.yaml's, with the known_hosts
+    file. A machine that does not answer is given up on after SSH_CONNECT_SECONDS,
+    so that one dead machine cannot hold up status or the off switch."""
     return await ssh.connect(
-        address=host.address, port=service.ssh_port, username=host.agent_user,
-        client_keys=[service.ssh_key], known_hosts=service.known_hosts, authority=authority,
+        address=host.address, port=service.ssh_port, username=host.agent_user, client_keys=[service.ssh_key],
+        known_hosts=(pinned_known_hosts(host.address, service.ssh_port, host.host_keys) if host.host_keys
+                     else service.known_hosts),
+        authority=authority, connect_timeout=SSH_CONNECT_SECONDS,
     )
+
+
+DATABASE_MACHINES = "the machines added from the web UI and the VMs used by id"
+
+
+def machines(service: Service) -> tuple[dict[str, Host], str | None]:
+    """Every machine nervus reaches, by the name nervus-ctl gives it, and why
+    any could not be known: hosts.yaml's; those added from the web UI's
+    Machines page (ADR-0024, ADR-0026); and each VM used by its id (ADR-0022),
+    as `vmid N`, the audit page's name for it. The last two are read from
+    nervus's database, as the account nervus runs as; a hand-written entry
+    keeps its name over an added one, as nervus has it (enrolled_hosts.merged).
+
+    A VM is asked where nervus last reached it, with the keys nervus pinned:
+    nervus-ctl enrolls and repairs nothing, and a VM that moved is not read
+    (found 2026-11-19, procedure 066: these two kinds were asked for nothing)."""
+    hosts = load_hosts(service.hosts)
+    try:
+        held = database_change(service, "machines")
+    except ConfigError as exc:
+        return hosts, str(exc)
+    for row in held["hosts"]:
+        hosts.setdefault(row["name"], Host(
+            name=row["name"], address=row["address"], os="", role=f"enrolled, {row['level']}",
+            agent_user=AGENT_USER, status="onboarded", host_keys=tuple(row["host_keys"]), level=row["level"]))
+    for row in held["vms"]:
+        name = f"vmid {row['vmid']}"
+        hosts[name] = Host(name=name, address=row["address"], os="", role="a VM used by its id",
+                           agent_user=AGENT_USER, status="onboarded", host_keys=tuple(row["host_keys"]))
+    return hosts, None
 
 
 async def _sessions(service: Service, host, authority: CertificateAuthority) -> list[str]:
@@ -241,12 +281,14 @@ async def running_jobs(service: Service) -> tuple[dict[str, list[tuple[str, str]
     owners = _jobs_by_run(service.audit_log)
     found: dict[str, list[tuple[str, str]]] = {}
     unreachable: list[str] = []
-    hosts = load_hosts(service.hosts)
+    hosts, why = machines(service)
+    if why is not None:
+        unreachable.append(f"{DATABASE_MACHINES}: {why}")
     try:
         authority = CertificateAuthority(service.ssh_ca)
         certs.acting_for(None, operator_record(service, "list_jobs", {"hosts": sorted(hosts)}))
     except ConfigError as exc:
-        return found, [f"any machine, so none was asked: {exc}"]
+        return found, [f"any machine, so none was asked: {exc}", *unreachable]
     for name, host in sorted(hosts.items()):
         try:
             for job_id in await _sessions(service, host, authority):
@@ -259,11 +301,14 @@ async def running_jobs(service: Service) -> tuple[dict[str, list[tuple[str, str]
 async def _kill(service: Service, targets: list[tuple[str, str]], run_id: str) -> list[str]:
     """Kill each (host, job id), its logins signed for the record `run_id`;
     return one line per job saying what happened."""
-    hosts = load_hosts(service.hosts)
+    hosts, _ = machines(service)
     authority = CertificateAuthority(service.ssh_ca)
     certs.acting_for(None, run_id)
     lines = []
     for name, job_id in targets:
+        if name not in hosts:  # listed a moment ago, and removed from nervus since
+            lines.append(f"  {name} {job_id}: NOT STOPPED: nervus no longer has this machine")
+            continue
         conn = await _connect(service, hosts[name], authority)
         try:
             await jobs.kill_job(conn, job_id)
@@ -312,6 +357,14 @@ try:
             c.execute("INSERT INTO backup_event (kind, file, made_at, at) VALUES (?, ?, ?, ?)",
                       (event["kind"], event["file"], event.get("made_at"), event["at"]))
         print(json.dumps({}))
+    elif sys.argv[2] == "machines":
+        from nervus.enrolled_hosts import EnrolledHostStore
+        from nervus.enrollments import EnrollmentStore
+        print(json.dumps({
+            "hosts": [{"name": h.name, "address": h.address, "level": h.level, "host_keys": list(h.host_keys)}
+                      for h in EnrolledHostStore(db).all()],
+            "vms": [{"vmid": v.vmid, "address": v.address, "host_keys": list(v.host_keys)}
+                    for v in EnrollmentStore(db).all()]}))
     elif sys.argv[2] == "identity":
         with db.transaction(write=False) as c:
             row = c.execute("SELECT ssh_key, ssh_ca_key, tls_issuer FROM identity").fetchone()

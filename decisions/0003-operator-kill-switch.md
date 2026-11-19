@@ -118,6 +118,11 @@ nervus-ctl lock --all [--kill-work]
 nervus-ctl unlock <token-id> | --all
 ```
 
+*Mended 2026-11-19 (procedure 066):* until 0.2.2, `status` and `--kill-work` looked for jobs only on
+the machines `hosts.yaml` describes, not on those added from the web UI or the VMs used by their
+id, so a job on either was neither listed nor stopped. They now ask every machine nervus reaches,
+each trusted with the keys nervus pinned for it, and say which could not be read.
+
 It runs on nervus, uses nervus's own key to reach the target hosts, and bypasses
 token authentication entirely — it is the operator acting locally, authorised by
 holding root on the container, not a client acting through the tool surface. No
