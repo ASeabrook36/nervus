@@ -35,6 +35,10 @@ class Token:
     # use it (ADR-0006 decision 7). Grants, when OAuth comes (piece 7), will
     # not be.
     unconfined: bool = True
+    # ADR-0031: the hosts on which this token is read-only, each one of `hosts`;
+    # on the rest it is read-write, the machine's own level. Only a token issued
+    # in the UI can have any; the token file's have none.
+    readonly: frozenset[str] = frozenset()
 
 
 def attribution(token: Token) -> dict[str, object]:

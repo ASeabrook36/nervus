@@ -168,6 +168,11 @@ class Row:
         return self._get("tool")
 
     @property
+    def level(self) -> str:
+        """The level the call ran at, as its intent record says (ADR-0031)."""
+        return self._get("level") if self.kind in ("call", "refused") else ""
+
+    @property
     def subject(self) -> str:
         """What the call was about: its command, path or reason."""
         if self.kind == "unreadable":

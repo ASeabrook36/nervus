@@ -41,6 +41,12 @@ class Host:
     # owner chose. A hand-written entry has neither.
     host_keys: tuple[str, ...] = ()
     level: str | None = None
+    # ADR-0031: the machine's read-only account, where it has one: one added from
+    # the UI since, the read-only account its enrollment made; one added before,
+    # at read-only, `agent`; one described by hand, the one its owner added from
+    # the Machines page. `agent_user` is then the read-write account, or at
+    # read-only alone the read-only one. nervus.accounts chooses between them.
+    readonly_user: str | None = None
 
 
 @dataclass(frozen=True)

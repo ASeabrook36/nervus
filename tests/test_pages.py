@@ -14,6 +14,7 @@ import pytest
 
 import nervus
 from nervus import pages
+from nervus.accounts import MachineAccount
 from nervus.audit_view import Cursor, Entry, Query, Row
 from nervus.clients import ClientRow, ClientsView
 from nervus.enrolled_hosts import EnrolledHost
@@ -143,6 +144,12 @@ def _arguments(page, text):
         "Query": Query(client=text, host=text, tool=text, kind=text, text=text),
         "Cursor | None": Cursor(before=10, horizon=20),
         "list[str]": [text, "hv-root"],
+        # ADR-0031: a machine with both accounts, its pick; the names asked about; each machine's accounts.
+        "frozenset[str]": frozenset({text}),
+        "list[tuple[str, str]]": [(text, "typed_readwrite")],
+        "dict[str, str]": {"name": text, "readwrite": text},
+        "list[tuple[str, str, str | None]] | None": [(text, text, text), (text, text, None)],
+        "dict[str, MachineAccount] | None": {text: MachineAccount(text, T0, text, text, (text,), None, T0)},
         "ClientsView": ClientsView(rows=[
             ClientRow(id=text, client=text, project=text, hosts=(text,), issued=True, off=True, last_call=T0),
             ClientRow(id=text, client=text, project=text, hosts=(text,), issued=False, off=False,

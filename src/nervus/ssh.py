@@ -49,6 +49,29 @@ def cd_target(cwd: str) -> str:
     return f"{prefix}/{shlex.quote(rest)}"
 
 
+class NotChosen(ValueError):
+    """A connection that did not come through the account's choice
+    (nervus.accounts, ADR-0031), or that cannot be made as chosen. Refused
+    before anything is sent: it is a fault in nervus, never the client's."""
+
+
+# ADR-0031 ("Settled already"): nervus's scratch folder is its account's alone,
+# at every level, whenever nervus uses it. On a machine whose homes are open to
+# other accounts, a read-only account among them, `mkdir -p` alone left it
+# `775` (procedure 068). A folder that cannot be made so stops the call, as a
+# folder nervus cannot change to does.
+PRIVATE_FOLDER_FAILED = 96
+
+
+def private_folder(path: str) -> str:
+    """The line that makes `path`, under ~/.nervus, and makes ~/.nervus its
+    account's alone: the umask only for the folders, never for the client's
+    own command. `path` is nervus's own, never a client's words."""
+    said = shlex.quote("nervus: cannot make ~/.nervus this account's alone, so nothing ran")
+    return (f"(umask 077 && mkdir -p {path}) && chmod 700 \"$HOME/.nervus\" "
+            f"|| {{ echo {said} >&2; exit {PRIVATE_FOLDER_FAILED}; }}\n")
+
+
 @dataclass(frozen=True)
 class ExecResult:
     run_id: str
@@ -104,9 +127,9 @@ def build_exec_script(run_id: str, cwd: str, command: str, label: str | None = N
     script = (
         label_line(label)
         + "set -o pipefail\n"
-        f"mkdir -p {remote_dir}\n"
-        f"cd {cd_target(cwd)} || {{ echo {cd_failed} | tee {output_path}; exit 97; }}\n"
-        "{\n"
+        + private_folder(remote_dir)
+        + f"cd {cd_target(cwd)} || {{ echo {cd_failed} | tee {output_path}; exit 97; }}\n"
+        + "{\n"
         f"{command}\n"
         "} 2>&1 | tee " + output_path + "\n"
         "ec=$?\n"
@@ -135,6 +158,25 @@ def _read_key(key: str | Path | asyncssh.SSHKey) -> asyncssh.SSHKey:
     return asyncssh.import_private_key(plainfile.read_bytes(key)) if isinstance(key, (str, Path)) else key
 
 
+def public_words(key_path: str | Path) -> str | None:
+    """nervus's own public key as "type base64", the words a line holds where a
+    machine was given nervus's key itself, by hand or enrolled before ADR-0025;
+    None where the key cannot be read."""
+    try:
+        return " ".join(_read_key(key_path).export_public_key().decode().split()[:2])
+    except (OSError, ValueError, asyncssh.KeyImportError):
+        return None
+
+
+def _certified(key: asyncssh.SSHKey, cert: asyncssh.SSHCertificate) -> asyncssh.SSHKeyPair:
+    """`key` as the SSH library offers it with `cert`, and only so. Given the two
+    as a pair, the library's load_keypairs offers the certificate and then the
+    bare key, which a line could admit with no forced command (ADR-0031 question
+    1a; procedure 068, section 12); a key pair that already carries the
+    certificate is offered as it is."""
+    return next(p for p in asyncssh.load_keypairs([(key, cert)]) if p.public_data == cert.public_data)
+
+
 async def connect(
     *,
     address: str,
@@ -144,6 +186,7 @@ async def connect(
     known_hosts: str | Path | asyncssh.SSHKnownHosts,
     connect_timeout: float | None = None,
     authority: CertificateAuthority | None = None,
+    machine: str | None = None,
 ) -> asyncssh.SSHClientConnection:
     """Open the one connection nervus is allowed to make: as `username`, with the
     single pinned key, against a known_hosts file with strict checking.
@@ -168,12 +211,36 @@ async def connect(
     window refuses it as it would a wrong key, and asyncssh says only
     "Permission denied". When a certificate was offered, the refusal says
     that a clock is one cause (procedure 042, finding 1).
+
+    `machine` is the name of the machine this connection is for, as nervus's
+    inventory names it (a VM used by its id: `vmid <id>`). Where an account was
+    chosen for the call, it must be the machine it was chosen on (procedure 068,
+    section 12).
     """
     caller = certs.current()
+    route = caller.route if caller is not None else None
+    # ADR-0031: every connection made for a client's call goes through the one
+    # place the account is chosen, and logs in to the account it chose.
+    if caller is not None and caller.token_id is not None and route is None:
+        raise NotChosen(f"nervus opened a connection to {address} for a client's call without choosing its "
+                        f"account (nervus.accounts); nothing was sent")
+    if route is not None and route.username != username:
+        raise NotChosen(f"nervus chose {route.username} on {route.host} for this call, and a connection asked "
+                        f"for {username}; nothing was sent")
+    if route is not None and machine != route.host:
+        raise NotChosen(f"nervus chose {route.username} on {route.host} for this call, and a connection was for "
+                        f"{machine or address}; nothing was sent")
     keys: list = [_read_key(k) for k in client_keys]
     signed = authority is not None and caller is not None
-    if signed:
-        keys = [(k, authority.sign(k, username, caller)) for k in keys] + keys
+    if route is not None and route.readonly:
+        # Question 1a: a certificate naming the read-only account and carrying the
+        # read-only shell, and no plain key, which a line could admit without one.
+        if authority is None:
+            raise NotChosen(f"a read-only call to {route.host} needs nervus's certificate authority, which this "
+                            f"nervus has not got; nothing was sent")
+        keys = [_certified(k, authority.sign(k, username, caller, force_command=certs.READONLY_SHELL)) for k in keys]
+    elif signed:
+        keys = [_certified(k, authority.sign(k, username, caller)) for k in keys] + keys
     if not isinstance(known_hosts, asyncssh.SSHKnownHosts):
         # Read here and now, as the key is: the library reads a name once a machine has answered.
         known_hosts = asyncssh.import_known_hosts(plainfile.read_text(known_hosts))

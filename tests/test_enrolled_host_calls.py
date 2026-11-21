@@ -45,7 +45,9 @@ def world(tmp_path, ssh_server):
     return server, store, settings, host_key
 
 
-def _enroll(store, host_key, name="web", level="read-only"):
+def _enroll(store, host_key, name="web", level="standard"):
+    # Standard: a read-only call needs nervus's certificate authority (ADR-0031), which this
+    # nervus has not got, and these tests are of how the machine is reached, not of its level.
     store.add(name, address="127.0.0.1", level=level, host_keys=[host_key], machine_id=MACHINE,
               enrolled_by="operator")
 
@@ -84,7 +86,9 @@ async def test_hosts_lists_it_with_its_level_beside_hosts_yaml(world):
     assert hosts == [{"name": "web", "address": "127.0.0.1", "role": "enrolled, standard", "status": "onboarded",
                       "level": "standard"}]
     mine = _content(await _call_tool(server, GOOD_TOKEN, "hosts", {}))["hosts"]
-    assert [h["name"] for h in mine] == ["testhost"] and "level" not in mine[0]
+    # ADR-0031: every machine with the client's level there; one described by hand, whose level
+    # nervus does not know, read-write.
+    assert [h["name"] for h in mine] == ["testhost"] and mine[0]["level"] == "read-write"
 
 
 async def test_once_forgotten_it_is_refused_at_the_next_call(world):

@@ -24,7 +24,7 @@ import asyncssh
 import pytest
 from sshd_shell import _handle_process
 
-from nervus import certs
+from nervus import accounts, certs
 from nervus.certs import CertificateAuthority
 from nervus.database import Database
 from nervus.enroller import (
@@ -258,8 +258,11 @@ def _ca(key_path):
 
 @pytest.fixture(autouse=True)
 def _in_a_call():
-    """nervus enrolls a VM only on a client's call: the certificate names it."""
-    token = certs._caller.set(certs.Caller("t", "0b9f4c2e-5d1a-4e8b-9c3f-7a6d2e1b0c94"))
+    """nervus enrolls a VM only on a client's call: the certificate names it;
+    and, as the server does for every call by vmid, the call chose `agent`
+    there (ADR-0031, accounts.vm_route)."""
+    token = certs._caller.set(certs.Caller("t", "0b9f4c2e-5d1a-4e8b-9c3f-7a6d2e1b0c94",
+                                           route=accounts.vm_route(123)))
     yield
     certs._caller.reset(token)
 
@@ -267,12 +270,12 @@ def _in_a_call():
 def _connector(key_path, standing_in, tried):
     """nervus's own connector, pointed at the server standing in for each
     reported address, and pinned under loopback exactly as nervus pins."""
-    async def connect(address, keys):
+    async def connect(address, keys, machine=None):
         tried.append(address)
         if address not in standing_in:
             raise OSError("no route to host")
         return await ssh_connector(key_path, port=standing_in[address].port, timeout=5,
-                                   authority=_ca(key_path))(LOOPBACK, keys)
+                                   authority=_ca(key_path))(LOOPBACK, keys, machine=machine)
     return connect
 
 
@@ -568,7 +571,7 @@ async def test_only_the_key_the_vm_presented_is_pinned_not_one_it_merely_listed(
     assert row.host_keys == (" ".join(vm_server.host_key_line.split()[:2]),)
     forwarded = _connector(servers.key_path, {VM_ADDRESS: other}, [])
     with pytest.raises(asyncssh.HostKeyNotVerifiable):
-        await forwarded(VM_ADDRESS, row.host_keys)
+        await forwarded(VM_ADDRESS, row.host_keys, machine=accounts.vm_name(123))
     assert other.auths == []
 
 

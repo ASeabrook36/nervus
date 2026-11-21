@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nervus"
-version = "0.2.2"
+version = "0.3.0"
 description = "MCP bastion giving AI agents programmatic SSH access to the operator's home fleet"
 requires-python = ">=3.11"
 dependencies = [

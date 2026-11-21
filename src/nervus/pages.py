@@ -36,6 +36,7 @@ import nervus
 from nervus.audit_view import PAGE_ROWS, Cursor, Entry, Query, Row, cut
 from nervus.clients import ClientRow, ClientsView
 from nervus.database import LINK_SECONDS
+from nervus.accounts import READONLY, READWRITE, MachineAccount
 from nervus.enrolled_hosts import EnrolledHost
 from nervus.enrollment_codes import EnrollmentCode
 from nervus.exposure import Declared
@@ -269,7 +270,8 @@ def _list_row(row: Row) -> Markup:
         client=_filter_link("client", row.client),
         tool=_filter_link("tool", row.tool),
         # Each machine the row is about, a link to its own filter; each is Markup, made by render().
-        host=Markup(" · ".join(_filter_link("host", name) for name in row.machines)),
+        host=join((Markup(" · ".join(_filter_link("host", name) for name in row.machines)),
+                   render(' <span class="muted">({level})</span>', level=row.level) if row.level else Markup(""))),
         shown=shown,
         left_out=render(' <span class="left-out">{note}</span>', note=left_out) if left_out else Markup(""),
         outcome=row.outcome,
@@ -427,7 +429,8 @@ def _client_row(row: ClientRow, view: ClientsView, form_token: str) -> Markup:
 <td class="actions">{switch}{revoke}</td>
 </tr>
 """,
-        id=row.id, label=UNCONFINED, client=row.client, project=row.project, hosts=", ".join(row.hosts),
+        id=row.id, label=UNCONFINED, client=row.client, project=row.project,
+        hosts=", ".join(f"{h} (read-only)" if h in row.readonly else h for h in row.hosts),
         where="issued in the UI" if row.issued else "token file", state=state,
         last_call="no call yet" if row.last_call is None else _second(row.last_call),
         switch=switch, revoke=revoke,
@@ -435,7 +438,7 @@ def _client_row(row: ClientRow, view: ClientsView, form_token: str) -> Markup:
 
 
 def page_clients(view: ClientsView, hosts: list[str], until: float, form_token: str,
-                 standing: Standing = NO_STANDING, notice: str = "") -> Markup:
+                 standing: Standing = NO_STANDING, notice: str = "", both: frozenset[str] = frozenset()) -> Markup:
     """Every client: on or off, lockdown, issuing a fallback token, and revoking
     one issued here (ADR-0014). `hosts` is the inventory's entries a token may
     be issued for: an entry marked `issue: never` is not among them (ADR-0009
@@ -449,8 +452,16 @@ def page_clients(view: ClientsView, hosts: list[str], until: float, form_token: 
     unreadable = render(
         '<p class="notice">The switch file is unreadable, so every client is refused: {why}. '
         'Fix it by hand on the nervus machine.</p>\n', why=view.unreadable) if view.unreadable else Markup("")
+    # ADR-0031: a machine with both accounts asks for an explicit pick, nothing chosen beforehand.
     boxes = join(render('<label class="host"><input type="checkbox" name="hosts" value="{host}"> {host}</label>\n',
-                        host=host) for host in hosts)
+                        host=host) for host in hosts if host not in both)
+    picks = join(render(
+        """<fieldset class="pick"><legend>{host}</legend>
+<label><input type="radio" name="level-{host}" value="none"> not on this token</label>
+<label><input type="radio" name="level-{host}" value="read-only"> read-only</label>
+<label><input type="radio" name="level-{host}" value="read-write"> read-write</label>
+</fieldset>
+""", host=host) for host in hosts if host in both)
     return _frame("nervus: clients", render(
         """<h1>Clients</h1>
 {notice}{unreadable}<section>
@@ -480,13 +491,16 @@ too, run <code>nervus-ctl lock &lt;id&gt; --kill-work</code> on the nervus machi
 <label>Project <input type="text" name="project" placeholder="laptop"></label>
 <fieldset><legend>Hosts</legend>
 {boxes}</fieldset>
-<button type="submit">Issue</button>
+{picks_note}{picks}<button type="submit">Issue</button>
 </form>
-<p class="muted">Its value is shown once, on the next page. Its hosts cannot be changed later: issue
-another and revoke this one.</p>
+<p class="muted">Its value is shown once, on the next page. Its hosts, and its level on each, cannot be changed
+later: issue another and revoke this one.</p>
 </section>""",
         notice=render('<p class="notice">{notice}</p>\n', notice=notice) if notice else Markup(""),
-        unreadable=unreadable, lockdown=lockdown, form_token=form_token, boxes=boxes,
+        unreadable=unreadable, lockdown=lockdown, form_token=form_token, boxes=boxes, picks=picks,
+        picks_note=Markup('<p class="muted">Each machine below has a read-only account beside its read-write one: '
+                          'choose for each whether this token is on it, and if so read-only or read-write.</p>\n')
+        if picks else Markup(""),
         rows=join(_client_row(row, view, form_token) for row in view.rows),
     ), until, form_token, standing, wide=True)
 
@@ -533,6 +547,55 @@ def _level_radios(chosen: str) -> Markup:
                 for level, words in LEVEL_WORDS.items())
 
 
+def account_boxes(readwrite: str, readonly: str) -> Markup:
+    """The two accounts' names (ADR-0031 question 8), filled in with nervus's."""
+    return render(
+        """<fieldset><legend>Accounts nervus makes there</legend>
+<label>Read-write, at standard or full <input type="text" name="readwrite" value="{readwrite}" autocomplete="off"
+ autocapitalize="none" spellcheck="false"></label>
+<label>Read-only, always <input type="text" name="readonly" value="{readonly}" autocomplete="off"
+ autocapitalize="none" spellcheck="false"></label>
+</fieldset>
+""", readwrite=readwrite, readonly=readonly)
+
+
+def names_hidden(readwrite: str, readonly: str, typed_readwrite: str = "", typed_readonly: str = "") -> Markup:
+    """The accounts' names, carried by a page that asks something else first."""
+    return render(
+        """<input type="hidden" name="readwrite" value="{readwrite}">
+<input type="hidden" name="readonly" value="{readonly}">
+<input type="hidden" name="typed_readwrite" value="{typed_readwrite}">
+<input type="hidden" name="typed_readonly" value="{typed_readonly}">
+""", readwrite=readwrite, readonly=readonly, typed_readwrite=typed_readwrite, typed_readonly=typed_readonly)
+
+
+def page_names_confirm(name: str, names: list[tuple[str, str]], fields: dict[str, str], action: str, until: float,
+                       form_token: str, standing: Standing = NO_STANDING) -> Markup:
+    """Before a code whose accounts are not nervus's own names (ADR-0031
+    question 8, as the operator added): what happens to an account that is
+    there already, and each such name typed again to go on. `fields` is
+    what the form asked for, carried."""
+    carried = join(render('<input type="hidden" name="{k}" value="{v}">\n', k=k, v=v) for k, v in fields.items())
+    typed = join(render('<label>Type {n} to go on <input type="text" name="{field}" autocomplete="off" '
+                        'autocapitalize="none" spellcheck="false"></label>\n', n=n, field=field)
+                 for n, field in names)
+    return _frame("nervus: add a machine", render(
+        """<h1>Use {accounts} on {name}?</h1>
+<p class="notice">If {accounts} is already an account on {name}, nervus uses it as it is, and its own SSH keys are
+replaced by nervus&#x27;s line alone: whoever logs in to it with a key, you too, can no longer. nervus never uses
+root or one of the machine&#x27;s own system accounts.</p>
+<p>To keep nervus&#x27;s own names, go back and leave the boxes as they were filled in.</p>
+<form method="post" action="machines" class="enroll">
+<input type="hidden" name="form_token" value="{form_token}">
+<input type="hidden" name="action" value="{action}">
+{carried}{typed}<button type="submit">Go on</button>
+</form>
+<p><a href="machines">Back to machines</a></p>""",
+        name=name, accounts=" and ".join(n for n, _ in names), form_token=form_token, action=action,
+        carried=carried, typed=typed,
+    ), until, form_token, standing)
+
+
 def _machine_action(action: str, form_token: str, label: str, name: str, extra: Markup = Markup("")) -> Markup:
     return render(
         """<form method="post" action="machines" class="inline">
@@ -545,7 +608,20 @@ def _machine_action(action: str, form_token: str, label: str, name: str, extra: 
     )
 
 
-def _machine_row(row: EnrolledHost, form_token: str) -> Markup:
+def _accounts_cell(row: EnrolledHost, kept) -> str:
+    """Its accounts, as nervus checked them (ADR-0031): the read-write one, and
+    the read-only one with its groups, or why it has none."""
+    if kept is None or kept.enrolled_at != row.enrolled_at:
+        return "agent (added before read-only accounts)"
+    parts = [kept.readwrite] if kept.readwrite else []
+    if kept.readonly:
+        parts.append(f"{kept.readonly}, read-only" + (f", in {', '.join(kept.groups)}" if kept.groups else ""))
+    else:
+        parts.append(f"no read-only account: {kept.why_none}")
+    return "; ".join(parts)
+
+
+def _machine_row(row: EnrolledHost, form_token: str, kept=None) -> Markup:
     move = _machine_action("move", form_token, "Change address", row.name, extra=render(
         '<input type="text" name="address" value="{address}" autocomplete="off" aria-label="new address">\n',
         address=row.address))
@@ -555,13 +631,14 @@ def _machine_row(row: EnrolledHost, form_token: str) -> Markup:
         """<tr>
 <td><code>{name}</code></td>
 <td>{address}</td>
-<td>{level}</td>
+<td>{level}<br><span class="muted">{accounts}</span></td>
 <td><code>{machine_id}</code></td>
 <td>{when}<br><span class="muted">by {by}</span></td>
 <td class="actions">{move}{remove}</td>
 </tr>
 """,
         name=row.name, address=row.address, level=row.level, machine_id=row.machine_id[:12],
+        accounts=_accounts_cell(row, kept),
         when=_second(row.enrolled_at), by=row.enrolled_by, move=move, remove=remove,
     )
 
@@ -580,7 +657,9 @@ def _code_state(code: EnrollmentCode, now: float) -> str:
 
 def page_machines(machines: list[EnrolledHost], codes: list[EnrollmentCode], by_hand: list[str], can_enroll: bool, now: float, until: float,
                   form_token: str, standing: Standing = NO_STANDING, notice: str = "",
-                  can_login: bool = False, restored: str = "") -> Markup:
+                  can_login: bool = False, restored: str = "",
+                  described: list[tuple[str, str, str | None]] | None = None,
+                  accounts: dict[str, MachineAccount] | None = None) -> Markup:
     """Machines enrolled from here, each removable and its address changeable;
     the codes made lately and what became of each; and the form that adds a
     machine, or gives one already here a new level (ADR-0024 decisions 2 to 5):
@@ -589,7 +668,7 @@ def page_machines(machines: list[EnrolledHost], codes: list[EnrollmentCode], by_
     names hosts.yaml's machines, which are not changed here. `can_enroll` is
     false when MCP serves plain HTTP. `restored`, after a restore until the
     next backup, says what the backup cannot have (ADR-0027 question 6)."""
-    rows = join(_machine_row(row, form_token) for row in machines) if machines else Markup(
+    rows = join(_machine_row(row, form_token, (accounts or {}).get(row.name)) for row in machines) if machines else Markup(
         '<tr><td colspan="6" class="muted">None yet.</td></tr>\n')
     code_rows = join(render("<tr><td><code>{name}</code></td><td>{level}</td><td>{address}</td><td>{made}</td>"
                             "<td>{state}</td></tr>\n", name=c.name, level=c.level,
@@ -614,16 +693,39 @@ def page_machines(machines: list[EnrolledHost], codes: list[EnrollmentCode], by_
  autocomplete="off"></label>
 <fieldset><legend>Level</legend>
 {levels}</fieldset>
-{connect}<button type="submit" name="action" value="add" class="secondary">Advanced: two lines to run on the machine yourself</button>
+{boxes}{connect}<button type="submit" name="action" value="add" class="secondary">Advanced: two lines to run on the machine yourself</button>
 </form>
 {how} To change a machine&#x27;s level, add it again under its name. To reinstall a
 machine, add it again under its name too, without removing it: the tokens that name it keep reaching
 it.</p>""",
-            form_token=form_token, levels=_level_radios("read-only"), connect=connect, how=how)
+            form_token=form_token, levels=_level_radios("read-only"), connect=connect, how=how,
+            boxes=account_boxes(READWRITE, READONLY))
     else:
         add = render('<p class="notice">{why}</p>\n', why=PLAIN_HTTP)
     hand = render('<p class="muted">Also reached, described by hand in hosts.yaml and not changed here: {names}.</p>\n',
                   names=", ".join(by_hand)) if by_hand else Markup("")
+    if described and can_enroll:
+        # ADR-0031 question 4: a machine described by hand gains a read-only account by two lines.
+        hand = join((hand, render(
+            """<h3>A read-only account on a machine described by hand</h3>
+<p class="muted">Two lines to run as root on it make one account, read-only, beside the one it is described with,
+which stays as it is; nervus then checks it and records it. Once it has one, a token can be read-only there.</p>
+<div class="table">
+<table>
+<thead><tr><th>Name</th><th>Described with</th><th>Read-only account</th><th></th></tr></thead>
+<tbody>
+{rows}</tbody>
+</table>
+</div>
+""", rows=join(render(
+                """<tr><td><code>{name}</code></td><td><code>{account}</code></td><td>{has}</td>
+<td class="actions">{action}</td></tr>
+""", name=d_name, account=d_account, has=render("<code>{r}</code>", r=d_readonly) if d_readonly else "none",
+                action=(_machine_action("forget-readonly", form_token, "Forget it", d_name) if d_readonly else
+                        _machine_action("readonly-account", form_token, "Two lines to add one", d_name, extra=render(
+                            '<input type="text" name="readonly" value="{ro}" autocomplete="off" '
+                            'aria-label="the read-only account\'s name">\n', ro=READONLY))))
+                for d_name, d_account, d_readonly in described))))
     return _frame("nervus: machines", render(
         """<h1>Machines</h1>
 {restored}{notice}<section>
@@ -658,7 +760,8 @@ it.</p>""",
 
 
 def page_enroll_confirm(name: str, level: str, address: str, reason: str, tokens: list[str], until: float,
-                        form_token: str, standing: Standing = NO_STANDING, action: str = "add") -> Markup:
+                        form_token: str, standing: Standing = NO_STANDING, action: str = "add",
+                        carried: Markup = Markup("")) -> Markup:
     """Before a code for a reused name or a raised level (ADR-0024 question
     8): which tokens reach what this changes, and the name typed to go on.
     The form carries what was asked for, so only the name is typed again, and
@@ -676,12 +779,12 @@ def page_enroll_confirm(name: str, level: str, address: str, reason: str, tokens
 <input type="hidden" name="name" value="{name}">
 <input type="hidden" name="address" value="{address}">
 <input type="hidden" name="level" value="{level}">
-<label>Type {name} to go on <input type="text" name="confirm" autocomplete="off"></label>
+{carried}<label>Type {name} to go on <input type="text" name="confirm" autocomplete="off"></label>
 <button type="submit">{button}</button>
 </form>
 <p><a href="machines">Back to machines</a></p>""",
         name=name, level=level, address=address, reason=reason, tokens=", ".join(tokens), form_token=form_token,
-        action=action, button="Connect" if action == "connect" else "Make the commands",
+        action=action, button="Connect" if action == "connect" else "Make the commands", carried=carried,
     ), until, form_token, standing)
 
 
@@ -706,7 +809,7 @@ instead.</p>
 def page_enroll_login(name: str, address: str, level: str, host_key: str, fingerprint: str, confirm: str,
                       until: float, form_token: str, standing: Standing = NO_STANDING,
                       notice: str = "", confirmed_level: str = "",
-                      key_file: str = "/etc/ssh/ssh_host_ed25519_key.pub") -> Markup:
+                      key_file: str = "/etc/ssh/ssh_host_ed25519_key.pub", carried: Markup = Markup("")) -> Markup:
     """What Connect shows (ADR-0026 question 2): the key the machine's SSH
     server answered with and how to check it, then the admin login. The form
     sends the login only with `host_key`, which nervus pins the login to, and
@@ -731,7 +834,7 @@ holding this key. If it does not match, stop: something else may be answering at
 <input type="hidden" name="host_key" value="{host_key}">
 <input type="hidden" name="confirm" value="{confirm}">
 <input type="hidden" name="confirmed_level" value="{confirmed_level}">
-<fieldset><legend>Level</legend>
+{carried}<fieldset><legend>Level</legend>
 {levels}</fieldset>
 <label>Admin account (root, or one that can use sudo) <input type="text" name="login" autocomplete="off"
  autocapitalize="none" spellcheck="false"></label>
@@ -739,7 +842,7 @@ holding this key. If it does not match, stop: something else may be answering at
 <button type="submit">Enroll</button>
 </form>
 <p class="muted">nervus logs in once, becomes root, directly or with sudo and this password, and runs its
-enrollment script: it makes the account agent with nervus&#x27;s key and sets up the level. nervus keeps no
+enrollment script: it makes nervus&#x27;s accounts with nervus&#x27;s key and sets up the level. nervus keeps no
 password. Whoever controls this nervus right now could see it; if you would rather nervus never saw it, or you do
 not trust this network, use the two lines.</p>
 <form method="post" action="machines" class="enroll">
@@ -749,11 +852,12 @@ not trust this network, use the two lines.</p>
 <input type="hidden" name="address" value="{address}">
 <input type="hidden" name="level" value="{level}">
 <input type="hidden" name="confirm" value="{confirm}">
-<button type="submit" class="secondary">Advanced: two lines to run on the machine yourself instead</button>
+{carried}<button type="submit" class="secondary">Advanced: two lines to run on the machine yourself instead</button>
 </form>
 <p><a href="machines">Back to machines</a></p>""",
         name=name, address=address, fingerprint=fingerprint, host_key=host_key, confirm=confirm,
         confirmed_level=confirmed_level, key_file=key_file, form_token=form_token, level=level, levels=_level_radios(level),
+        carried=carried,
         notice=render('<p class="notice">{notice}</p>\n', notice=notice) if notice else Markup(""),
     ), until, form_token, standing)
 
@@ -809,7 +913,7 @@ Revoke them in <a href="clients">Clients</a> if that is not what you want.</p>
 """, name=name, ids=", ".join(tokens)) if tokens else Markup("")
     return _frame("nervus: machine removed", render(
         """<h1>{name} is forgotten</h1>
-<p>nervus no longer reaches {name}. To take nervus&#x27;s account and key off it, run this on {name} as
+<p>nervus no longer reaches {name}. To take nervus&#x27;s accounts and key off it, run this on {name} as
 root:</p>
 <pre class="lines"><code>{commands}</code></pre>
 {naming}<p><a href="machines">Back to machines</a></p>""",
@@ -1004,7 +1108,7 @@ installing and after each upgrade, on nervus&#x27;s machine, as root, with the r
 
 
 PAGES = (page_signed_out, page_signin, page_home, page_audit, page_audit_row, page_clients, page_token_issued,
-         page_machines, page_enroll_confirm, page_enroll_login, page_enrolling, page_enroll_lines,
+         page_machines, page_enroll_confirm, page_names_confirm, page_enroll_login, page_enrolling, page_enroll_lines,
          page_machine_removed, page_setup, page_backups)
 
 

@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 
 import asyncssh
 
-from nervus import certs
+from nervus import accounts, certs
 from nervus.enroller import Enroller, EnrollmentFailed
 from nervus.enrollments import EnrolledVM, EnrollmentStore
 from nervus.guest import FIRST_POLL, Guest, GuestError
@@ -68,7 +68,7 @@ class VMTargets:
                 note = f"VM {vmid} enrolled, at {row.address}"
             else:
                 try:
-                    return await self.enroller.connect(row.address, row.host_keys), None
+                    return await self.enroller.connect(row.address, row.host_keys, machine=accounts.vm_name(vmid)), None
                 except _NOT_THIS_VM:
                     await self._still_there(guest, row)
                     row, note = await self._afresh(guest, token_id, row)
@@ -79,7 +79,7 @@ class VMTargets:
             # the caller, so the call's audit result has it whatever becomes of the connection
             # below or of the call after it (ADR-0001 section 10).
             certs.note(note)
-            return await self.enroller.connect(row.address, row.host_keys), note
+            return await self.enroller.connect(row.address, row.host_keys, machine=accounts.vm_name(vmid)), note
 
     async def _enroll(self, guest: Guest, token_id: str):
         return await self.enroller.enroll(guest, token_id)

@@ -193,6 +193,18 @@ Then, for each machine, on the UI's **Machines** page (ADR-0024, ADR-0026):
    account can read, run programs, and reach the network from there; it cannot change the
    machine's files. Full makes nervus root-equivalent there; never choose it for the machine nervus
    runs on, which nervus refuses anyway ("Where nervus may run").
+
+   **Two accounts** (ADR-0031). At standard or full nervus makes two accounts on the machine: a
+   read-write one, `nervusagent`, at the level you chose, and a read-only one,
+   `nervusagent-readonly`, kept read-only by the machine's kernel as a read-only machine's is. Each
+   client is then read-only or read-write there, chosen when you issue its token (step 4). At
+   read-only, the read-only account alone. The page fills in both names; you may give others,
+   such as an account that is there already, and the page asks first: **such an account is used as
+   it is, and its own SSH keys are replaced by nervus's line**, so whoever logged in to it with a
+   key, you too, no longer can. nervus never uses root or one of the machine's own system accounts.
+   Where the read-only account's sandbox cannot start (no bubblewrap, or no user namespaces), a
+   machine at standard or full is added with its read-write account alone, and the script and the
+   page say why; no client can be read-only there until you add it again.
 2. **Give the address**: the name or address nervus connects to. nervus's machine looks a name up
    in your network's DNS, as your other machines do; a `.local` name works only where nervus's
    machine runs mDNS (on Debian, `avahi-daemon` and `libnss-mdns`). On a network that hands out
@@ -216,16 +228,16 @@ Then, for each machine, on the UI's **Machines** page (ADR-0024, ADR-0026):
    answering at that address.
 4. **Log in once**, as root or as an account that can use `sudo`, with its password. nervus logs
    in, becomes root, directly or with `sudo` and that password, and runs its enrollment script
-   there, the same script the two lines below run: the account `agent` with exactly nervus's key,
-   the level, and the machine's SSH host keys sent back to nervus, which checks the level and only
-   then adds the machine. A page shows each step as it happens, then the outcome, and the machine
+   there, the same script the two lines below run: nervus's accounts, each with exactly nervus's
+   line, the level, and the machine's SSH host keys sent back to nervus, which logs in as each
+   account, checks it, and only then adds the machine. A page shows each step as it happens, then the outcome, and the machine
    is in the list. Leaving that page does not stop it; Machines shows what became of it.
 
    **What nervus keeps:** the account name, in its audit log and beside the one-time code it made;
    never the password, which it holds in memory for that one enrollment. Whoever controls nervus
    at that moment could see it. If the host keys the machine sends back do not include the one
    that answered the login, something between nervus and the machine may have answered instead:
-   nervus refuses it, the script takes nervus's key off again, and the page tells you to change
+   nervus refuses it, the script puts back everything it changed, and the page tells you to change
    that password.
 
 ### Advanced: two lines run on the machine yourself
@@ -246,19 +258,23 @@ less nervus-enroll.sh && sh nervus-enroll.sh
 
 The first fetches nervus's enrollment script, and refuses any server whose key is not nervus's (`-k`
 only stops curl asking the machine's own certificate authorities, which do not know nervus's). The
-second shows you the script; read it, quit with `q`, and it runs. It makes the account `agent` with
-exactly nervus's key, sets up the level (installing bubblewrap for read-only, or `sudo` for full,
-with `apt-get` if missing, and `tmux` for background jobs at every level), and sends the machine's
-SSH host keys back to nervus. Where the machine's AppArmor keeps bubblewrap from making user
-namespaces, as Ubuntu 24.04's does (26.04 lets it through, by a profile of Ubuntu's own), read-only
-also gives nervus its own copy of bubblewrap, which only `agent` may run, an AppArmor profile
-letting that copy alone make them, and an apt hook keeping the copy up to date (ADR-0024 question
-9); another level, or removal, takes all three off. nervus then logs in with those keys, checks the
-level, and only then adds the machine. The script ends by saying so, and the Machines page lists it.
+second shows you the script; read it, quit with `q`, and it runs. It makes nervus's accounts, each
+with exactly nervus's line, sets up the level (installing bubblewrap for the read-only account, and
+`sudo` for full, with `apt-get` if missing, and `tmux` for background jobs at every level), and
+sends the machine's SSH host keys back to nervus. Where the machine's AppArmor keeps bubblewrap from
+making user namespaces, as Ubuntu 24.04's does (26.04 lets it through, by a profile of Ubuntu's own),
+it also gives nervus its own copy of bubblewrap, which only the read-only account may run, an
+AppArmor profile letting that copy alone make them, and an apt hook keeping the copy up to date
+(ADR-0024 question 9); removal takes all three off. nervus then logs in with those keys as each
+account, checks it, and only then adds the machine. The script ends by saying so, and the Machines page lists it.
 The lines work once, within 15 minutes; the script checks its code first, so a used or expired one,
 or a copy left from an earlier try, changes nothing. If anything fails, the script says why, and you
-make new ones. If nervus does not add the machine, the script takes nervus's key off again; at full,
-on the machine nervus runs on, it refuses before changing anything.
+make new ones. If nervus does not add the machine, or the script stops before it is done (Ctrl-C
+included), it puts back everything it changed as it was: each account's SSH keys and sudoers line,
+nervus's read-only shell, and its copy of bubblewrap. It deletes the accounts it made, and leaves the
+packages it installed. So a failed attempt to change a machine's level leaves nervus the access it
+had there (ADR-0031 question 12). At full, on the machine nervus runs on, it refuses before changing
+anything.
 
 **What a machine needs:** Linux with an SSH server. For the two lines, also `curl`, which fetches
 them; by Connect, nervus installs `curl` itself where it is missing and the machine has `apt-get`,
@@ -276,26 +292,45 @@ makes commands.
 - **To reinstall a machine, or change its level**, add it again under its name, by Connect or the
   two lines. Don't remove it first: the tokens that name it keep reaching it. If the change gives
   tokens something new (a higher level, or a name a removed machine had), the page lists them and
-  asks you to type the name.
+  asks you to type the name. **A machine added before 0.3.0** has one account, `agent`, and no
+  read-only one; adding it again gives it both, and takes nervus's line, and its sudoers line, off
+  `agent`.
+- **A machine described by hand**, in nervus's inventory rather than added here, gains a read-only
+  account from the Machines page too: beside it, give the account's name, or keep nervus's, and
+  the page shows two lines like the ones above, to run on it as root. They make the read-only
+  account alone and change nothing else there, not the account the machine is described with and
+  not `sudo`; nervus then logs in as it, checks it is read-only, and records it. **Forget it** on
+  the same page takes it away from nervus and shows the commands that take it off the machine.
 - **To remove a machine**, use Remove on the Machines page. nervus forgets it at once, and the page
-  shows these commands to run on the machine as root, which take nervus's account and key off it:
+  shows the commands to run on the machine as root, which take nervus's accounts and key off it; for
+  a machine whose two accounts nervus made, these:
 
   <!-- install:remove -->
   ```bash
-  pkill -KILL -u agent; sleep 1
-  userdel -r agent
-  rm -f /etc/sudoers.d/nervus-agent
+  pkill -KILL -u nervusagent; pkill -KILL -u nervusagent-readonly; sleep 1
+  userdel -r nervusagent
+  userdel -r nervusagent-readonly
+  rm -f /etc/sudoers.d/nervus-nervusagent /etc/sudoers.d/nervus-nervusagent-readonly
   apparmor_parser -R /etc/apparmor.d/nervus-bwrap 2>/dev/null; rm -f /etc/apparmor.d/nervus-bwrap /etc/apt/apt.conf.d/99nervus-bwrap
   rm -rf /usr/local/lib/nervus
   ```
 
-  It also lists the tokens that still name the machine; revoke them on the Clients page if a machine
-  given that name later should not be reachable by them.
+  Every account nervus made there is deleted, those of names the machine had before it was added
+  again under others included: nervus remembers them until the machine is removed (ADR-0031
+  question 13). An account that was there before nervus, named when the machine was added, is not
+  deleted: the
+  page shows instead a line that takes nervus's line off it, run as that account, and its sudoers
+  file goes; the account, its home and its own keys stay. So do the accounts of a machine added
+  before 0.3.0, `agent`, since nervus cannot tell whether it made them. The page also lists the
+  tokens that still name the machine; revoke them on the Clients page if a machine given that name
+  later should not be reachable by them.
 
 ## 4. Connect your clients
 
 - **Issue a token for each client and project**, on the UI's Clients page, choosing the machines it
-  may reach (ADR-0001 s6, ADR-0014). The UI shows it once; keep it where you keep secrets: it goes
+  may reach (ADR-0001 s6, ADR-0014). For each machine with both accounts, choose explicitly: not on
+  this token, read-only, or read-write (ADR-0031); nothing is chosen for you, and the token is not
+  issued until each has a choice. The UI shows it once; keep it where you keep secrets: it goes
   to the client, never into a repository.
 - **On each client machine**, in your clone of this repository: save nervus's root, comparing it
   with the value the installer printed, then run `tools/nervus-status` (`docs/clients.md`, "Trust

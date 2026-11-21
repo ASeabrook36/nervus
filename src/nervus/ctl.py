@@ -74,12 +74,14 @@ from pathlib import Path
 import yaml
 
 import nervus
-from nervus import certs, identity, jobs, plainfile, restore, ssh
+from nervus import accounts, certs, identity, jobs, plainfile, restore, ssh
+from nervus.accounts import MachineAccount
 from nervus.backup import kept_name, recipient
 from nervus.auth import load_tokens
 from nervus.certs import CertificateAuthority
 from nervus.config import ConfigError, Host, load_hosts
 from nervus.database import LINK_SECONDS, audit_id
+from nervus.enrolled_hosts import EnrolledHost, merged
 from nervus.enroller import AGENT_USER, SSH_CONNECT_SECONDS, pinned_known_hosts
 from nervus.first_run import TIER_WORDS
 from nervus.switches import Switches, SwitchesSwapped, SwitchesUnreadable, change_switches, load_switches
@@ -215,18 +217,32 @@ def _jobs_by_run(audit_log: Path) -> dict[str, str]:
     return owners
 
 
-async def _connect(service: Service, host, authority: CertificateAuthority):
+class _Rows:
+    """Rows read by nervus-ctl's child process, as the stores give them."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def all(self):
+        return list(self.rows)
+
+
+async def _connect(service: Service, host, authority: CertificateAuthority, route=None):
     """A login to one machine, signed for the record certs.acting_for names,
     then with the plain key for a machine not yet moved to the CA. A machine
     added from the web UI, or a VM used by its id, is trusted only with its own
     pinned keys, as nervus trusts it; one of hosts.yaml's, with the known_hosts
     file. A machine that does not answer is given up on after SSH_CONNECT_SECONDS,
     so that one dead machine cannot hold up status or the off switch."""
+    # As the account chosen in nervus's one place (ADR-0031): for the operator's
+    # own work, the read-write account, or where the machine is read-only, its
+    # read-only one, signed read-only.
+    route = certs.take(route or accounts.choose(None, host))
     return await ssh.connect(
-        address=host.address, port=service.ssh_port, username=host.agent_user, client_keys=[service.ssh_key],
+        address=host.address, port=service.ssh_port, username=route.username, client_keys=[service.ssh_key],
         known_hosts=(pinned_known_hosts(host.address, service.ssh_port, host.host_keys) if host.host_keys
                      else service.known_hosts),
-        authority=authority, connect_timeout=SSH_CONNECT_SECONDS,
+        authority=authority, connect_timeout=SSH_CONNECT_SECONDS, machine=host.name,
     )
 
 
@@ -249,10 +265,12 @@ def machines(service: Service) -> tuple[dict[str, Host], str | None]:
         held = database_change(service, "machines")
     except ConfigError as exc:
         return hosts, str(exc)
-    for row in held["hosts"]:
-        hosts.setdefault(row["name"], Host(
-            name=row["name"], address=row["address"], os="", role=f"enrolled, {row['level']}",
-            agent_user=AGENT_USER, status="onboarded", host_keys=tuple(row["host_keys"]), level=row["level"]))
+    # As nervus has them, with each machine's accounts (ADR-0031): the same merge.
+    enrolled = [EnrolledHost(r["name"], r["address"], r["level"], tuple(r["host_keys"]), r.get("machine_id", ""),
+                             r.get("enrolled_at"), r.get("enrolled_by", "")) for r in held["hosts"]]
+    kept = [MachineAccount(a["name"], a["enrolled_at"], a["readwrite"], a["readonly"], tuple(a["groups"]),
+                           a["why_none"], a["checked_at"]) for a in held.get("accounts", [])]
+    hosts = merged(hosts, _Rows(enrolled), _Rows(kept))
     for row in held["vms"]:
         name = f"vmid {row['vmid']}"
         hosts[name] = Host(name=name, address=row["address"], os="", role="a VM used by its id",
@@ -260,10 +278,23 @@ def machines(service: Service) -> tuple[dict[str, Host], str | None]:
     return hosts, None
 
 
-async def _sessions(service: Service, host, authority: CertificateAuthority) -> list[str]:
-    """Job ids of nervus's tmux sessions on one inventory entry. Two entries
-    may be one machine with two accounts, and each has its own sessions."""
-    conn = await _connect(service, host, authority)
+def _accounts_of(host) -> list[tuple[str, certs.Route | None]]:
+    """Each account nervus runs jobs as on `host`, by the name nervus-ctl gives
+    it: the one chosen for nervus's own work, by the machine's name; and the
+    read-only one beside it, as `<name> (<account>)` (ADR-0031), whose jobs are
+    a read-only client's, reached by a read-only certificate."""
+    labels: list[tuple[str, certs.Route | None]] = [(host.name, None)]
+    if host.readonly_user and host.readonly_user != accounts.choose(None, host).username:
+        labels.append((f"{host.name} ({host.readonly_user})",
+                       certs.Route(host.name, host.readonly_user, True, "read-only")))
+    return labels
+
+
+async def _sessions(service: Service, host, authority: CertificateAuthority, route=None) -> list[str]:
+    """Job ids of nervus's tmux sessions on one inventory entry, as one of its
+    accounts. Two entries may be one machine with two accounts, and each has
+    its own sessions; so has a machine's read-only account (ADR-0031)."""
+    conn = await _connect(service, host, authority, route)
     try:
         result = await conn.run("tmux list-sessions -F '#{session_name}' 2>/dev/null")
     finally:
@@ -289,12 +320,13 @@ async def running_jobs(service: Service) -> tuple[dict[str, list[tuple[str, str]
         certs.acting_for(None, operator_record(service, "list_jobs", {"hosts": sorted(hosts)}))
     except ConfigError as exc:
         return found, [f"any machine, so none was asked: {exc}", *unreachable]
-    for name, host in sorted(hosts.items()):
-        try:
-            for job_id in await _sessions(service, host, authority):
-                found.setdefault(owners.get(job_id, "unattributed"), []).append((name, job_id))
-        except Exception as exc:  # report and go on: one host down must not hide the others
-            unreachable.append(f"{name}: {exc}")
+    for _, host in sorted(hosts.items()):
+        for label, route in _accounts_of(host):
+            try:
+                for job_id in await _sessions(service, host, authority, route):
+                    found.setdefault(owners.get(job_id, "unattributed"), []).append((label, job_id))
+            except Exception as exc:  # report and go on: one host down must not hide the others
+                unreachable.append(f"{label}: {exc}")
     return found, unreachable
 
 
@@ -302,14 +334,16 @@ async def _kill(service: Service, targets: list[tuple[str, str]], run_id: str) -
     """Kill each (host, job id), its logins signed for the record `run_id`;
     return one line per job saying what happened."""
     hosts, _ = machines(service)
+    labelled = {label: (host, route) for host in hosts.values() for label, route in _accounts_of(host)}
     authority = CertificateAuthority(service.ssh_ca)
     certs.acting_for(None, run_id)
     lines = []
     for name, job_id in targets:
-        if name not in hosts:  # listed a moment ago, and removed from nervus since
+        if name not in labelled:  # listed a moment ago, and removed from nervus since
             lines.append(f"  {name} {job_id}: NOT STOPPED: nervus no longer has this machine")
             continue
-        conn = await _connect(service, hosts[name], authority)
+        host, route = labelled[name]
+        conn = await _connect(service, host, authority, route)
         try:
             await jobs.kill_job(conn, job_id)
             still = await conn.run(f"tmux has-session -t nervus-{job_id} 2>/dev/null")
@@ -360,9 +394,14 @@ try:
     elif sys.argv[2] == "machines":
         from nervus.enrolled_hosts import EnrolledHostStore
         from nervus.enrollments import EnrollmentStore
+        from nervus.accounts import MachineAccounts
         print(json.dumps({
-            "hosts": [{"name": h.name, "address": h.address, "level": h.level, "host_keys": list(h.host_keys)}
+            "hosts": [{"name": h.name, "address": h.address, "level": h.level, "host_keys": list(h.host_keys),
+                       "machine_id": h.machine_id, "enrolled_at": h.enrolled_at, "enrolled_by": h.enrolled_by}
                       for h in EnrolledHostStore(db).all()],
+            "accounts": [{"name": a.name, "enrolled_at": a.enrolled_at, "readwrite": a.readwrite,
+                          "readonly": a.readonly, "groups": list(a.groups), "why_none": a.why_none,
+                          "checked_at": a.checked_at} for a in MachineAccounts(db).all()],
             "vms": [{"vmid": v.vmid, "address": v.address, "host_keys": list(v.host_keys)}
                     for v in EnrollmentStore(db).all()]}))
     elif sys.argv[2] == "identity":

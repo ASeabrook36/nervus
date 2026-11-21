@@ -21,17 +21,25 @@ What it holds to:
   host key that answered, never a password** (ADR-0026 question 4). Both or
   neither, the account a name and the key exactly one key; they go when the
   code does.
+- **A code keeps the accounts its script makes** (ADR-0031 question 8), in a
+  table of its own, `enrollment_accounts`: the read-write one, at standard or
+  full; the read-only one, always; and those nervus used on the machine before
+  and takes its line off. A code for a machine described by hand gives it the
+  read-only account alone (question 4), at a level of its own that a release
+  before this one does not know, so it serves no script for it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import secrets
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from nervus import accounts
 from nervus.database import Database
 from nervus.enrolled_hosts import HostRefused, check
 from nervus.enrollments import EnrollmentRefused, host_keys
@@ -57,6 +65,39 @@ class EnrollmentCode:
     made_by: str
     used_at: float | None
     outcome: str | None
+
+
+# ADR-0031 question 4: the level of a code that gives a machine described by
+# hand its read-only account, and nothing else.
+READONLY_ACCOUNT = "readonly-account"
+
+
+@dataclass(frozen=True)
+class CodeAccounts:
+    """The accounts a code's script makes (ADR-0031): `kind` "machine", or
+    READONLY_ACCOUNT for a machine described by hand."""
+    kind: str
+    readwrite: str | None
+    readonly: str
+    off: tuple[str, ...]
+
+
+def _accounts(level: str, readwrite: str | None, readonly: str | None, off) -> CodeAccounts:
+    """The accounts as a code keeps them, or HostRefused saying what is wrong."""
+    kind = accounts.READONLY_ACCOUNT_KIND if level == READONLY_ACCOUNT else "machine"
+    if level in ("read-only", READONLY_ACCOUNT):
+        readwrite = None
+    elif readwrite is None:
+        readwrite = accounts.READWRITE
+    readonly = accounts.READONLY if readonly is None else readonly
+    off = tuple(sorted(set(off)))
+    for name in (readwrite, readonly, *off):
+        if name is not None and (not isinstance(name, str) or not accounts.NAME.fullmatch(name) or name == "root"):
+            raise HostRefused("bad_account", f"{name!r} is not an account nervus uses: lowercase letters, digits, "
+                                             f"_ and -, starting with a letter or _, at most 32, and never root")
+    if readwrite is not None and readwrite == readonly:
+        raise HostRefused("bad_account", "the read-write and the read-only accounts must be two accounts")
+    return CodeAccounts(kind, readwrite, readonly, tuple(a for a in off if a not in (readwrite, readonly)))
 
 
 @dataclass(frozen=True)
@@ -102,18 +143,36 @@ class EnrollmentCodes:
 
     def make(self, *, name: str, address: str, level: str, made_by: str, reserved: Iterable[str] = (),
              now: float | None = None, login: str | None = None,
-             host_key: str | None = None) -> tuple[str, EnrollmentCode]:
+             host_key: str | None = None, readwrite: str | None = None, readonly: str | None = None,
+             off: Iterable[str] = ()) -> tuple[str, EnrollmentCode]:
         """A new code for this machine: its value, which exists only in what
         the caller shows, and its record. A code made from nervus's page also
         takes the account it logs in as and the host key that answered
-        (ADR-0026), both or neither. Raises HostRefused."""
+        (ADR-0026), both or neither; and every code, the accounts its script
+        makes (ADR-0031), nervus's names unless others are given. Raises
+        HostRefused."""
         name, address, level = check(name, address, level, reserved)
         made_with = _login_and_key(login, host_key)
+        return self._make(name, address, level, made_by, now, made_with, _accounts(level, readwrite, readonly, off))
+
+    def make_readonly_account(self, *, name: str, made_by: str, described: Iterable[str],
+                              readonly: str | None = None, now: float | None = None) -> tuple[str, EnrollmentCode]:
+        """A code that gives machine `name`, one described by hand in hosts.yaml
+        and named in `described`, the read-only account alone (ADR-0031
+        question 4). Raises HostRefused."""
+        if name not in set(described):
+            raise HostRefused("not_described", f"{name} is not a machine described by hand that a token may be "
+                                               f"issued for")
+        return self._make(name, "", READONLY_ACCOUNT, made_by, now, None,
+                          _accounts(READONLY_ACCOUNT, None, readonly, ()))
+
+    def _make(self, name, address, level, made_by, now, made_with, made_accounts) -> tuple[str, EnrollmentCode]:
         now = _now(now)
         value, code_id = secrets.token_urlsafe(CODE_BYTES), secrets.token_hex(ID_BYTES)
         with self.database.transaction() as db:
             db.execute("DELETE FROM enrollment_code WHERE expires_at <= ?", (now - KEEP_SECONDS,))
             db.execute("DELETE FROM enrollment_login WHERE code_id NOT IN (SELECT id FROM enrollment_code)")
+            db.execute("DELETE FROM enrollment_accounts WHERE code_id NOT IN (SELECT id FROM enrollment_code)")
             db.execute(
                 "INSERT INTO enrollment_code (id, hash, name, address, level, made_at, expires_at, made_by) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -122,7 +181,18 @@ class EnrollmentCodes:
             if made_with is not None:
                 db.execute("INSERT INTO enrollment_login (code_id, login, host_key) VALUES (?, ?, ?)",
                            (code_id, made_with.login, made_with.host_key))
+            db.execute("INSERT INTO enrollment_accounts (code_id, kind, readwrite, readonly, off) VALUES (?, ?, ?, ?, ?)",
+                       (code_id, made_accounts.kind, made_accounts.readwrite, made_accounts.readonly,
+                        json.dumps(list(made_accounts.off))))
             return value, self._get(db, "id", code_id)
+
+    def accounts_of(self, code_id: str) -> CodeAccounts | None:
+        """The accounts a code's script makes, or None for a code made by a
+        release before this one, which kept none."""
+        with self.database.transaction(write=False) as db:
+            row = db.execute("SELECT kind, readwrite, readonly, off FROM enrollment_accounts WHERE code_id = ?",
+                             (code_id,)).fetchone()
+        return CodeAccounts(row[0], row[1], row[2], tuple(json.loads(row[3]))) if row else None
 
     def login_of(self, code_id: str) -> CodeLogin | None:
         """The account and host key a code was made with, or None for a code

@@ -15,7 +15,7 @@ import os
 
 import pytest
 
-from nervus import certs
+from nervus import accounts, certs
 from nervus.audit import AuditLog
 from nervus.database import Database
 from nervus.exporter import Exporter, VMRequest
@@ -110,6 +110,7 @@ async def _exported(exporter, path, key="k"):
     """One call, as the export tool makes it: its result record, and the export."""
     run_id = exporter.audit.record_intent("export", {"token_id": "t"})
     certs.acting_for("t", run_id)
+    certs.take(accounts.vm_route(123))  # as the export tool chooses (ADR-0031)
     status = await exporter.export("t", key, VMRequest(123, str(path)), run_id, wait=30)
     return _result(exporter.audit, run_id), status.export
 
@@ -219,6 +220,7 @@ async def _delivered(store, world, upload, tmp_path):
     uploader = Uploader(store, audit, deliver=_vm_delivery(store, world))
     run_id = audit.record_intent("upload", {"token_id": "t"})
     certs.acting_for("t", run_id)
+    certs.take(accounts.vm_route(123))  # as the upload route chooses (ADR-0031)
     uploader.start(upload, run_id)
     await uploader.wait(upload.id, 30)
     return _result(audit, run_id), store.get("t", upload.id)

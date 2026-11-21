@@ -334,3 +334,23 @@ async def test_the_copys_ssh_port_is_in_the_exports_result_record(world):
     records = [r for r in _records(world) if r["id"] == result["run_id"] and r["phase"] == "result"]
     assert records and all(isinstance(p, int) for r in records for p in r["ssh_ports"])
     assert len(records[-1]["ssh_ports"]) == 1
+
+
+# --- ADR-0031: where the client is read-only ------------------------------------------------
+
+
+async def test_a_vm_export_is_refused_where_the_client_is_read_only_on_the_proxmox_host(world):
+    world.tokens["sekret-ro"] = Token(id="t-ro", client="c", project="p", hosts=frozenset({"testhost", "hv"}),
+                                      readonly=frozenset({"hv"}))
+    result = await _export(world, token="sekret-ro", request_key="k", vmid=100, path=_file(world, "f", b"x"))
+    assert result.is_error and "read-only on hv" in result.content[0].text
+    refusal = _records(world)[-1]
+    assert refusal["phase"] == "refused" and refusal["vmid"] == 100
+    assert world.api.reads == []
+
+
+async def test_a_host_export_records_the_account_and_the_level_it_ran_at(world):
+    result = await _export(world, request_key="k", host="testhost", remote_path=_file(world, "f", b"x"))
+    assert not result.is_error, result.content[0].text
+    intent = next(r for r in _records(world) if r["tool"] == "export" and r["phase"] == "intent")
+    assert (intent["user"], intent["level"]) == (world.settings.hosts["testhost"].agent_user, "read-write")

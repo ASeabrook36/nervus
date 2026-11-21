@@ -25,6 +25,7 @@ class ClientRow:
     issued: bool  # issued in the UI, and so revocable there; else from the token file
     off: bool  # switched off one by one; lockdown and an unreadable file are the view's
     last_call: float | None  # when its newest call began; None if the log has none
+    readonly: tuple[str, ...] = ()  # ADR-0031: the hosts it is read-only on
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,7 @@ def clients_view(tokens: Tokens, issued: Iterable[IssuedToken], switches: Path, 
     def row(token: Token, from_ui: bool) -> ClientRow:
         return ClientRow(id=token.id, client=token.client, project=token.project, hosts=tuple(sorted(token.hosts)),
                          issued=from_ui, off=token.id in disabled,
-                         last_call=_last_call(audit_log, token.id))
+                         last_call=_last_call(audit_log, token.id), readonly=tuple(sorted(token.readonly)))
 
     rows = [row(t, False) for t in tokens.in_file()] + [row(i.token, True) for i in issued]
     return ClientsView(rows=sorted(rows, key=lambda r: r.id), lockdown=lockdown, unreadable=unreadable)

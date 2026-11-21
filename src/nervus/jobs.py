@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import asyncssh
 
-from nervus.ssh import cd_target, label_line
+from nervus.ssh import cd_target, label_line, private_folder
 
 
 class JobError(Exception):
@@ -79,8 +79,8 @@ def build_job_script(job_id: str, cwd: str, command: str, label: str | None = No
     # The label as the job starts, beside the tmux session (ADR-0025 decision 2).
     script = (
         label_line(label)
-        + f"mkdir -p {job_dir}\n"
-        f"tmux new-session -d -s {shlex.quote(session_name)} bash -c {shlex.quote(inner)}\n"
+        + private_folder(job_dir)
+        + f"tmux new-session -d -s {shlex.quote(session_name)} bash -c {shlex.quote(inner)}\n"
     )
     return script, JobHandle(job_id=job_id, session_name=session_name, log_path=log_path, exit_path=exit_path)
 

@@ -39,7 +39,7 @@ import anyio
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
-from nervus import certs, switches
+from nervus import accounts, certs, switches
 from nervus.audit import AuditLog
 from nervus.auth import Token, Tokens, _hold, attribution, resolve_token
 from nervus.config import Settings, hypervisor_host
@@ -59,7 +59,7 @@ _FLAGS = {None: False, "": False, "0": False, "false": False, "1": True, "true":
 
 STATUS = {
     "bad_destination": 400, "bad_wait": 400, "bad_request_key": 400, "bad_sha256": 400, "bad_size": 400,
-    "not_allowed": 403, "no_proxmox": 403, "no_such_upload": 404, "key_reused": 409, "length_required": 411,
+    "not_allowed": 403, "no_proxmox": 403, "read_only": 403, "no_such_upload": 404, "key_reused": 409, "length_required": 411,
     "too_large": 413, "too_long": 413, "quota": 507, "disk_floor": 507,
 }
 
@@ -120,6 +120,25 @@ def authorize(token: Token, destination: dict, settings: Settings, hosts: dict |
                                           "has no Proxmox host")
     if proxmox not in token.hosts:
         raise UploadRefused("not_allowed", "this token may not reach the Proxmox host, so it may not reach VMs")
+    if proxmox in token.readonly:
+        raise UploadRefused("read_only", accounts.read_only_vms(proxmox))
+
+
+def account(token: Token, destination: dict, settings: Settings, hosts: dict | None = None):
+    """The account the delivery logs in to (ADR-0031, nervus.accounts), chosen
+    before any byte is accepted; a destination whose read-only account is
+    missing is refused here."""
+    if destination["kind"] != "host":
+        return accounts.vm_route(destination["vmid"])
+    host = (settings.hosts if hosts is None else hosts)[destination["host"]]
+    try:
+        route = accounts.choose(token, host)
+    except accounts.NoReadOnlyAccount:
+        route = None
+    if route is None or route.readonly:
+        # ADR-0031 question 2a: refused before any byte is accepted.
+        raise UploadRefused("read_only", accounts.read_only_put(host.name))
+    return route
 
 
 def declared_length(request: Request) -> int:
@@ -184,7 +203,9 @@ def upload_endpoints(uploader: Uploader, settings: Settings, tokens: Tokens, aud
             destination = parse_destination(query)
             fields["destination"] = destination
             wait = parse_wait(query)
-            authorize(token, destination, settings, hosts_now() if hosts_now else None)
+            hosts = hosts_now() if hosts_now else None
+            authorize(token, destination, settings, hosts)
+            route = account(token, destination, settings, hosts)
             size = declared_length(request)
         except UploadRefused as exc:
             return refuse(token, fields, exc)
@@ -205,8 +226,9 @@ def upload_endpoints(uploader: Uploader, settings: Settings, tokens: Tokens, aud
 
         upload = await receive(request, upload, run_id)
         if upload.state != FAILED:
-            # The delivery runs as a task of its own and carries this call (ADR-0025).
+            # The delivery runs as a task of its own and carries this call (ADR-0025), and its account (ADR-0031).
             certs.acting_for(token.id, run_id)
+            certs.take(route)
             uploader.start(upload, run_id)
             await uploader.wait(upload.id, wait)
             upload = store.get(token.id, upload.id) or upload

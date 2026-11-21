@@ -167,7 +167,7 @@ def test_main_builds_and_runs_server_on_valid_config(tmp_path, monkeypatch):
     fake_server = object()
 
     def fake_build_server(*, settings, tokens, audit, proxmox=None, exporter=None, uploader=None, vms=None,
-                          enrolled=None, enrollment=None):
+                          enrolled=None, enrollment=None, machine_accounts=None):
         calls["vms"] = vms
         calls["enrolled"] = enrolled
         calls["enrollment"] = enrollment
@@ -283,7 +283,7 @@ def test_main_passes_a_proxmox_client_when_configured(tmp_path, monkeypatch, pki
     calls = {}
 
     def fake_build_server(*, settings, tokens, audit, proxmox=None, exporter=None, uploader=None, vms=None,
-                          enrolled=None, enrollment=None):
+                          enrolled=None, enrollment=None, machine_accounts=None):
         calls["proxmox"] = proxmox
         calls["exporter"] = exporter
         calls["vms"] = vms

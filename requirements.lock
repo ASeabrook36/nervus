@@ -1,6 +1,6 @@
 # requirements.lock: every library an install of nervus fetches, each at one exact version, each of
 # its files named by its SHA-256, so that an install is the set this release's tests ran (ADR-0029).
-# Made for nervus 0.2.2 on 2026-11-19, by tools/lock-libraries with uv 0.13.6.
+# Made for nervus 0.3.0 on 2026-11-20, by tools/lock-libraries with uv 0.13.6.
 # Not written by hand. To move a library, change pyproject.toml if it is named there, and run
 # tools/lock-libraries again: every release has its lock made again, at the newest versions.
 annotated-types==0.8.0 \

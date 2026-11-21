@@ -24,7 +24,9 @@ from nervus.certs import CertificateAuthority
 from nervus.config import ConfigError, Settings, hypervisor_host, load_hosts, never_issued, require_private_file
 from nervus.database import Database, DatabaseUnusable
 from nervus.enroller import Enroller, ssh_connector
+from nervus.ssh import public_words
 from nervus.enrollments import EnrollmentStore
+from nervus.accounts import MachineAccounts, accounts_at, described
 from nervus.enrolled_hosts import EnrolledHostStore, merged
 from nervus.enrollment_codes import EnrollmentCodes
 from nervus.host_enrollment import HostEnrollment, own_machine_id
@@ -847,6 +849,8 @@ def main(argv: list[str] | None = None) -> int:
     # nervus's own key with the host keys their guest agents report (ADR-0022).
     # Machines enrolled from the UI, read at every call beside hosts.yaml (ADR-0024).
     enrolled = EnrolledHostStore(database)
+    # What each machine's accounts are, read-only and read-write (ADR-0031).
+    machine_accounts = MachineAccounts(database)
     vms = None
     if proxmox is not None:
         enrollments = EnrollmentStore(database)
@@ -864,7 +868,7 @@ def main(argv: list[str] | None = None) -> int:
         vm_connect=vms.connect if vms else None,
     )
     uploader = Uploader(upload_store, audit, deliver=Deliveries(
-        HostDelivery(upload_store, lambda: merged(hosts, enrolled), lambda host: connect_host(settings, host)),
+        HostDelivery(upload_store, lambda: merged(hosts, enrolled, machine_accounts), lambda host: connect_host(settings, host)),
         # The root beside the certificate MCP serves, handed to a VM with each
         # pull so its curl can check nervus (ADR-0022 8a). Read at each pull.
         VMDelivery(upload_store, exporter.vm_api, args.upload_pull_url or None,
@@ -882,9 +886,18 @@ def main(argv: list[str] | None = None) -> int:
         key=ssh_ca.public_key, connect=ssh_connector(ssh_key, settings.ssh_port, authority=ssh_ca),
         pin=pin, own_machine_id=own_machine_id(), reserved=lambda: hosts.keys(),
         locked=lambda: locked(settings.switches_path),
+        # ADR-0031: what each machine's accounts are, and the machines described by hand that can be
+        # given a read-only account from the Machines page (question 4).
+        machine_accounts=machine_accounts, described=lambda: described(hosts),
+        connect_described=lambda host: connect_host(settings, host),
+        # nervus's own key, which a machine enrolled before ADR-0025 holds (procedure 068, section 12).
+        nervus_key=lambda: public_words(ssh_key),
+        # The accounts every hosts.yaml entry at a machine's address is described with (procedure 068, section 12).
+        taken=lambda name: accounts_at(hosts, name),
     )
     mcp_server = build_server(settings=settings, tokens=tokens, audit=audit, proxmox=proxmox, exporter=exporter,
-                              uploader=uploader, vms=vms, enrolled=enrolled, enrollment=enrollment)
+                              uploader=uploader, vms=vms, enrolled=enrolled, enrollment=enrollment,
+                              machine_accounts=machine_accounts)
     # At every start: the tier declared at setup, and whether nervus listens on
     # an address public in form, with the ranges declared internal (ADR-0007
     # decision 4, ADR-0015 decisions C to E). It only reads, and is never a
@@ -919,7 +932,13 @@ def main(argv: list[str] | None = None) -> int:
                                         urllib.parse.urlsplit(args.ui_url).hostname or "" if args.ui_url else "",
                                         # Added by an admin login given once, the machine's key shown first (ADR-0026).
                                         login=LoginEnrollment(codes, audit, port=settings.ssh_port,
-                                                              locked=lambda: locked(settings.switches_path))))
+                                                              locked=lambda: locked(settings.switches_path)),
+                                        # ADR-0031: each machine's accounts, and question 4's machines.
+                                        accounts=machine_accounts, described=described(hosts),
+                                        taken={n: accounts_at(hosts, n) for n in described(hosts)},
+                                        # nervus's key words, for the removal commands (ADR-0031 question 9).
+                                        key_words=lambda: tuple(w for w in (
+                                            " ".join(ssh_ca.public_key().split()[:2]), public_words(ssh_key)) if w)))
     host = settings.bind_host
 
     for served in {id(c): c for c in (certificate, ui_cert) if c}.values():

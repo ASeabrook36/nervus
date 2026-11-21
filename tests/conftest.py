@@ -67,6 +67,39 @@ async def ssh_server(tmp_path):
         await server.wait_closed()
 
 
+@pytest.fixture
+async def ca_ssh_server(tmp_path):
+    """As ssh_server, and trusting a certificate authority of its own as well,
+    as a machine enrolled since ADR-0025 trusts nervus's: a read-only call,
+    which offers only a certificate (ADR-0031), can log in to it. `ca_path`
+    is the authority's private key."""
+    from types import SimpleNamespace
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    ca_key = asyncssh.generate_private_key("ssh-ed25519")
+    folder = tmp_path / "ca-ssh-server"
+    folder.mkdir()
+    client_key_path, ca_path = folder / "client_ed25519", folder / "ca_ed25519"
+    for path, key in ((client_key_path, client_key), (ca_path, ca_key)):
+        path.write_bytes(key.export_private_key())
+        path.chmod(0o600)
+    authorized = folder / "authorized_keys"
+    authorized.write_text(client_key.export_public_key().decode().strip() + "\n"
+                          + "cert-authority " + ca_key.export_public_key().decode().strip() + "\n")
+    server = await asyncssh.listen("127.0.0.1", 0, server_host_keys=[host_key],
+                                   authorized_client_keys=str(authorized), process_factory=_handle_process,
+                                   sftp_factory=True)
+    port = server.sockets[0].getsockname()[1]
+    known = folder / "known_hosts"
+    known.write_text(f"[127.0.0.1]:{port} {host_key.export_public_key().decode().strip()}\n")
+    try:
+        yield SimpleNamespace(host="127.0.0.1", port=port, client_key_path=str(client_key_path),
+                              known_hosts_path=str(known), username="testuser", ca_path=ca_path)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 # A fake Proxmox API over real TLS, for tests/test_proxmox.py and the
 # proxmox tool in tests/test_server.py.
 

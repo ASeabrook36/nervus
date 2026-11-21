@@ -18,7 +18,7 @@ from pathlib import Path
 import asyncssh
 import pytest
 
-from nervus import ctl
+from nervus import certs, ctl
 from nervus.audit import AuditLog
 from nervus.database import Database
 from nervus.enrolled_hosts import EnrolledHostStore
@@ -81,6 +81,7 @@ async def _job(service_, token_id):
     audit run id of an exec_bg intent naming the token."""
     svc, _, server = service_
     run_id = AuditLog(path=svc.audit_log).record_intent("exec_bg", {"token_id": token_id, "host": "h1"})
+    certs._caller.set(None)  # outside any call: nervus-ctl, run in this process, leaves its own
     conn = await connect(address=server.host, port=server.port, username=server.username,
                          client_keys=[server.client_key_path], known_hosts=server.known_hosts_path)
     try:
@@ -92,6 +93,7 @@ async def _job(service_, token_id):
 
 async def _running(service_, job_id):
     _, _, server = service_
+    certs._caller.set(None)  # outside any call: nervus-ctl, run in this process, leaves its own
     conn = await connect(address=server.host, port=server.port, username=server.username,
                          client_keys=[server.client_key_path], known_hosts=server.known_hosts_path)
     try:
@@ -910,3 +912,66 @@ async def test_when_the_database_cannot_be_read_status_says_so_and_still_asks_ho
     assert rc == 0, out
     assert f"    h1 {job}" in out
     assert "could not read jobs on the machines added from the web UI and the VMs used by id:" in out
+
+
+@needs_tmux
+async def test_nervus_ctl_logs_in_to_a_machine_as_the_account_nervus_chose(elsewhere, monkeypatch):
+    """ADR-0031, note 4: nervus-ctl's logins go through the same choice as a
+    client's: a machine added since this release is reached as the read-write
+    account its enrollment recorded, not as agent."""
+    from nervus import ssh
+    from nervus.accounts import MachineAccounts
+    _added_from_the_page(elsewhere)
+    db = Database(elsewhere[0].database)
+    row = EnrolledHostStore(db).get("m1")
+    MachineAccounts(db).record("m1", enrolled_at=row.enrolled_at, readwrite="nervusagent",
+                               readonly="nervusagent-readonly", groups=[], why_none=None)
+    seen = []
+    real = ssh.connect
+
+    async def recording(**kwargs):
+        seen.append((kwargs["address"], kwargs["username"]))
+        return await real(**kwargs)
+
+    monkeypatch.setattr(ssh, "connect", recording)
+    rc, out = await _ctl(elsewhere, "status")
+    assert rc == 0, out
+    assert (elsewhere[2].host, "nervusagent") in seen and (elsewhere[2].host, "agent") not in seen
+
+
+@needs_tmux
+async def test_nervus_ctl_lists_and_stops_jobs_under_a_machine_s_read_only_account(elsewhere, monkeypatch):
+    """ADR-0031 verification 9: a read-only client's jobs run as the machine's read-only account; nervus-ctl
+    asks that account too, by a read-only certificate, and stops what it finds there. The test's SSH server
+    runs every account's commands as this one, so the job started there is found under both."""
+    from nervus import certs, ssh
+    from nervus.accounts import MachineAccounts
+    _added_from_the_page(elsewhere)
+    db = Database(elsewhere[0].database)
+    row = EnrolledHostStore(db).get("m1")
+    MachineAccounts(db).record("m1", enrolled_at=row.enrolled_at, readwrite="nervusagent",
+                               readonly="nervusagent-readonly", groups=[], why_none=None)
+    seen = []
+    real = ssh.connect
+
+    async def as_chosen(**kwargs):
+        route = certs.route()
+        seen.append((kwargs["username"], route.readonly if route else None, certs.current().run_id))
+        # The test's server trusts nervus's plain key alone: log in with it, as the account chosen.
+        certs.current().route = None
+        return await real(**{**kwargs, "authority": None})
+
+    monkeypatch.setattr(ssh, "connect", as_chosen)
+    job = await _job(elsewhere, "t1")
+    rc, out = await _ctl(elsewhere, "status")
+    assert rc == 0, out
+    assert {s[:2] for s in seen} >= {("nervusagent-readonly", True), ("nervusagent", False)}
+    assert f"    m1 (nervusagent-readonly) {job}" in out
+    seen.clear()
+    rc, out = await _ctl(elsewhere, "lock", "t1", "--kill-work", "--yes")
+    assert rc == 0, out
+    assert f"m1 (nervusagent-readonly) {job}: stopped" in out
+    # Stopped as the account it was listed under: a read-only login signed for the lock that asked for it.
+    kill = next(r for r in reversed(_operator_records(elsewhere[0])) if r.get("action") == "lock")
+    assert ("nervusagent-readonly", True, kill["id"]) in seen
+    assert not await _running(elsewhere, job)

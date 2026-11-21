@@ -188,7 +188,37 @@ CREATE TABLE IF NOT EXISTS backup_event (
     made_at REAL,
     at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS enrollment_accounts (
+    code_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    readwrite TEXT,
+    readonly TEXT NOT NULL,
+    off TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS machine_account (
+    name TEXT PRIMARY KEY,
+    enrolled_at REAL,
+    readwrite TEXT,
+    readonly TEXT,
+    readonly_groups TEXT NOT NULL,
+    why_none TEXT,
+    checked_at REAL NOT NULL,
+    made TEXT NOT NULL DEFAULT '[]',
+    machine_id TEXT
+);
+CREATE TABLE IF NOT EXISTS assigned_token (
+    id TEXT PRIMARY KEY,
+    hash TEXT NOT NULL UNIQUE,
+    client TEXT NOT NULL,
+    project TEXT NOT NULL,
+    levels TEXT NOT NULL,
+    issued_at REAL NOT NULL
+);
 """
+# ADR-0031: what a token may be on one of its machines. Read-write is the
+# machine's own level, as for every token before; read-only is the machine's
+# read-only account.
+ASSIGNMENTS = ("read-only", "read-write")
 
 
 class DatabaseUnusable(ConfigError):
@@ -403,7 +433,8 @@ class Database:
     # --- tokens issued in the UI (ADR-0014 decisions C and D) ----------------------
 
     def issue_token(self, id: str, client: str, project: str, hosts: list[str],
-                    taken: object = (), never_issued: object = (), now: float | None = None) -> str:
+                    taken: object = (), never_issued: object = (), now: float | None = None,
+                    readonly: object = ()) -> str:
         """Issue a token and return its value, which exists only in what the
         caller shows, once. Raises TokenRefused.
 
@@ -412,6 +443,12 @@ class Database:
         issue another and revoke this one (decision D). `never_issued` holds the
         inventory's entries marked `issue: never`, which only the token file's
         tokens hold (ADR-0009 decision 3, ADR-0019 decision D).
+
+        `readonly` names the hosts on which the token is read-only (ADR-0031),
+        each one of `hosts`. A token with any is kept whole in `assigned_token`,
+        which a release before this one does not know, so it refuses the token
+        as unknown rather than read it as read-write everywhere ("Settled
+        already"). One with none is kept in `issued_token`, as before.
         """
         now = _now(now)
         if not isinstance(id, str) or not TOKEN_ID.fullmatch(id):
@@ -427,16 +464,29 @@ class Database:
         if kept:
             raise TokenRefused(f"{', '.join(kept)} is never issued here: the inventory marks it "
                                "`issue: never` (ADR-0009)")
+        if not isinstance(readonly, (list, tuple, set, frozenset)) or not all(isinstance(h, str) for h in readonly):
+            raise TokenRefused("the machines a token is read-only on are a list of its hosts")
+        outside = sorted(set(readonly) - set(hosts))
+        if outside:
+            raise TokenRefused(f"{', '.join(outside)} is read-only on this token but is not one of its hosts")
         if id in taken:
             raise TokenRefused(f"the id {id} is already a token's, in the token file")
         value = secrets.token_urlsafe(TOKEN_BYTES)
         with self._transaction() as db:
-            if db.execute("SELECT 1 FROM issued_token WHERE id = ?", (id,)).fetchone():
+            if db.execute("SELECT 1 FROM issued_token WHERE id = ? UNION SELECT 1 FROM assigned_token WHERE id = ?",
+                          (id, id)).fetchone():
                 raise TokenRefused(f"the id {id} is already a token's")
-            db.execute(
-                "INSERT INTO issued_token (id, hash, client, project, hosts, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (id, _hash(value), client.strip(), project.strip(), json.dumps(sorted(set(hosts))), now),
-            )
+            if readonly:
+                levels = {h: ("read-only" if h in set(readonly) else "read-write") for h in sorted(set(hosts))}
+                db.execute(
+                    "INSERT INTO assigned_token (id, hash, client, project, levels, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (id, _hash(value), client.strip(), project.strip(), json.dumps(levels), now),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO issued_token (id, hash, client, project, hosts, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (id, _hash(value), client.strip(), project.strip(), json.dumps(sorted(set(hosts))), now),
+                )
         return value
 
     def token(self, value: str) -> Token | None:
@@ -445,20 +495,40 @@ class Database:
         with self._transaction(write=False) as db:
             row = db.execute("SELECT id, client, project, hosts FROM issued_token WHERE hash = ?",
                              (_hash(value),)).fetchone()
-        return None if row is None else _token(row)
+            if row is not None:
+                return _token(row)
+            row = db.execute("SELECT id, client, project, levels FROM assigned_token WHERE hash = ?",
+                             (_hash(value),)).fetchone()
+        return None if row is None else _assigned(row)
 
     def issued_tokens(self) -> list[IssuedToken]:
+        """Every token issued in the UI, from both tables, by id."""
         with self._transaction(write=False) as db:
-            rows = db.execute("SELECT id, client, project, hosts, issued_at FROM issued_token ORDER BY id").fetchall()
-        return [IssuedToken(token=_token(row[:4]), issued_at=row[4]) for row in rows]
+            plain = db.execute("SELECT id, client, project, hosts, issued_at FROM issued_token").fetchall()
+            assigned = db.execute("SELECT id, client, project, levels, issued_at FROM assigned_token").fetchall()
+        issued = ([IssuedToken(token=_token(row[:4]), issued_at=row[4]) for row in plain]
+                  + [IssuedToken(token=_assigned(row[:4]), issued_at=row[4]) for row in assigned])
+        return sorted(issued, key=lambda i: i.token.id)
 
     def revoke_token(self, id: str) -> bool:
-        """Delete an issued token: its next call is refused as an unknown
-        token's (ADR-0006 decision 8). False if there was none."""
+        """Delete an issued token, from whichever table holds it: its next call
+        is refused as an unknown token's (ADR-0006 decision 8). False if there
+        was none."""
         with self._transaction() as db:
-            return db.execute("DELETE FROM issued_token WHERE id = ?", (id,)).rowcount > 0
+            gone = db.execute("DELETE FROM issued_token WHERE id = ?", (id,)).rowcount
+            gone += db.execute("DELETE FROM assigned_token WHERE id = ?", (id,)).rowcount
+            return gone > 0
 
 
 def _token(row: tuple) -> Token:
     id, client, project, hosts = row
     return Token(id=id, client=client, project=project, hosts=frozenset(json.loads(hosts)))
+
+
+def _assigned(row: tuple) -> Token:
+    """A token from `assigned_token`: its hosts, and those it is read-only on.
+    A level this release does not know reads as read-only, never as more."""
+    id, client, project, levels = row
+    levels = json.loads(levels)
+    return Token(id=id, client=client, project=project, hosts=frozenset(levels),
+                 readonly=frozenset(h for h, level in levels.items() if level != "read-write"))

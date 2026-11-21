@@ -65,7 +65,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import anyio.to_thread
@@ -88,7 +88,8 @@ from nervus.enrollment_codes import LOGIN, EnrollmentCodes
 from nervus.enrollments import EnrollmentRefused, host_keys
 from nervus.exposure import Exposure
 from nervus.first_run import FirstRun, SetupRefused
-from nervus.host_enrollment import REMOVE_COMMANDS, enroll_lines, enroll_url
+from nervus.accounts import READONLY, READWRITE, MachineAccounts, has_both
+from nervus.host_enrollment import enroll_lines, enroll_url, remove_commands, remove_readonly_commands
 from nervus.host_login import LoginEnrollment, LoginRefused, LoginRun, fingerprint, key_file
 from nervus.pages import (
     PLAIN_HTTP,
@@ -106,6 +107,8 @@ from nervus.pages import (
     page_home,
     page_machine_removed,
     page_machines,
+    page_names_confirm,
+    names_hidden,
     page_setup,
     page_signed_out,
     page_signin,
@@ -178,6 +181,16 @@ class Machines:
     by_hand: list[str]
     nervus_host: str = ""
     login: LoginEnrollment | None = None
+    # ADR-0031: what each machine's accounts are, and the machines described by
+    # hand that may be given a read-only account from this page (question 4).
+    accounts: MachineAccounts | None = None
+    described: dict = field(default_factory=dict)
+    # For each of those, the accounts every hosts.yaml entry at its address is
+    # described with, none of which may be its read-only account (procedure 068, section 12).
+    taken: dict = field(default_factory=dict)
+    # nervus's key words, its authority's and its own, as a line holds them: the removal commands take the line
+    # off an account that was there before nervus by them (ADR-0031 question 9).
+    key_words: Callable[[], tuple] = lambda: ()
 
 
 @dataclass(frozen=True)
@@ -441,7 +454,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         view = await anyio.to_thread.run_sync(lambda: clients_view(
             management.tokens, database.issued_tokens(), management.switches, audit.path))
         offered = [h for h in await issuable() if h not in management.never_issued]
-        return page(page_clients(view=view, hosts=offered, until=session.expires_at,
+        return page(page_clients(view=view, hosts=offered, until=session.expires_at, both=await both_accounts(),
                                  form_token=form_token(value), standing=await standing_now(), notice=notice), status)
 
     async def clients(request: Request) -> Response:
@@ -451,6 +464,20 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         if management is None:
             return PlainTextResponse("Client management is not set up in this nervus.", status_code=404)
         return await clients_page(request, *found[:2])
+
+    async def both_accounts() -> frozenset[str]:
+        """The machines a token may be read-only or read-write on (ADR-0031):
+        those with a read-only account beside their read-write one, as nervus
+        checked them; offered with an explicit pick."""
+        if machines is None or machines.accounts is None:
+            return frozenset()
+        kept = {a.name: a for a in await anyio.to_thread.run_sync(machines.accounts.all)}
+        rows = await anyio.to_thread.run_sync(machines.store.all)
+        found = {name for name, host in machines.described.items()
+                 if name in kept and kept[name].enrolled_at is None and kept[name].readonly}
+        found |= {row.name for row in rows if has_both(row.as_host(kept.get(row.name)))
+                  and row.name not in management.hosts}
+        return frozenset(found)
 
     async def issuable() -> list[str]:
         """The machines a token may name: hosts.yaml's, then those enrolled
@@ -521,19 +548,33 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             elif action == "issue":
                 hosts = [str(h) for h in form.getlist("hosts")]
                 known = await issuable()
+                both = await both_accounts()
                 unknown = [h for h in hosts if h not in known]
                 if unknown:
                     raise _Refused(f"Not in the inventory: {', '.join(unknown)}.")
+                # ADR-0031: each machine with both accounts has an explicit pick, and only those have one.
+                picked = {k[len("level-"):]: str(form.get(k)) for k in form.keys() if k.startswith("level-")}
+                strays = sorted(set(picked) - both) + sorted(h for h in hosts if h in both)
+                if strays:
+                    raise _Refused(f"Not issued: {', '.join(strays)} cannot be read-only on this token here, or was "
+                                   f"given twice.")
+                unpicked = sorted(h for h in both if h not in management.never_issued
+                                  and picked.get(h) not in ("none", "read-only", "read-write"))
+                if unpicked:
+                    raise _Refused(f"Not issued: choose for {', '.join(unpicked)} whether this token is on it, "
+                                   f"read-only or read-write.")
+                readonly = sorted(h for h, level in picked.items() if level == "read-only")
+                hosts += [h for h, level in picked.items() if level in ("read-only", "read-write")]
                 client, project = str(form.get("client", "")), str(form.get("project", ""))
                 try:
                     issued = await anyio.to_thread.run_sync(lambda: database.issue_token(
                         token_id, client, project, hosts, taken=management.tokens.file_ids(),
-                        never_issued=management.never_issued))
+                        never_issued=management.never_issued, readonly=readonly))
                 except TokenRefused as exc:
                     raise _Refused(f"Not issued: {exc}.") from exc
                 failed = await recorded("issue_token", {"target": token_id, "client": client.strip(),
                                                         "project": project.strip(), "hosts": sorted(set(hosts)),
-                                                        **where},
+                                                        "read_only": readonly, **where},
                                         undo=lambda: database.revoke_token(token_id))
                 if failed:
                     return await clients_page(request, value, session, failed, 500)
@@ -567,7 +608,11 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         assert machines is not None
         rows = await anyio.to_thread.run_sync(machines.store.all)
         codes = await anyio.to_thread.run_sync(machines.codes.recent)
-        return page(page_machines(machines=rows, codes=codes, by_hand=list(machines.by_hand),
+        kept = {a.name: a for a in await anyio.to_thread.run_sync(machines.accounts.all)} if machines.accounts else {}
+        described = [(name, host.agent_user, kept[name].readonly if name in kept and kept[name].enrolled_at is None
+                      else None) for name, host in sorted(machines.described.items())]
+        return page(page_machines(machines=rows, codes=codes, by_hand=list(machines.by_hand), described=described,
+                                  accounts=kept,
                                   can_enroll=machines.pin() is not None, now=time.time(), until=session.expires_at,
                                   form_token=form_token(value), standing=await standing_now(), notice=notice,
                                   can_login=machines.login is not None,
@@ -589,7 +634,8 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         return sorted({t.id for t in [*in_file, *issued] if name in t.hosts})
 
     async def ask_first(form, *, name: str, level: str, at: str, action: str, value: str, session: Session,
-                        standing: Standing, confirmed_level: str | None = None) -> tuple[list[str], Response | None]:
+                        standing: Standing, confirmed_level: str | None = None,
+                        carried: Markup = Markup("")) -> tuple[list[str], Response | None]:
         """ADR-0024 question 8, asked the same way before Connect, the login and
         the two lines: tokens follow the name, so ask before they would reach a
         machine they did not, or a higher level. Returns the tokens shown, and
@@ -613,8 +659,42 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         if not typed:
             return shown, page(page_enroll_confirm(name=name, level=level, address=at, reason=reason, tokens=shown,
                                                    until=session.expires_at, form_token=form_token(value),
-                                                   standing=standing, action=action))
+                                                   standing=standing, action=action, carried=carried))
         return shown, None
+
+    def account_names(form) -> tuple[str, str]:
+        """The accounts' names the form gives (ADR-0031 question 8), nervus's own where left blank."""
+        return (str(form.get("readwrite", "")).strip() or READWRITE, str(form.get("readonly", "")).strip() or READONLY)
+
+    def carried(form) -> Markup:
+        readwrite, readonly = account_names(form)
+        return names_hidden(readwrite, readonly, str(form.get("typed_readwrite", "")),
+                            str(form.get("typed_readonly", "")))
+
+    def ask_names(form, *, name: str, level: str, action: str, value: str, session: Session, standing: Standing,
+                  fields: dict) -> Response | None:
+        """As the operator added to question 8: a name other than nervus's own
+        is asked about first, and goes on only when it is typed again."""
+        readwrite, readonly = account_names(form)
+        unusual = [(n, f"typed_{which}") for n, which, default in
+                   ((readwrite if level in ("standard", "full") else None, "readwrite", READWRITE),
+                    (readonly, "readonly", READONLY)) if n and n != default]
+        if all(str(form.get(f, "")) == n for n, f in unusual):
+            return None
+        kept = {**fields, "readwrite": readwrite, "readonly": readonly,
+                **{f: str(form.get(f, "")) for f in ("confirm", "confirmed_level", "host_key") if form.get(f)}}
+        return page(page_names_confirm(name=name, names=unusual, fields=kept, action=action,
+                                       until=session.expires_at, form_token=form_token(value), standing=standing))
+
+    async def accounts_before(name: str) -> set[str]:
+        """The accounts nervus used on machine `name` before, whose line its
+        script takes off where they are not this enrollment's (ADR-0031)."""
+        row = await anyio.to_thread.run_sync(machines.store.get, name)
+        if row is None:
+            return set()
+        kept = await anyio.to_thread.run_sync(machines.accounts.get, name) if machines.accounts else None
+        host = row.as_host(kept)
+        return {a for a in (host.agent_user, host.readonly_user) if a}
 
     def one_host_key(text: str) -> str:
         """The host key as the store keeps it; exactly one, as the login is
@@ -652,16 +732,25 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                 except HostRefused as exc:
                     raise _Refused(f"No commands made: {exc.message}") from exc
                 shown, asked = await ask_first(form, name=name, level=level, at=at, action="add", value=value,
-                                               session=session, standing=standing)
+                                               session=session, standing=standing, carried=carried(form))
                 if asked is not None:
                     return asked
+                asked = ask_names(form, name=name, level=level, action="add", value=value, session=session,
+                                  standing=standing, fields={"name": name, "address": at, "level": level})
+                if asked is not None:
+                    return asked
+                readwrite, readonly = account_names(form)
+                before = await accounts_before(name)
                 try:
                     code_value, code = await anyio.to_thread.run_sync(lambda: machines.codes.make(
-                        name=name, address=at, level=level, made_by="operator", reserved=machines.by_hand))
+                        name=name, address=at, level=level, made_by="operator", reserved=machines.by_hand,
+                        readwrite=readwrite, readonly=readonly, off=before))
                 except HostRefused as exc:
                     raise _Refused(f"No commands made: {exc.message}") from exc
+                made = await anyio.to_thread.run_sync(machines.codes.accounts_of, code.id)
                 failed = await recorded("enrollment_code", {
                     "target": code.name, "code_id": code.id, "level": code.level,
+                    "readwrite": made.readwrite, "readonly": made.readonly, "off": list(made.off),
                     "tokens_shown": shown,
                     "machine_address": code.address or "where its report comes from", **where},
                     undo=lambda: machines.codes.cancel(code.id))
@@ -675,6 +764,50 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             if action in ("connect", "login"):
                 return await connect_or_login(request, form, action, name=name, value=value, session=session,
                                               standing=standing, where=where)
+            if action == "readonly-account":
+                # ADR-0031 question 4: a machine described by hand gains a read-only account by two lines.
+                pin = machines.pin()
+                if pin is None:
+                    raise _Refused(PLAIN_HTTP)
+                host = machines.described.get(name)
+                if host is None:
+                    raise _Refused(f"No commands made: {name} is not a machine described by hand that a token "
+                                   f"may be issued for.")
+                _, readonly = account_names(form)
+                if readonly == host.agent_user or readonly in machines.taken.get(name, ()):
+                    raise _Refused(f"No commands made: {readonly} is the account {name}, or another entry of "
+                                   f"hosts.yaml at its address, is described with.")
+                asked = ask_names(form, name=name, level="read-only", action="readonly-account", value=value,
+                                  session=session, standing=standing, fields={"name": name})
+                if asked is not None:
+                    return asked
+                try:
+                    code_value, code = await anyio.to_thread.run_sync(lambda: machines.codes.make_readonly_account(
+                        name=name, made_by="operator", described=machines.described, readonly=readonly))
+                except HostRefused as exc:
+                    raise _Refused(f"No commands made: {exc.message}") from exc
+                failed = await recorded("enrollment_code", {"target": code.name, "code_id": code.id,
+                                                            "level": code.level, "readonly": readonly, **where},
+                                        undo=lambda: machines.codes.cancel(code.id))
+                if failed:
+                    return await machines_page(value, session, failed, 500)
+                nervus_at = machines.nervus_host or request.url.hostname or ""
+                lines = enroll_lines(enroll_url(nervus_at, machines.port, code_value), pin)
+                return page(page_enroll_lines(name=code.name, level=f"the read-only account {readonly}", lines=lines,
+                                              nervus_host=nervus_at, until=session.expires_at,
+                                              form_token=form_token(value), standing=standing))
+            if action == "forget-readonly":
+                kept = await anyio.to_thread.run_sync(machines.accounts.get, name) if machines.accounts else None
+                if kept is None or kept.enrolled_at is not None or name not in machines.described:
+                    raise _Refused(f"{name} has no read-only account recorded here.")
+                await anyio.to_thread.run_sync(machines.accounts.remove, name)
+                # Forgetting takes access away, so it stands without its record.
+                await recorded("forget_readonly_account", {"target": name, "readonly": kept.readonly, **where})
+                return page(page_machine_removed(name=f"{name}'s read-only account",
+                                                 commands=remove_readonly_commands(kept.readonly, made=kept.made,
+                                                                                   keys=machines.key_words()),
+                                                 tokens=[], until=session.expires_at, form_token=form_token(value),
+                                                 standing=standing))
             row = await anyio.to_thread.run_sync(machines.store.get, name)
             if row is None:
                 raise _Refused(f"There is no machine {name} enrolled here.")
@@ -693,11 +826,21 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             elif action == "remove":
                 if str(form.get("confirm", "")) != name:
                     raise _Refused(f"To remove {name}, type its name exactly. Nothing was removed.")
+                kept = await anyio.to_thread.run_sync(machines.accounts.get, name) if machines.accounts else None
+                gone = row.as_host(kept)
+                # Which accounts nervus made there, where its record of this enrollment says (ADR-0031 question 9);
+                # where it cannot tell, none, so nothing the machine's owner made is deleted.
+                made = kept.made if kept is not None and kept.enrolled_at == row.enrolled_at else ()
                 await anyio.to_thread.run_sync(machines.store.remove, name)
+                if machines.accounts is not None:
+                    await anyio.to_thread.run_sync(machines.accounts.remove, name)
                 # Removing takes access away, so it stands without its record.
                 await recorded("remove_machine", {"target": name, "machine_address": row.address,
                                                   "level": row.level, "machine_id": row.machine_id, **where})
-                return page(page_machine_removed(name=name, commands=REMOVE_COMMANDS, tokens=await naming(name),
+                return page(page_machine_removed(name=name, commands=remove_commands(gone.agent_user,
+                                                                                    gone.readonly_user, made=made,
+                                                                                    keys=machines.key_words()),
+                                                 tokens=await naming(name),
                                                  until=session.expires_at, form_token=form_token(value),
                                                  standing=standing))
             else:
@@ -737,9 +880,15 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
         # On the login, the name typed counts only up to the level it was typed at (ADR-0026 question 7).
         shown, asked = await ask_first(form, name=name, level=level, at=at, action="connect", value=value,
                                        session=session, standing=standing,
-                                       confirmed_level=str(form.get("confirmed_level", "")) if action == "login" else None)
+                                       confirmed_level=str(form.get("confirmed_level", "")) if action == "login" else None,
+                                       carried=carried(form))
         if asked is not None:
             return asked
+        if action == "connect":
+            asked = ask_names(form, name=name, level=level, action="connect", value=value, session=session,
+                              standing=standing, fields={"name": name, "address": at, "level": level})
+            if asked is not None:
+                return asked
         framing = {"until": session.expires_at, "form_token": form_token(value), "standing": standing}
         confirm = str(form.get("confirm", ""))
         confirmed_level = (level if action == "connect" else str(form.get("confirmed_level", ""))) if confirm == name else ""
@@ -760,11 +909,11 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                 raise _Refused(f"Not connected: {exc.message}") from exc
             return page(page_enroll_login(name=name, address=at, level=level, host_key=key,
                                           fingerprint=fingerprint(key), key_file=key_file(key), confirm=confirm,
-                                          confirmed_level=confirmed_level, **framing))
+                                          confirmed_level=confirmed_level, carried=carried(form), **framing))
         key = one_host_key(str(form.get("host_key", "")))
         account, password = str(form.get("login", "")).strip(), str(form.get("password", ""))
         again = {"name": name, "address": at, "level": level, "host_key": key, "fingerprint": fingerprint(key),
-                 "key_file": key_file(key),
+                 "key_file": key_file(key), "carried": carried(form),
                  "confirm": confirm, "confirmed_level": confirmed_level, **framing}
         if not LOGIN.fullmatch(account):
             said = "Give the admin account to log in as: root, or an account that can use sudo. Nothing was sent."
@@ -774,10 +923,17 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             said = "Give that account's password. Nothing was sent."
             refusal(request, "machines", action, said, target=name, machine_address=at, level=level)
             return page(page_enroll_login(notice=said, **again), 400)
+        # The names were asked about at Connect; at a level raised since, the read-write one is asked about now.
+        asked = ask_names(form, name=name, level=level, action="connect", value=value, session=session,
+                          standing=standing, fields={"name": name, "address": at, "level": level})
+        if asked is not None:
+            return asked
+        readwrite, readonly = account_names(form)
+        before = await accounts_before(name)
         try:
             code_value, code = await anyio.to_thread.run_sync(lambda: machines.codes.make(
                 name=name, address=at, level=level, made_by="operator", reserved=machines.by_hand, login=account,
-                host_key=key))
+                host_key=key, readwrite=readwrite, readonly=readonly, off=before))
         except HostRefused as exc:
             raise _Refused(f"No commands made: {exc.message}") from exc
         failed = await recorded("enrollment_code", {

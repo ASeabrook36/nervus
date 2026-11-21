@@ -12,7 +12,7 @@ import asyncssh
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from nervus import certs, jobs, sftp, ssh
+from nervus import accounts, certs, jobs, sftp, ssh
 from nervus.proxmox import ProxmoxClient, ProxmoxError, check_request
 from nervus.audit import AuditError, AuditLog
 from nervus.auth import (
@@ -31,7 +31,7 @@ from nervus.upload_route import upload_endpoints
 from nervus.uploader import Uploader
 from nervus.exporter import DEFAULT_WAIT_SECONDS, MEASURING, Exporter, HostRequest, Status, VMRequest, export_fields
 from nervus.exports import ExportRefused
-from nervus.enroller import AGENT_USER, EnrollmentFailed, pinned_known_hosts
+from nervus.enroller import EnrollmentFailed, pinned_known_hosts
 from nervus.enrolled_hosts import EnrolledHostStore, merged
 from nervus.enrollments import EnrollmentRefused, valid_vmid
 from nervus.guest import GuestError
@@ -121,12 +121,13 @@ REDACTED = "<redacted>"
 # needs it is refused, with this reason.
 NO_PROXMOX_HOST = "no inventory entry is marked `hypervisor: proxmox`, so this nervus has no Proxmox host"
 
+
 # Refusals, and failures reaching a target, whose text is meant for the client
 # and holds no secret: ProxmoxError never carries the token's secret, and
 # asyncssh's errors carry no key. The MCP library hides the text of any other
 # exception, as a crash inside nervus, and it stays hidden.
 _REFUSALS = (AuthError, ValueError, sftp.TransferPathError, ProxmoxError, jobs.JobError, AuditError,
-             EnrollmentFailed, GuestError)
+             EnrollmentFailed, GuestError)  # ValueError holds accounts.NoReadOnlyAccount and ssh.NotChosen
 _FAILURES = (asyncssh.Error, OSError)
 
 
@@ -181,10 +182,13 @@ def redact_params(params: dict | None) -> dict:
 
 def require_proxmox_host(token: Token, host: str | None) -> None:
     """Refuse a token whose allowlist does not name the Proxmox host, or any
-    token at all when the inventory marks no entry `hypervisor: proxmox`."""
+    token at all when the inventory marks no entry `hypervisor: proxmox`; and
+    one read-only there, for the API and every VM by its id (ADR-0031 2a)."""
     if host is None:
         raise ProxmoxError(NO_PROXMOX_HOST)
     require_host_allowed(token, host)
+    if host in token.readonly:
+        raise AuthError(accounts.read_only_vms(host))
 
 
 def _authorized_proxmox(
@@ -228,15 +232,18 @@ def connect_host(settings: Settings, host: Host):
     """nervus's one way to open SSH to a host: its own key, the pinned host keys,
     from the known_hosts file or, for a machine enrolled from the UI, its own
     (ADR-0024); with a certificate naming the call when nervus has its CA
-    (ADR-0025)."""
+    (ADR-0025); as the account chosen for the call (ADR-0031, nervus.accounts),
+    or, for nervus's own work that chose none, the machine's read-write one."""
+    route = certs.route()
     return ssh.connect(
         address=host.address,
         port=settings.ssh_port,
-        username=host.agent_user,
+        username=route.username if route is not None else host.agent_user,
         client_keys=[settings.ssh_key_path],
         known_hosts=(pinned_known_hosts(host.address, settings.ssh_port, host.host_keys) if host.host_keys
                      else settings.known_hosts_path),
         authority=settings.ssh_ca,
+        machine=host.name,
     )
 
 
@@ -281,6 +288,7 @@ def build_server(
     vms: VMTargets | None = None,
     enrolled: EnrolledHostStore | None = None,
     enrollment: HostEnrollment | None = None,
+    machine_accounts: accounts.MachineAccounts | None = None,
 ) -> MCPServer:
     """Build the nervus MCP server: tool surface, audit, and the one
     authorization check this layer performs beyond token validity --
@@ -296,7 +304,7 @@ def build_server(
     def hosts_now() -> dict[str, Host]:
         """hosts.yaml's machines and those enrolled from the UI, read at every
         call, so enrolling needs no restart (ADR-0024 decision 3)."""
-        return merged(settings.hosts, enrolled)
+        return merged(settings.hosts, enrolled, machine_accounts)
 
     mcp_server: MCPServer = MCPServer(
         name="nervus",
@@ -314,15 +322,27 @@ def build_server(
     async def _connect(host: Host) -> asyncssh.SSHClientConnection:
         return await connect_host(settings, host)
 
-    def _target(tool_name: str, token: Token, host: str | None, vmid: int | None) -> tuple[Host | None, dict]:
+    def _choose(tool_name: str, token: Token, record: Host) -> certs.Route:
+        """The account this call logs in to on `record` (ADR-0031), or a refusal
+        with its record: a read-only call to a machine with no read-only account."""
+        try:
+            return accounts.choose(token, record)
+        except accounts.NoReadOnlyAccount as exc:
+            audit.record_refusal(tool_name, {**attribution(token), "host": record.name, "level": "read-only",
+                                             "reason": str(exc)})
+            raise
+
+    def _target(tool_name: str, token: Token, host: str | None,
+                vmid: int | None) -> tuple[Host | None, dict, certs.Route]:
         """Authorize a host, or a VM by id (ADR-0022 4a), recording a refusal
         as _authorized_host does. A VM may be named by any token whose
         allowlist holds the hypervisor's entry, and no other (6a): those are
         root in it through the guest agent already. Returns the host's
-        record, or None for a VM, and the fields naming it in the audit log."""
+        record, or None for a VM, the fields naming it in the audit log, and
+        the account the call logs in to, chosen once, here (ADR-0031)."""
         if host is not None and vmid is None:
-            return _authorized_host(audit=audit, tool=tool_name, token=token, host=host, hosts=hosts_now()), \
-                {"host": host}
+            record = _authorized_host(audit=audit, tool=tool_name, token=token, host=host, hosts=hosts_now())
+            return record, {"host": host}, _choose(tool_name, token, record)
         try:
             if host is not None:
                 raise ValueError("give a host or a vmid, not both")
@@ -335,7 +355,7 @@ def build_server(
         except (AuthError, ProxmoxError, ValueError) as exc:
             audit.record_refusal(tool_name, {**attribution(token), "host": host, "vmid": vmid, "reason": str(exc)})
             raise
-        return None, {"vmid": vmid}
+        return None, {"vmid": vmid}, accounts.vm_route(vmid)
 
     def _no_nul(tool_name: str, token: Token, named: dict, **given: str) -> None:
         """Refuse, with a record, a string bound for a machine that holds a NUL byte (procedure 056). bash
@@ -350,16 +370,18 @@ def build_server(
                 audit.record_refusal(tool_name, {**attribution(token), **named, **given, "reason": reason})
                 raise ValueError(reason)
 
-    def _user(host_record: Host | None) -> str:
-        return AGENT_USER if host_record is None else host_record.agent_user
+    def _as(route: certs.Route) -> dict:
+        """What every intent record of a call says of its account (ADR-0031)."""
+        return {"user": route.username, "level": route.level}
 
-    async def _open(host_record: Host | None, vmid: int | None, token: Token,
-                    run_id: str) -> tuple[asyncssh.SSHClientConnection, str | None]:
+    async def _open(host_record: Host | None, vmid: int | None, token: Token, run_id: str,
+                    route: certs.Route) -> tuple[asyncssh.SSHClientConnection, str | None]:
         """SSH to the target, for the call `run_id` (ADR-0025: the certificate
-        names it, and the result record the port). For a VM, enrolled or
-        repaired first if it needs it; the note says what changed, for the
-        answer and the log."""
+        names it, and the result record the port), as the account `route`
+        names (ADR-0031). For a VM, enrolled or repaired first if it needs it;
+        the note says what changed, for the answer and the log."""
         certs.acting_for(token.id, run_id)
+        certs.take(route)
         if host_record is not None:
             return await _connect(host_record), None
         assert vms is not None and vmid is not None
@@ -403,15 +425,17 @@ def build_server(
                 "address": h.address,
                 "role": h.role,
                 "status": h.status,
-                # read-only, standard or full, for a machine enrolled from the UI (ADR-0024)
-                **({"level": h.level} if h.level else {}),
+                # The level this client has there (ADR-0031): read-only where it or the machine is,
+                # otherwise the machine's own, read-write for one described by hand.
+                "level": accounts.level(token, h),
             }
             for h in hosts_now().values()
             if h.name in token.hosts
         ]
         answer: dict = {"hosts": visible}
         recorded: dict = {"count": len(visible), "hosts": sorted(h["name"] for h in visible)}
-        if vms is not None and proxmox_host is not None and proxmox_host in token.hosts:
+        if vms is not None and proxmox_host is not None and proxmox_host in token.hosts \
+                and proxmox_host not in token.readonly:
             try:
                 answer["vms"] = await vms.listing()
                 recorded["vms"] = [vm["vmid"] for vm in answer["vms"]]
@@ -443,7 +467,7 @@ def build_server(
         account has sudo: `sudo -n systemctl reboot` works, a bare `reboot`
         is refused by polkit."""
         token = require_token(ctx.headers, tokens)
-        host_record, named = _target("exec", token, host, vmid)
+        host_record, named, route = _target("exec", token, host, vmid)
         _no_nul("exec", token, named, command=command, cwd=cwd)
 
         run_id = audit.record_intent(
@@ -451,7 +475,7 @@ def build_server(
             {
                 **attribution(token),
                 **named,
-                "user": _user(host_record),
+                **_as(route),
                 "cwd": cwd,
                 "command": command,
             },
@@ -459,7 +483,7 @@ def build_server(
 
         start = time.monotonic()
         with _failure_recorded(run_id, "exec"):
-            conn, note = await _open(host_record, vmid, token, run_id)
+            conn, note = await _open(host_record, vmid, token, run_id, route)
             try:
                 result = await ssh.exec_command(
                     conn, cwd=cwd, command=command, timeout=timeout, run_id=run_id, label=certs.label()
@@ -504,7 +528,7 @@ def build_server(
         Runs as the host's agent account, not as root; privileged commands
         need `sudo -n`, as with exec."""
         token = require_token(ctx.headers, tokens)
-        host_record, named = _target("exec_bg", token, host, vmid)
+        host_record, named, route = _target("exec_bg", token, host, vmid)
         _no_nul("exec_bg", token, named, command=command, cwd=cwd)
 
         run_id = audit.record_intent(
@@ -512,14 +536,14 @@ def build_server(
             {
                 **attribution(token),
                 **named,
-                "user": _user(host_record),
+                **_as(route),
                 "cwd": cwd,
                 "command": command,
             },
         )
 
         with _failure_recorded(run_id, "exec_bg"):
-            conn, note = await _open(host_record, vmid, token, run_id)
+            conn, note = await _open(host_record, vmid, token, run_id, route)
             try:
                 handle = await jobs.start_job(conn, cwd=cwd, command=command, job_id=run_id, label=certs.label())
             finally:
@@ -553,20 +577,21 @@ def build_server(
         """Check status, read logs, or kill a job started by exec_bg, on the
         host or in the VM (`vmid`) it was started on."""
         token = require_token(ctx.headers, tokens)
-        host_record, named = _target("job", token, host, vmid)
+        host_record, named, route = _target("job", token, host, vmid)
 
         run_id = audit.record_intent(
             "job",
             {
                 **attribution(token),
                 **named,
+                **_as(route),
                 "job_id": job_id,
                 "action": action,
             },
         )
 
         with _failure_recorded(run_id, "job"):
-            conn, note = await _open(host_record, vmid, token, run_id)
+            conn, note = await _open(host_record, vmid, token, run_id, route)
             try:
                 if action == "status":
                     status = await jobs.job_status(conn, job_id)
@@ -604,7 +629,12 @@ def build_server(
         command is in nervus's client instructions, "Send a file from your
         machine"."""
         token = require_token(ctx.headers, tokens)
-        host_record, named = _target("put", token, host, vmid)
+        host_record, named, route = _target("put", token, host, vmid)
+        if route.readonly:
+            reason = accounts.read_only_put(route.host)
+            audit.record_refusal("put", {**attribution(token), **named, "level": route.level,
+                                         "local_path": local_path, "remote_path": remote_path, "reason": reason})
+            raise AuthError(reason)
         _no_nul("put", token, named, local_path=local_path, remote_path=remote_path)
         resolved = _transfer_path(
             audit=audit,
@@ -620,12 +650,13 @@ def build_server(
             {
                 **attribution(token),
                 **named,
+                **_as(route),
                 "local_path": local_path,
                 "remote_path": remote_path,
             },
         )
         with _failure_recorded(run_id, "put"):
-            conn, note = await _open(host_record, vmid, token, run_id)
+            conn, note = await _open(host_record, vmid, token, run_id, route)
             try:
                 await sftp.put_file(conn, resolved, remote_path, transfer_dir=settings.transfer_dir)
             finally:
@@ -639,7 +670,7 @@ def build_server(
         """Copy a file from a host, or a VM given as `vmid`, to nervus's own
         filesystem over SFTP."""
         token = require_token(ctx.headers, tokens)
-        host_record, named = _target("get", token, host, vmid)
+        host_record, named, route = _target("get", token, host, vmid)
         _no_nul("get", token, named, remote_path=remote_path, local_path=local_path)
         resolved = _transfer_path(
             audit=audit,
@@ -655,12 +686,13 @@ def build_server(
             {
                 **attribution(token),
                 **named,
+                **_as(route),
                 "remote_path": remote_path,
                 "local_path": local_path,
             },
         )
         with _failure_recorded(run_id, "get"):
-            conn, note = await _open(host_record, vmid, token, run_id)
+            conn, note = await _open(host_record, vmid, token, run_id, route)
             try:
                 await sftp.get_file(conn, remote_path, resolved, transfer_dir=settings.transfer_dir)
             finally:
@@ -822,11 +854,9 @@ def build_server(
                 raise ToolError(reason)
 
             if host is not None and vmid is None and path is None and remote_path:
-                request = HostRequest(
-                    _authorized_host(audit=audit, tool="export", token=token, host=host,
-                                     hosts=hosts_now()),
-                    remote_path,
-                )
+                record = _authorized_host(audit=audit, tool="export", token=token, host=host, hosts=hosts_now())
+                route = _choose("export", token, record)
+                request = HostRequest(record, remote_path)
             elif vmid is not None and path and host is None and remote_path is None:
                 try:
                     require_proxmox_host(token, proxmox_host)
@@ -836,6 +866,7 @@ def build_server(
                     refuse("VM exports need nervus's Proxmox settings, which this nervus does not have",
                            vmid=vmid, path=path)
                 request = VMRequest(vmid, path)
+                route = accounts.vm_route(vmid)
             else:
                 refuse("give either host and remote_path, or vmid and path",
                        host=host, remote_path=remote_path, vmid=vmid, path=path)
@@ -845,9 +876,10 @@ def build_server(
                 refuse(exc.message, source=request.describe())
 
             run_id = audit.record_intent("export", {**attribution(token), "request_key": request_key,
-                                                    "source": request.describe()})
-            # The copy runs as a task of its own and carries this call (ADR-0025).
+                                                    "source": request.describe(), **_as(route)})
+            # The copy runs as a task of its own and carries this call (ADR-0025), and its account (ADR-0031).
             certs.acting_for(token.id, run_id)
+            certs.take(route)
             status = await exports.export(token.id, request_key, request, run_id, wait)
             if not status.created:
                 audit.record_result(run_id, "export", export_fields(status.export) if status.export

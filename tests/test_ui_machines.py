@@ -18,7 +18,7 @@ from nervus.auth import Token, Tokens
 from nervus.database import Database
 from nervus.enrolled_hosts import EnrolledHostStore
 from nervus.enrollment_codes import EnrollmentCodes
-from nervus.host_enrollment import REMOVE_COMMANDS
+from nervus.host_enrollment import remove_commands
 from nervus.pages import PLAIN_HTTP
 from nervus.ui import Machines, Management, build_ui
 
@@ -228,7 +228,8 @@ def test_a_removed_machine_is_forgotten_and_the_page_says_how_to_take_nervus_off
     world.db.issue_token("laptop", "claude-code", "p", ["nas", "node-a"], taken=world.tokens.file_ids())
     page = world.act(action="remove", name="nas", confirm="nas")
     assert page.status_code == 200 and world.store.get("nas") is None
-    assert "nas is forgotten" in page.text and _lines(page.text) == REMOVE_COMMANDS
+    # Added before this release as far as this page knows: `agent` is kept, nervus's line off it (ADR-0031 question 9).
+    assert "nas is forgotten" in page.text and _lines(page.text) == remove_commands("agent", None)
     assert "These tokens still name nas: codex-anywhere, laptop." in page.text
     record, = world.records("remove_machine")
     assert (record["target"], record["level"], record["machine_id"]) == ("nas", "full", MACHINE)

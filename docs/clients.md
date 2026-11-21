@@ -236,10 +236,20 @@ it says so there too: pull this repository on each client machine, and run what 
 
 ## What each machine lets you do (ADR-0024)
 
-`hosts` lists the machines your token may reach. One added on nervus's Machines page shows its
-`level`, which the machine's owner chose and the machine itself enforces; nervus cannot raise it.
-A machine described by hand in nervus's inventory shows no `level`: it is as nervus's operator set
-it up, usually full.
+`hosts` lists the machines your token may reach, each with the `level` you have there. One added
+on nervus's Machines page has the level its owner chose, which the machine itself enforces; nervus
+cannot raise it. A machine described by hand in nervus's inventory shows `read-write`: it is as
+nervus's operator set it up, usually full.
+
+**Your token may be read-only on a machine whose own level is higher** (ADR-0031). A machine that
+clients may change has two accounts of nervus's, one read-write and one read-only, and the
+operator chose one of them for your token on each machine when they issued it; you have no say,
+and nervus chooses the account. There `hosts` says `read-only`, and you have what a read-only
+machine gives, below, through the read-only account, which is not the read-write one: it cannot
+see the read-write account's files, jobs or saved output, nor use its groups, such as `docker`.
+Where you are read-only on the Proxmox host, `hosts` lists no VMs, and the `proxmox` tool and a VM
+by its `vmid` are refused, saying why. Where the machine has no read-only account yet, every call
+is refused, nothing runs, and the answer says how its owner adds one.
 
 | level | `exec`, `exec_bg`, `job` | `get`, `export` | `put`, uploads | `sudo` |
 |---|---|---|---|---|
@@ -247,9 +257,10 @@ it up, usually full.
 | standard | yes, changing only what `agent` owns | yes | into `agent`'s own folders | no |
 | full | yes | yes | anywhere, `root=1` through `sudo` | yes, `sudo -n` |
 
-**On a read-only machine:**
-- **A write is refused by the machine**: a command's write fails with "Read-only file system", and
-  `put` and uploads are refused; an upload says `not_writable` and names the machine's level.
+**On a read-only machine, or one you are read-only on:**
+- **A write is refused by the machine**: a command's write fails with "Read-only file system". `put`
+  and uploads are refused by nervus before anything is sent, saying you are read-only there; an
+  upload answers `403` with the code `read_only`.
   That is the machine doing its job, not a fault in nervus; don't try to work around it. There is
   no `sudo` here, nor at standard, so `root=1` cannot help.
 - **`~/.nervus` is the one folder a command can write**, and it lasts between calls. Use it for scratch

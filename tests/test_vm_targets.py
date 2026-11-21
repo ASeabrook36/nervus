@@ -14,7 +14,7 @@ import json
 import asyncssh
 import pytest
 
-from nervus import certs, jobs, sftp, ssh
+from nervus import accounts, certs, jobs, sftp, ssh
 from nervus.audit import AuditLog
 from nervus.auth import Token
 from nervus.config import Host, Settings
@@ -121,21 +121,24 @@ async def test_what_a_connection_changed_is_noted_on_the_call_it_was_made_for(wo
     """The note also goes with the call (certs.note), so a call whose own answer has no place for it, or
     that fails after the VM was enrolled, still has it for its audit result (ADR-0001 section 10)."""
     first = certs.acting_for("t", "0b9f4c2e-5d1a-4e8b-9c3f-7a6d2e1b0c94")
+    certs.take(accounts.vm_route(123))
     note = await world.visit()
     assert note == f"VM 123 enrolled, at {VM_ADDRESS}" and first.notes == [note]
     later = certs.acting_for("t", "7d1c9a53-2f4e-4b6a-8e0d-3c5b7a9f1e24")
+    certs.take(accounts.vm_route(123))
     assert await world.visit() is None and later.notes == [] and first.notes == [note]
 
 
 async def test_an_enrollment_is_noted_even_if_the_connection_after_it_fails(world):
     """The VM is changed and its row kept before nervus connects for the call itself."""
     caller = certs.acting_for("t", "0b9f4c2e-5d1a-4e8b-9c3f-7a6d2e1b0c94")
+    certs.take(accounts.vm_route(123))
     connect, calls = world.targets.enroller.connect, []
 
-    async def dropped_after_the_check(address, keys):
+    async def dropped_after_the_check(address, keys, machine=None):
         calls.append(address)
         if len(calls) == 1:
-            return await connect(address, keys)  # the enrollment's own check
+            return await connect(address, keys, machine=machine)  # the enrollment's own check
         raise asyncssh.ConnectionLost("the VM went away")
 
     world.targets.enroller.connect = dropped_after_the_check

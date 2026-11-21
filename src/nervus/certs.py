@@ -10,8 +10,10 @@ So nervus signs one for every connection it makes on a client's call, naming
 the token and the run the audit log has just recorded (decision 1). A command
 cannot forge that line; only whoever holds the CA key can.
 
-The certificate carries no forced command and no permissions (decision 1):
-what a machine allows stays in its own `authorized_keys` line. nervus only
+The certificate carries no permissions (decision 1): what a machine allows stays
+in its own `authorized_keys` line. Since ADR-0031 one for a read-only call also
+carries the read-only shell as its forced command, a second lock on the same
+door; one for any other call carries none. nervus only
 ever runs a command or SFTP, neither of which needs a terminal, forwarding or
 `~/.ssh/rc`. It is valid from five minutes before signing to five after
 (question 2a): OpenSSH checks the window only at login, so a long command is
@@ -64,6 +66,23 @@ def _word(value: str) -> str:
     return urllib.parse.quote(value, safe=_SAFE)
 
 
+# ADR-0031: the read-only shell, the forced command of every read-only account's
+# line, and of every certificate nervus signs for a read-only call.
+READONLY_SHELL = "/usr/local/lib/nervus/readonly-shell"
+
+
+@dataclass(frozen=True)
+class Route:
+    """The account a call's connections log in to (ADR-0031): on machine `host`,
+    as `username`, read-only or not, at `level`, which `hosts` and every audit
+    record of the call give. Chosen by nervus.accounts and nowhere else."""
+
+    host: str
+    username: str
+    readonly: bool
+    level: str
+
+
 @dataclass
 class Caller:
     """The call a connection is made for: the token and the run that the audit
@@ -80,6 +99,9 @@ class Caller:
     run_id: str
     ports: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # ADR-0031: the account this call's connections log in to, as nervus.accounts
+    # chose it (take). nervus.ssh.connect refuses a client's call without one.
+    route: Route | None = None
 
     def key_id(self) -> str:
         """`token=<id> run=<run>`, the words decision 2's label line uses too;
@@ -102,6 +124,22 @@ def acting_for(token_id: str | None, run_id: str) -> Caller:
 
 def current() -> Caller | None:
     return _caller.get()
+
+
+def take(route: Route) -> Route:
+    """Put the account nervus.accounts chose on the current call, for every
+    connection it and the work it starts make (ADR-0031). Only a call has one."""
+    caller = current()
+    if caller is None:
+        raise RuntimeError("an account is chosen for a call; there is none here")
+    caller.route = route
+    return route
+
+
+def route() -> Route | None:
+    """The account chosen for the current call, or None."""
+    caller = current()
+    return caller.route if caller is not None else None
 
 
 def label() -> str | None:
@@ -153,9 +191,13 @@ class CertificateAuthority:
         return " ".join(self._key.export_public_key("openssh").decode().split()[:2]) + " nervus-ca"
 
     def sign(self, key: asyncssh.SSHKey, username: str, caller: Caller,
-             now: float | None = None) -> asyncssh.SSHCertificate:
+             now: float | None = None, force_command: str | None = None) -> asyncssh.SSHCertificate:
         """A certificate for `key`, naming `username` and `caller`, valid from
-        WINDOW_SECONDS before `now` to WINDOW_SECONDS after."""
+        WINDOW_SECONDS before `now` to WINDOW_SECONDS after. For a read-only
+        call it carries the read-only shell as its forced command (ADR-0031
+        question 1a): a machine whose line has the same admits it, one whose
+        line has none runs the shell all the same, and one whose line has
+        another admits it to nothing."""
         signed = int(time.time() if now is None else now)
         return self._key.generate_user_certificate(
             key, caller.key_id(),
@@ -163,7 +205,7 @@ class CertificateAuthority:
             serial=secrets.randbits(63),
             valid_after=signed - WINDOW_SECONDS,
             valid_before=signed + WINDOW_SECONDS,
-            force_command=None,
+            force_command=force_command,
             source_address=None,
             permit_x11_forwarding=False,
             permit_agent_forwarding=False,

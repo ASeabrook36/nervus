@@ -33,9 +33,10 @@ from nervus.audit import AuditLog
 from nervus.database import Database
 from nervus.enrolled_hosts import EnrolledHostStore
 from nervus import certs
+from nervus.certs import CertificateAuthority
 from nervus.enroller import ssh_connector
 from nervus.enrollment_codes import EnrollmentCodes
-from nervus.host_enrollment import (HTTPS_ONLY, NOT_ITS_OWN, UNKNOWN, HostEnrollment, check_failed,
+from nervus.host_enrollment import (CHECK_READONLY, HTTPS_ONLY, NOT_ITS_OWN, UNKNOWN, HostEnrollment, check_failed,
                                     enroll_endpoint)
 from nervus.tls import generate_self_signed, key_fingerprint, key_pin
 
@@ -55,14 +56,26 @@ class World:
         self.host_key = open(ssh_server.known_hosts_path).read().split(" ", 1)[1].strip()
         self.pin, self.locked, self.reserved, self.own = PIN, False, {"in-hosts-yaml"}, OWN
         self.connects = []
-        real = ssh_connector(Path(ssh_server.client_key_path), ssh_server.port)
+        real = ssh_connector(Path(ssh_server.client_key_path), ssh_server.port,
+                             authority=CertificateAuthority(ssh_server.ca_path))
 
         self.callers = []
 
-        def connect(address, keys):
+        def connect(address, keys, machine=None):
             self.connects.append((address, keys))
             self.callers.append(certs.current())  # who the certificate would name (ADR-0025)
-            return real(address, keys)
+            # ADR-0031: the machine answers as the account nervus logs in to. The level is played by the account
+            # it is about, the read-only one at read-only, the read-write one otherwise; at standard and full the
+            # read-only account is read-only, unless a test plays it otherwise.
+            route = certs.route()
+            user = route.username if route is not None else "agent"
+            self.logins.append(user)
+            about = (route is None or not route.readonly or self.level == "read-only")
+            sudo, writes = (self.sudo, self.writes) if about else (self.ro_sudo, self.ro_writes)
+            (self.bin / ".user").write_text(user + "\n")
+            (self.bin / ".sudo").write_text("yes" if sudo else "")
+            self.home.chmod(0o700 if writes else 0o500)
+            return real(address, keys, machine=machine)
 
         self.enrollment = HostEnrollment(
             self.codes, self.store, self.audit, key=lambda: NERVUS_KEY, connect=connect, pin=lambda: self.pin,
@@ -71,18 +84,30 @@ class World:
         self.bin, self.home = tmp_path / "machine-bin", tmp_path / "home-agent"
         self.bin.mkdir()
         self.home.mkdir()
-        (self.bin / "id").write_text('#!/bin/sh\n[ "$*" = -un ] && echo agent\n')
+        self.logins, self.ro_sudo, self.ro_writes, self.groups = [], False, False, ""
+        (self.bin / "id").write_text('#!/bin/sh\n[ "$*" = -un ] && cat "$(dirname "$0")/.user"\n'
+                                     '[ "$1" = -Gn ] && echo "$2 $(cat "$(dirname "$0")/.groups" 2>/dev/null)"\n'
+                                     'exit 0\n')
+        (self.bin / ".user").write_text("agent")
+        # The read-only account's forced command (ADR-0031): the test server runs a certificate's forced
+        # command in place of what was asked, keeping no copy, so its stand-in runs the one command nervus
+        # sends that account here, the check. The real shell, forced by a real sshd, is the trials'.
+        shell = tmp_path / "readonly-shell"
+        shell.write_text("#!/bin/sh\n" + CHECK_READONLY + "\n")
+        shell.chmod(0o755)
+        monkeypatch.setattr(certs, "READONLY_SHELL", str(shell))
         monkeypatch.setenv("PATH", f"{self.bin}:/usr/bin:/bin")
         monkeypatch.setenv("HOME", str(self.home))
         self.play("standard")
 
     def play(self, level, *, sudo=None, writes=None):
-        sudo = (level == "full") if sudo is None else sudo
-        writes = (level != "read-only") if writes is None else writes
-        (self.bin / "sudo").write_text("#!/bin/sh\necho root\n" if sudo else "#!/bin/sh\nexit 1\n")
+        self.level = level
+        self.sudo = (level == "full") if sudo is None else sudo
+        self.writes = (level != "read-only") if writes is None else writes
+        (self.bin / "sudo").write_text('#!/bin/sh\n[ -s "$(dirname "$0")/.sudo" ] && echo root || exit 1\n')
         for name in ("id", "sudo"):
             (self.bin / name).chmod(0o755)
-        self.home.chmod(0o700 if writes else 0o500)
+        self.home.chmod(0o700 if self.writes else 0o500)
 
     def make(self, level="standard", name="web", address="127.0.0.1"):
         value, code = self.codes.make(name=name, address=address, level=level, made_by="operator")
@@ -116,8 +141,8 @@ class World:
 
 
 @pytest.fixture
-def world(tmp_path, ssh_server, monkeypatch):
-    world = World(tmp_path, ssh_server, monkeypatch)
+def world(tmp_path, ca_ssh_server, monkeypatch):
+    world = World(tmp_path, ca_ssh_server, monkeypatch)
     yield world
     world.home.chmod(0o700)
 
@@ -176,13 +201,16 @@ async def test_a_report_is_checked_over_ssh_with_its_keys_pinned_then_enrolled(w
     value, code = world.make("standard")
     answer = await world.post(value)
     assert answer.status_code == 200, answer.text
-    assert answer.text == ("nervus: web is enrolled, standard. In nervus's page, give a token this machine "
+    assert answer.text == ("nervus: web is enrolled, standard. Its read-only account is nervusagent-readonly; "
+                           "its read-write account is nervusagent. In nervus's page, give a token this machine "
                            "to let a client use it.\n")
     row = world.store.get("web")
     assert (row.address, row.level, row.machine_id, row.enrolled_by) == ("127.0.0.1", "standard", MACHINE,
                                                                          "operator")
     assert row.host_keys == (" ".join(world.host_key.split()[:2]),)
-    assert world.connects == [("127.0.0.1", row.host_keys)]
+    # ADR-0031: each account logged in to, the keys pinned each time; the read-write one first.
+    assert world.connects == [("127.0.0.1", row.host_keys)] * 2
+    assert world.logins == ["nervusagent", "nervusagent-readonly"]
     assert world.codes.get(code.id).outcome == "enrolled web, standard"
     result = world.records[-1]
     assert result["enrolled"] is True and result["machine_id"] == MACHINE and result["host_keys"] == list(row.host_keys)
@@ -334,7 +362,7 @@ async def test_a_code_made_with_a_login_enrolls_when_its_key_is_among_those_repo
     answer = await world.post(value)
     assert answer.status_code == 200, answer.text
     assert world.store.get("web").host_keys == (" ".join(world.host_key.split()[:2]),)
-    assert len(world.connects) == 1 and world.codes.get(code.id).outcome == "enrolled web, standard"
+    assert len(world.connects) == 2 and world.codes.get(code.id).outcome == "enrolled web, standard"
 
 
 async def test_one_of_several_reported_keys_is_enough(world):
@@ -518,8 +546,9 @@ async def test_the_check_after_a_report_signs_as_the_operator_under_its_record(w
     value, _ = world.make("standard")
     assert (await world.post(value)).status_code == 200
     report = next(r for r in world.records if r.get("action") == "report" and r["phase"] == "intent")
-    [caller] = world.callers
+    caller, again = world.callers  # the read-write account's check, then the read-only one's: one call
+    assert caller is again
     assert (caller.token_id, caller.run_id) == (None, report["id"])
     assert caller.key_id() == f"operator run={report['id']}"
     result = world.records[-1]
-    assert result["id"] == report["id"] and result["ssh_ports"] == caller.ports and len(caller.ports) == 1
+    assert result["id"] == report["id"] and result["ssh_ports"] == caller.ports and len(caller.ports) == 2

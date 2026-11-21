@@ -51,6 +51,16 @@ def ca(tmp_path) -> CertificateAuthority:
     return CertificateAuthority(_key_file(tmp_path / "ca"))
 
 
+def _chosen(username: str) -> None:
+    """ADR-0031: a client's call chooses its account before it connects
+    (nervus.accounts); these tests connect directly, so they choose here, as
+    the read-write account they log in to; and for nervus's own work, which may
+    connect unchosen, so that one chosen by work before it does not linger."""
+    caller = certs.current()
+    if caller is not None:
+        certs.take(certs.Route("testhost", username, False, "read-write"))
+
+
 @pytest.fixture(autouse=True)
 def _no_caller():
     """Each test starts outside any call, as nervus's own tasks do."""
@@ -169,8 +179,9 @@ async def ca_server(tmp_path, ca):
 
 
 async def _connect(server, authority):
+    _chosen("agent")
     return await ssh.connect(address="127.0.0.1", port=server.port, username="agent",
-                             client_keys=[server.key], known_hosts=server.known, authority=authority)
+                             client_keys=[server.key], known_hosts=server.known, authority=authority, machine="testhost")
 
 
 async def test_on_a_call_nervus_logs_in_by_certificate_and_notes_its_port(ca_server, ca):
@@ -215,8 +226,10 @@ async def test_without_its_ca_nervus_offers_its_plain_key_and_still_notes_the_po
     caller = certs.acting_for("t-good", RUN)
     with pytest.raises(asyncssh.PermissionDenied):
         await _connect(ca_server, None)
+    _chosen(ssh_server.username)
     conn = await ssh.connect(address=ssh_server.host, port=ssh_server.port, username=ssh_server.username,
-                             client_keys=[ssh_server.client_key_path], known_hosts=ssh_server.known_hosts_path)
+                             client_keys=[ssh_server.client_key_path], known_hosts=ssh_server.known_hosts_path,
+                             machine="testhost")
     conn.close()
     assert len(caller.ports) == 1
 
@@ -302,8 +315,9 @@ def _shell(server: Sshd) -> str:
 
 
 async def _login(server: Sshd, key: Path, authority, command: str = "echo hello") -> str:
+    _chosen(server.user)
     conn = await ssh.connect(address="127.0.0.1", port=server.port, username=server.user,
-                             client_keys=[key], known_hosts=server.known, authority=authority)
+                             client_keys=[key], known_hosts=server.known, authority=authority, machine="testhost")
     try:
         # On standard input, as nervus sends its script: the line's command decides what runs.
         return (await conn.run("bash -s", input=command, check=True, timeout=20)).stdout
@@ -350,10 +364,11 @@ async def test_a_read_only_line_keeps_its_forced_command_with_a_certificate(sshd
             return self.authority._key.generate_user_certificate(
                 k, caller.key_id(), principals=[user], force_command="echo other")
 
+    _chosen(server.user)
     with pytest.raises(asyncssh.PermissionDenied):
         await ssh.connect(address="127.0.0.1", port=server.port, username=server.user,
                           client_keys=[asyncssh.read_private_key(str(key))], known_hosts=server.known,
-                          authority=Forcing(ca))
+                          authority=Forcing(ca), machine="testhost")
     server.wait_for("forced command options do not match")
 
 

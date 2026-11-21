@@ -21,10 +21,11 @@ Every change is one transaction (database.py).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from nervus.config import ConfigError, Host
@@ -63,11 +64,23 @@ class EnrolledHost:
     enrolled_at: float
     enrolled_by: str
 
-    def as_host(self) -> Host:
-        """The machine as nervus's tools use a host: as `agent`, at its
-        address, pinned to its own keys."""
+    def as_host(self, accounts=None) -> Host:
+        """The machine as nervus's tools use a host: at its address, pinned to
+        its own keys, with the accounts its enrollment made (ADR-0031).
+
+        `accounts` is its `machine_account` row, believed only if it was made
+        for this enrollment. Without one, the machine was added before this
+        release, or added again since by a release before it: `agent`, which
+        at read-only is the read-only account."""
+        if accounts is not None and accounts.enrolled_at == self.enrolled_at:
+            readwrite, readonly = accounts.readwrite, accounts.readonly
+        elif self.level == "read-only":
+            readwrite, readonly = None, AGENT_USER
+        else:
+            readwrite, readonly = AGENT_USER, None
         return Host(name=self.name, address=self.address, os="", role=f"enrolled, {self.level}",
-                    agent_user=AGENT_USER, status="onboarded", host_keys=self.host_keys, level=self.level)
+                    agent_user=readwrite or readonly or AGENT_USER, status="onboarded", host_keys=self.host_keys,
+                    level=self.level, readonly_user=readonly)
 
 
 def _now(now: float | None) -> float:
@@ -127,10 +140,15 @@ class EnrolledHostStore:
 
     def add(self, name: str, *, address: str, level: str, host_keys: Iterable[str], machine_id: str,
             enrolled_by: str, reserved: Iterable[str] = (), now: float | None = None,
+            also: Callable[[object, EnrolledHost], None] | None = None,
             ) -> tuple[EnrolledHost, EnrolledHost | None]:
         """Keep machine `name`, replacing any row it had. `reserved` is the
         names hosts.yaml has, which are refused. Returns the new row and the
-        one it replaced, or None."""
+        one it replaced, or None.
+
+        `also(db, row)` writes, in the same transaction, what goes with the new
+        row: its accounts (ADR-0031). If it fails, the machine is not kept and
+        the row it had stays as it was (procedure 068, section 12)."""
         name, address, level = check(name, _address(address), level, reserved)
         try:
             keys = pinned_keys(host_keys)
@@ -142,7 +160,10 @@ class EnrolledHostStore:
             replaced = self._get(db, name)
             db.execute(f"INSERT OR REPLACE INTO enrolled_host ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (name, address, level, json.dumps(keys), machine_id, _now(now), enrolled_by))
-            return self._get(db, name), replaced
+            row = self._get(db, name)
+            if also is not None:
+                also(db, row)
+            return row, replaced
 
     def move(self, name: str, address: str) -> bool:
         """Machine `name` is now at `address`; its keys and level stay
@@ -157,12 +178,24 @@ class EnrolledHostStore:
             return bool(db.execute("DELETE FROM enrolled_host WHERE name = ?", (name,)).rowcount)
 
 
-def merged(file_hosts: dict[str, Host], store: EnrolledHostStore | None) -> dict[str, Host]:
+def merged(file_hosts: dict[str, Host], store: EnrolledHostStore | None, machine_accounts=None) -> dict[str, Host]:
     """hosts.yaml's machines, then the enrolled ones, read now. A hand-written
     entry keeps its name if one was enrolled under it before hosts.yaml
-    gained it: the operator's file is the last word."""
-    hosts = dict(file_hosts)
+    gained it: the operator's file is the last word.
+
+    Each with its accounts (ADR-0031), from `machine_accounts`
+    (nervus.accounts.MachineAccounts): a hand-written entry, the account it
+    names and the read-only account its owner added; an enrolled one, what its
+    enrollment made."""
+    rows = {a.name: a for a in machine_accounts.all()} if machine_accounts is not None else {}
+    hosts = {}
+    for name, host in file_hosts.items():
+        row = rows.get(name)
+        if row is not None and row.enrolled_at is None and row.readonly is not None:
+            host = dataclasses.replace(host, readonly_user=row.readonly)
+        hosts[name] = host
     if store is not None:
         for row in store.all():
-            hosts.setdefault(row.name, row.as_host())
+            if row.name not in hosts:
+                hosts[row.name] = row.as_host(rows.get(row.name))
     return hosts

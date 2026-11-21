@@ -7,6 +7,55 @@ exported; until then it says "Not yet exported.", and what is still being built.
 heads: what you will see, what each client must do, and what the upgrade does on nervus's
 machine. An ADR named beside a change is the decision record behind it, in `decisions/`.
 
+## 0.3.0
+
+Exported 2026-11-20.
+
+**What you will see:**
+
+- **A client can be read-only on a machine other clients change** (ADR-0031). A machine added at
+  standard or full now gets two accounts of nervus's: the read-write one, `nervusagent`, at the
+  level you chose, and a read-only one, `nervusagent-readonly`, which the machine's kernel keeps
+  read-only, as a read-only machine's account is. At read-only, the read-only account alone. The
+  Machines page fills in both names and lets you give others, asking first, since an account that
+  is there already keeps nothing of its own SSH keys. Where the read-only account's sandbox cannot
+  start, a machine at standard or full is added read-write alone, saying why.
+- **Issuing a token asks, for each machine with both accounts, whether the token is on it, and if
+  so read-only or read-write**, nothing chosen for you. nervus chooses the account from that; the
+  client has no say, and the machine refuses what the account may not do. A read-only client may
+  `exec`, `exec_bg`, `job`, `get` and `export`; `put` and uploads are refused there, and, where it is
+  read-only on the Proxmox host, the `proxmox` tool and a VM by its id. Each refusal is in the audit
+  log with its reason.
+- **`hosts` gives the level a client has on each machine**: `read-only`, the machine's own, or
+  `read-write` for a machine described by hand. The clients page shows where each token is
+  read-only, the Machines page each machine's accounts, and the audit page the level each call ran
+  at. The machine's own log names the account: `Accepted publickey for nervusagent-readonly`.
+- **A machine described by hand can be given a read-only account** from the Machines page, by two
+  lines run on it as root; nothing else there changes.
+- **An add that nervus refuses, or that stops part way, leaves the machine as it was** (ADR-0031
+  question 12): every account's SSH keys and sudo file, nervus's read-only shell and its copy of
+  bubblewrap are put back, and the accounts it made are deleted. So a failed attempt to change a
+  machine's level leaves nervus the access it had. The packages it installed stay.
+- **Removing a machine deletes only the accounts nervus made there** (questions 9 and 13), those of
+  names the machine had before included. An account that was there before nervus keeps itself, its
+  home and its own keys, and loses only nervus's line and sudo file; so does `agent` on a machine
+  added before this release.
+- **The names the page gives are never root or one of the machine's system accounts**: none below
+  `UID_MIN`, nor above `UID_MAX` up to 65535, `nobody` among them.
+- **`~/.nervus` is made its account's alone** wherever nervus uses it; before, `mkdir -p` left it as
+  the account's umask made it, `775` on some machines.
+- `nervus-ctl status` and `lock --kill-work` list and stop jobs under a machine's read-only account
+  too, as `<machine> (<account>)`.
+
+**What each client must do:** nothing. A token issued before keeps reaching what it reached, as
+before; a token read-only somewhere is a new token, issued in the web UI.
+
+**What the upgrade does:** `sudo ./install.sh --upgrade`, from this release's copy on nervus's
+machine, as `docs/install.md`, "Upgrading", says. Three tables are added to nervus's database, whose
+version stays 1, so going back still starts: a release before this one refuses a token read-only
+anywhere as unknown, rather than read it as read-write everywhere. Machines added before keep their
+one account, `agent`, until you add them again; a read-only assignment there is refused until then.
+
 ## 0.2.2
 
 Exported 2026-11-19.

@@ -39,7 +39,7 @@ from pathlib import Path
 
 import asyncssh
 
-from nervus import ssh
+from nervus import accounts, certs, ssh
 from nervus.certs import CertificateAuthority
 from nervus.enrollments import EnrolledVM, EnrollmentRefused, EnrollmentStore, host_keys, reachable
 from nervus.guest import Guest, GuestError
@@ -146,11 +146,14 @@ def ssh_connector(key_path: Path, port: int = 22, timeout: float = SSH_CONNECT_S
                   authority: CertificateAuthority | None = None) -> Connect:
     """The Connect nervus uses: its own key, the pinned keys, strict checking;
     with a certificate naming the call, on a client's call, when nervus has its
-    CA (ADR-0025)."""
-    def connect(address: str, keys: tuple[str, ...]):
-        return ssh.connect(address=address, port=port, username=AGENT_USER, client_keys=[key_path],
+    CA (ADR-0025); as the account chosen for the call (ADR-0031), which for a VM
+    is `agent`, or `agent` where nervus's own work chose none."""
+    def connect(address: str, keys: tuple[str, ...], machine: str | None = None):
+        route = certs.route()
+        return ssh.connect(address=address, port=port, username=route.username if route else AGENT_USER,
+                           client_keys=[key_path],
                            known_hosts=pinned_known_hosts(address, port, keys), connect_timeout=timeout,
-                           authority=authority)
+                           authority=authority, machine=machine)
     return connect
 
 
@@ -226,18 +229,18 @@ class Enroller:
             raise EnrollmentFailed("unreachable", f"{where}: its guest agent reports no address nervus can reach")
         tried = []
         for address in candidates:
-            why, presented = await self._check(address, keys, challenge, where)
+            why, presented = await self._check(address, keys, challenge, where, accounts.vm_name(guest.vmid))
             if why is None:
                 return address, presented
             tried.append(f"{address}: {why}")
         raise EnrollmentFailed("unreachable", f"{where}: no address answered as it should ({'; '.join(tried)})")
 
     async def _check(self, address: str, keys: tuple[str, ...], challenge: str | None,
-                     where: str) -> tuple[str | None, str]:
+                     where: str, machine: str | None = None) -> tuple[str | None, str]:
         """(None, the host key the server presented) if `address` is this VM: agent
         with root by sudo, and, given a challenge, holding it. Else (why not, "")."""
         try:
-            conn = await self.connect(address, keys)
+            conn = await self.connect(address, keys, machine=machine)
         except asyncssh.HostKeyNotVerifiable:
             return "another machine's host key", ""
         except asyncssh.PermissionDenied:

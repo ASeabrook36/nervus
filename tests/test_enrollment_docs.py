@@ -16,7 +16,8 @@ import asyncssh
 import pytest
 
 from nervus.enrolled_hosts import LEVELS
-from nervus.host_enrollment import READONLY_SHELL, REMOVE_COMMANDS, enroll_lines, enroll_url
+from nervus.accounts import READONLY, READWRITE
+from nervus.host_enrollment import READONLY_SHELL, enroll_lines, enroll_url, remove_commands
 from nervus.host_login import fingerprint
 from nervus.pages import NON_GOALS
 from test_first_run_docs import README
@@ -52,7 +53,8 @@ def test_the_two_lines_are_the_ones_the_page_shows():
 
 
 def test_the_removal_commands_are_the_ones_the_page_shows():
-    assert _block("remove") == REMOVE_COMMANDS
+    # ADR-0031: the commands for a machine with nervus's two accounts, by nervus's names.
+    assert _block("remove") == remove_commands(READWRITE, READONLY, made=(READWRITE, READONLY))
 
 
 def test_step_3_offers_the_three_levels_read_only_first_and_says_what_read_only_leaves():

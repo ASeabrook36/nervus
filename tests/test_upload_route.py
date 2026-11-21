@@ -5,6 +5,7 @@ SHA-256, delivery left to a deliverer (steps 3 and 4; a stand-in here), and an
 audit intent and result for every request."""
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -557,3 +558,35 @@ async def test_a_delivery_carries_the_sending_call_and_its_ports_reach_the_recor
     result = [r for r in _records(world) if r["phase"] == "result" and r["id"] == intent["id"]]
     assert seen == [("t-mine", intent["id"])]
     assert [r.get("ssh_ports") for r in result] == [[40001]]
+
+
+# --- ADR-0031 question 2a: no upload where the client is read-only ---------------------------
+
+LIMITED = "sekret-limited"
+
+
+@pytest.fixture
+def limited(world):
+    web = _host("web", level="full", readonly_user="nervusagent-readonly")
+    world.settings = dataclasses.replace(world.settings, hosts={**world.settings.hosts, "web": web})
+    world.tokens[LIMITED] = Token(id="t-limited", client="codex", project="a", hosts=frozenset({"web", "hv"}),
+                                  readonly=frozenset({"web", "hv"}))
+    world.app = build_server(settings=world.settings, tokens=world.tokens, audit=world.audit,
+                             uploader=world.uploader).streamable_http_app()
+    return world
+
+
+@pytest.mark.parametrize("where", [{}, {"host": None, "vmid": "123"}], ids=["host", "vm"])
+async def test_an_upload_where_the_client_is_read_only_is_refused_before_any_byte(limited, where):
+    response = await _put(limited, token=LIMITED, **where)
+    assert response.status_code == 403, response.text
+    assert response.json()["failure"]["code"] == "read_only"
+    assert limited.deliver.calls == [] and _staged(limited) == []
+    refused = [r for r in _records(limited) if r["phase"] == "refused"]
+    assert len(refused) == 1 and refused[0]["reason"].startswith("read_only: this token is read-only on")
+
+
+async def test_another_client_read_write_on_that_machine_still_uploads(limited):
+    response = await _put(limited, token=MINE)
+    assert response.status_code == 200, response.text
+    assert len(limited.deliver.calls) == 1
