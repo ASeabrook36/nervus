@@ -22,7 +22,7 @@ runs every day on its author's own machines. Expect rough edges, and please say 
 | `export` | save a file from a machine or a VM onto the client's own computer, checked by SHA-256 |
 | `proxmox` | the Proxmox API, if you have a Proxmox host: make, use and destroy VMs |
 
-**Nothing of nervus's runs on the machines it reaches.** It logs in over SSH, as accounts it makes
+**Nothing of nervus' runs on the machines it reaches.** It logs in over SSH, as accounts it makes
 there when a machine is added, with what the machine's level needs (`tmux` for background jobs,
 `bubblewrap` to keep a read-only account read-only, `sudo` at full). No program of its own stays
 running there. That is a choice, argued in ADR-0005: every connection also lands in the machine's
