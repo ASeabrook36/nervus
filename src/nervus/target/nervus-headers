@@ -1,0 +1,36 @@
+#!/bin/sh
+# nervus-headers -- the header that carries one nervus token, for a client to send when it
+# connects (ADR-0032 question 5). nervus's laptop line put this here.
+#
+#   nervus-headers <name>
+#
+# Claude Code's headersHelper and Codex's http_headers_helper run it when they connect to nervus,
+# and send what it prints as the request's headers: {"Authorization": "Bearer <token>"}, and
+# nothing else. The token is never written to a file, the error output or an environment variable.
+#
+# Where the token is kept is the only thing it knows of this computer: on a Mac, the login
+# keychain's item nervus-<name>, which trusts no application, so macOS asks before every read
+# (approve it when you have just started your client; never "Always Allow", which lets anything
+# read it silently); elsewhere, the file token-<name> beside this helper, which only you can read.
+set -u
+
+[ $# -eq 1 ] || { echo "usage: nervus-headers <name>" >&2; exit 2; }
+case $1 in ''|*[!A-Za-z0-9._-]*) echo "nervus-headers: $1 is not a token's name" >&2; exit 2 ;; esac
+
+if [ "$(uname -s)" = Darwin ]; then
+  # Absolute, so a folder earlier on PATH cannot stand in for it; another only for nervus's own tests.
+  token=$("${NERVUS_SECURITY_BIN:-/usr/bin/security}" find-generic-password -a nervus -s "nervus-$1" -w 2>/dev/null) || {
+    echo "nervus-headers: no keychain item nervus-$1, or reading it was refused" >&2; exit 1; }
+else
+  file=${0%/*}/token-$1
+  [ -f "$file" ] || { echo "nervus-headers: no token file $file" >&2; exit 1; }
+  IFS= read -r token < "$file" || [ -n "${token:-}" ] || { echo "nervus-headers: cannot read $file" >&2; exit 1; }
+fi
+
+# A token is URL-safe base64. Checked, so a wrong item is refused rather than sent, and the value
+# goes into JSON as it is.
+case $token in
+  *[!A-Za-z0-9_-]*|'') echo "nervus-headers: what is kept for $1 is not a nervus token" >&2; exit 1 ;;
+esac
+[ ${#token} -ge 32 ] || { echo "nervus-headers: what is kept for $1 is not a nervus token" >&2; exit 1; }
+printf '{"Authorization": "Bearer %s"}\n' "$token"

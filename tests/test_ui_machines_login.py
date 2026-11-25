@@ -143,7 +143,7 @@ def test_the_add_form_offers_connect_first_and_the_two_lines_as_advanced_with_re
     page = world.browser.get("/machines").text
     form = re.search(r'<form method="post" action="machines" class="enroll">(.*?)</form>', page, re.S).group(1)
     assert [(action, label) for action, label in _buttons(form)] == [
-        ("connect", "Connect"), ("add", "Advanced: two lines to run on the machine yourself")]
+        ("connect", "Connect"), ("add", "Advanced: a line to run on the machine yourself")]
     assert 'type="hidden" name="action"' not in form  # the button the browser presses says which
     assert 'value="read-only" checked' in page and "A name or address nervus can reach" in page
     assert "Connect shows the key the machine answers with" in " ".join(page.split())
@@ -580,7 +580,7 @@ def test_a_run_that_failed_says_so_and_offers_to_try_again_or_use_the_two_lines(
     page = world.browser.get(f"/enrolling?id={code.id}")
     assert "box was not enrolled" in page.text and "refused alice with that password." in page.text
     assert "http-equiv" not in page.text and "give a token this machine" not in page.text
-    assert '<a href="machines">Try again</a>' in page.text and "Advanced: two lines to run" in page.text
+    assert '<a href="machines">Try again</a>' in page.text and "Advanced: a line to run" in page.text
     assert _hidden(page.text, "action")[-1] == "add" and _hidden(page.text, "name")[-1] == "box"
 
 
@@ -644,7 +644,7 @@ def test_what_a_machine_printed_comes_out_as_text_on_the_page_of_a_run_that_goes
     assert shown.structure() == Parsed(benign).structure()
 
 
-# --- the two lines are still there --------------------------------------------------------
+# --- the line is still there ------------------------------------------------------------
 
 def test_advanced_still_makes_the_two_lines(world):
     page = world.act(action="add", name="nas", confirm="nas", address=ADDRESS, level="read-only")

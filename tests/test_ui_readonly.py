@@ -22,6 +22,7 @@ from nervus.config import Host
 from nervus.database import Database
 from nervus.enrolled_hosts import EnrolledHostStore
 from nervus.enrollment_codes import EnrollmentCodes
+from nervus.token_codes import TokenCodes
 from nervus.ui import Machines, Management, build_ui
 
 from test_ui_machines import BY_HAND, FILE_TOKENS, KEY, MACHINE, ORIGIN, PIN
@@ -44,7 +45,8 @@ class World:
         machines = Machines(self.codes, self.store, lambda: PIN, 8000, BY_HAND, "", accounts=self.accounts,
                             described=described, **more)
         self.browser = TestClient(build_ui(self.db, self.audit, secure=True,
-                                           management=Management(self.tokens, switches, BY_HAND),
+                                           management=Management(self.tokens, switches, BY_HAND,
+                                                                 codes=TokenCodes(self.db), pin=lambda: PIN),
                                            machines=machines), base_url=ORIGIN, follow_redirects=False)
         link, _ = self.db.make_link()
         assert self.browser.post("/signin", data={"link": link}, headers={"Origin": ORIGIN}).status_code == 303

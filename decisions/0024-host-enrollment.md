@@ -22,6 +22,10 @@ the same day:** verification item 9 observed on that machine, through a trial ne
 a profile of its own: the read-only shell gives `--disable-userns` to the system's bubblewrap too,
 wherever it knows the flag, at the operator's word ("I'm good with that fix"). **Built and tried the
 same night** (procedure 055).
+**Amended 2026-11-23** by ADR-0031, Accepted by the operator the same day: enrolling a machine at
+standard or full makes two accounts, the read-write one and a read-only one beside it, named on the form;
+a machine where the read-only account cannot start is added read-write alone, saying why; and a machine
+described by hand gains the read-only account by two lines from the Machines page.
 **Date:** 2026-10-19
 **Asked for by:** the operator, item 2 of the order before friends are invited ("enrollment
 (ADR-0011 decision 3), with read-only access (ADR-0005 decision 5) if the design allows"); the half

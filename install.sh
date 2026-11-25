@@ -2,8 +2,8 @@
 # install.sh -- install nervus on the machine it will run on (ADR-0023), or
 # upgrade it there (ADR-0029).
 #
-#   sudo ./install.sh --address <nervus's address> [--name <nervus's name>]... [--yes]
-#   sudo ./install.sh --restore <backup> --address <nervus's address> [--name <nervus's name>]... [--yes]
+#   sudo ./install.sh [--address <nervus's address> [--name <nervus's name>]... [--yes]]
+#   sudo ./install.sh --restore <backup> [--address <nervus's address> [--name <nervus's name>]... [--yes]]
 #   sudo ./install.sh --proxmox --address <nervus's address> [--yes]
 #   sudo ./install.sh --upgrade [--yes]
 #   sudo ./install.sh --back [--yes]
@@ -37,6 +37,12 @@
 # --address is the address your clients and VMs reach nervus at; it goes into
 # nervus's certificate, and VMs fetch uploads from it. --name adds a name to the
 # certificate too, if your network gives nervus one; sign-in links then use it.
+# Without --address, it asks for both before it shows its plan (ADR-0032
+# question 3): it lists this machine's own addresses and its hostname, numbered,
+# and you choose the ones your clients and machines will use, or type an address
+# or a name of your own. A restore asks for one, the name or address its sign-in
+# links use, since its certificate is the backup's. With --yes no one is there to
+# answer, so it needs --address.
 #
 # --upgrade, run from a newer tree (a clone brought up to date with git pull,
 # or a newer archive unpacked in a folder of its own), upgrades the nervus this
@@ -86,8 +92,8 @@ die() { complain "$*${STAYS:+ ($STAYS)}"; exit 1; }
 
 # --- arguments --------------------------------------------------------------------
 
-ADDRESS= YES= PROXMOX= RESTORE= UPGRADE= BACK=
-NAMES=()
+ADDRESS= YES= PROXMOX= RESTORE= UPGRADE= BACK= ASK=
+NAMES=() MORE_ADDRESSES=()
 while [ $# -gt 0 ]; do
   case $1 in
     --address) ADDRESS=${2:-}; shift 2 ;;
@@ -97,7 +103,7 @@ while [ $# -gt 0 ]; do
     --restore) RESTORE=${2:-}; shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
     --back) BACK=1; shift ;;
-    -h|--help) sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -115,20 +121,232 @@ if [ -n "$RESTORE" ]; then
   [ -f "$RESTORE" ] || die "--restore $RESTORE: no such file"
   RESTORE="$(cd "$(dirname "$RESTORE")" && pwd)/$(basename "$RESTORE")"
 fi
-if [ -z "$UPGRADE$BACK" ]; then
-  [ -n "$ADDRESS" ] || die "give --address, the address your clients and VMs reach nervus at (see --help)"
+if [ -z "$UPGRADE$BACK" ] && [ -z "$ADDRESS" ]; then
+  # --proxmox changes an installed nervus, and is told its address as before.
+  [ -z "$PROXMOX" ] || die "give --address, the address your clients and VMs reach nervus at (see --help)"
+  # An install or a restore asks, before its plan (ADR-0032 question 3a). With --yes no one is there
+  # to answer: refused now, before anything changes, Python included.
+  [ -z "$YES" ] \
+    || die "give --address, the address your clients and VMs reach nervus at: without it install.sh asks, and with --yes no one is there to answer (see --help)"
+  [ ${#NAMES[@]} -eq 0 ] || die "--name needs --address: give both, or neither and install.sh asks for them (see --help)"
+  ASK=1
 fi
-# check_address: --address is an IP address, as Python reads one. Called once Python is known to be
-# here: checked among the arguments, a machine without Python was told its address was not one.
-check_address() {
-  python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$ADDRESS" 2>/dev/null \
-    || die "--address $ADDRESS is not an IP address"
+# is_ip <text>: whether it is an IP address, as Python reads one.
+is_ip() {
+  python3 -I -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$1" 2>/dev/null
 }
+# check_address: --address is an IP address. Called once Python is known to be here: checked among
+# the arguments, a machine without Python was told its address was not one. Any IP address, as before:
+# 127.0.0.1 is how nervus is installed for this machine alone.
+check_address() {
+  is_ip "$ADDRESS" || die "--address $ADDRESS is not an IP address"
+}
+
+# kind_of <text>: "address" or "name", on standard output, if clients and machines could reach nervus
+# by it; if not, why not, and it fails. An address as own_addresses would list one: never loopback,
+# link-local, unspecified or multicast, nor with a network interface after a %, which no link can
+# hold. A name by tls.certificate_name's own rule, since tls-init refuses any other once the install
+# has begun: labels of 1 to 63 letters, digits and hyphens, none first or last a hyphen, 253 characters
+# at most. Nor localhost, which every computer is to itself and nervus's certificate never names
+# (ADR-0021 B1), nor a name whose last label is all digits: an address mistyped, since no top-level
+# domain is all digits.
+kind_of() {
+  python3 -I - "$1" <<'PY'
+import ipaddress, re, sys
+
+text = sys.argv[1]
+try:
+    ip = ipaddress.ip_address(text)
+except ValueError:
+    ip = None
+if ip is not None:
+    why = ("it names a network interface after its %, which no link can hold" if getattr(ip, "scope_id", None)
+           else "it is loopback, which only this machine reaches nervus at" if ip.is_loopback
+           else "it is link-local, which reaches only the same stretch of network, and can change" if ip.is_link_local
+           else "it stands for all of a machine's addresses, and no computer connects to it" if ip.is_unspecified
+           else "it is a multicast address, which no computer connects to" if ip.is_multicast
+           else None)
+    print(why or "address")
+    sys.exit(1 if why else 0)
+name = text.lower()
+if len(name) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in name.split(".")):
+    print("a name is labels of 1 to 63 letters, digits and hyphens, joined by dots, none beginning or ending "
+          "with a hyphen, and 253 characters at most")
+elif name == "localhost" or name.endswith(".localhost"):
+    print("localhost is every computer to itself, so no other reaches nervus by it, and nervus's certificate "
+          "never names it")
+elif name.rsplit(".", 1)[-1].isdigit():
+    print("its last part is all digits: it is an address mistyped, not a name")
+else:
+    print("name")
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# A first look at each --name, before Python can be asked; check_names applies the certificate's rule.
+DNS_NAME='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
 for n in ${NAMES[@]+"${NAMES[@]}"}; do
-  [[ $n =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "--name $n is not a DNS name"
+  [[ $n =~ $DNS_NAME ]] || die "--name $n is not a DNS name"
 done
-case $ADDRESS in *:*) URL_HOST="[$ADDRESS]" ;; *) URL_HOST=$ADDRESS ;; esac
-UI_HOST=${NAMES[0]:-$URL_HOST}
+# check_names: each --name one nervus's certificate can hold and clients could reach it by, checked as
+# an answer to the question is, so that tls-init never refuses one after the plan's yes. Called once
+# Python is known to be here, as check_address is.
+check_names() {
+  local n kind
+  for n in ${NAMES[@]+"${NAMES[@]}"}; do
+    kind=$(kind_of "$n") || die "--name $n will not do: $kind"
+    [ "$kind" = name ] || die "--name $n is an IP address, not a DNS name: nervus's address is --address"
+  done
+}
+# url_hosts: URL_HOST, the address as a URL holds it, an IPv6 one in brackets; and UI_HOST, where the
+# sign-in links point: the first name, or else the address.
+url_hosts() {
+  case $ADDRESS in *:*) URL_HOST="[$ADDRESS]" ;; *) URL_HOST=$ADDRESS ;; esac
+  UI_HOST=${NAMES[0]:-$URL_HOST}
+}
+url_hosts
+
+# own_addresses: this machine's own addresses, one to a line, as nervus's certificate will name them:
+# tls.machine_addresses, by the machine's own python3, which has none of nervus's libraries. Read from
+# `ip -j address`; global ones only, never loopback, link-local, unspecified or multicast, and never
+# an IPv6 address that is temporary, deprecated, tentative or failed its duplicate check, which can
+# change or go by itself. Where there is no `ip`, none.
+own_addresses() {
+  python3 -I - <<'PY'
+import ipaddress, json, subprocess
+try:
+    done = subprocess.run(["ip", "-j", "address", "show"], capture_output=True, text=True, timeout=10)
+    interfaces = json.loads(done.stdout) if done.returncode == 0 else []
+except (OSError, subprocess.SubprocessError, ValueError):
+    interfaces = []
+found = []
+for interface in interfaces if isinstance(interfaces, list) else []:
+    for entry in (interface.get("addr_info") or []) if isinstance(interface, dict) else []:
+        if not isinstance(entry, dict) or entry.get("scope") != "global":
+            continue
+        if entry.get("temporary") or entry.get("deprecated") or entry.get("tentative") or entry.get("dadfailed"):
+            continue
+        try:
+            ip = ipaddress.ip_address(entry.get("local", ""))
+        except ValueError:
+            continue
+        if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast):
+            found.append(str(ip))
+for ip in dict.fromkeys(found):
+    print(ip)
+PY
+}
+
+# take_answers <answer>: ADDRESS, NAMES and MORE_ADDRESSES from the person's answer, its words each a
+# number LISTED, or an address or a name clients could reach nervus by (kind_of), taken in order and
+# each once. The first address is ADDRESS, as --address would be; any other goes into nervus's
+# certificate beside it; the names are --name's, the first of them where sign-in links point. An
+# install needs an address, for its certificate and for VMs to fetch uploads from, and a DNS name,
+# which nervus's certificate needs (ADR-0021 B1), unless this machine's hostname is listed: tls-init
+# names it. A restore keeps the backup's certificate, so it takes one, a name or an address, which
+# the sign-in links use. If the answer will not do, it fails, saying why in WHY.
+take_answers() {
+  local words=() word item kind seen=" " taken=0
+  ADDRESS= NAMES=() MORE_ADDRESSES=() WHY=
+  read -ra words <<<"$1"
+  for word in ${words[@]+"${words[@]}"}; do
+    item=$word
+    if [[ $word =~ ^[0-9]+$ ]]; then
+      [[ $word =~ ^[1-9][0-9]{0,2}$ ]] && [ "$word" -le ${#LISTED[@]} ] \
+        || { WHY="$word is not one of the numbers listed"; return 1; }
+      item=${LISTED[word - 1]}
+    fi
+    case $seen in *" $item "*) continue ;; esac
+    seen="$seen$item "
+    kind=$(kind_of "$item") || { WHY="$word will not do: $kind"; return 1; }
+    if [ "$kind" = address ]; then
+      if [ -z "$ADDRESS" ]; then ADDRESS=$item; else MORE_ADDRESSES+=("$item"); fi
+    else
+      NAMES+=("$item")
+    fi
+    taken=$((taken + 1))
+  done
+  [ "$taken" -gt 0 ] || { WHY="nothing was typed"; return 1; }
+  if [ -n "$RESTORE" ]; then
+    [ "$taken" -eq 1 ] \
+      || { WHY="a restore takes one, the name or address the backup's nervus had: its certificate is the backup's, so nothing else here would be used"; return 1; }
+    return 0
+  fi
+  [ -n "$ADDRESS" ] \
+    || { WHY="none of them is an IP address: nervus's certificate needs one, and VMs fetch uploads from it"; return 1; }
+  [ ${#NAMES[@]} -gt 0 ] || [ -z "$HOST_FAULT" ] \
+    || { WHY="none of them is a DNS name, and nervus's certificate needs one: $HOST_FAULT"; return 1; }
+}
+
+# ask_address (ADR-0032 question 3a): without --address, ADDRESS and NAMES asked of the person, so the
+# release page's line runs as it is pasted, with nothing in it to edit. This machine knows its own
+# addresses better than the person does: it lists them and its hostname, numbered; an address or a
+# name typed in is taken too. Asked again until the answer will do; at the end of input, nothing changed.
+ask_address() {
+  local line count i kind
+  LISTED=() HOST_FAULT=
+  while IFS= read -r line; do LISTED+=("$line"); done < <(own_addresses)
+  count=${#LISTED[@]}
+  # Its hostname, which tls-init names in the certificate, unless the certificate could not hold it
+  # or no other computer could use it; then an install must be given a DNS name.
+  line=$(hostname 2>/dev/null || true)
+  if [ -z "$line" ]; then
+    HOST_FAULT="install.sh could not read this machine's hostname to use instead"
+  elif kind=$(kind_of "$line"); [ "$kind" = name ]; then
+    LISTED+=("$line")
+  else
+    HOST_FAULT="this machine's hostname, $line, cannot be used instead (${kind/#address/it is an address})"
+  fi
+  say ""
+  if [ -n "$RESTORE" ]; then
+    say "Which name or address will your clients reach the restored nervus at? Its certificate is the"
+    say "backup's, so give the one the backup's nervus had, which its clients trust. Its sign-in links"
+    say "use it; nothing else is taken from this answer."
+  else
+    say "Which addresses and names will your clients and machines reach nervus at? They go into its"
+    say "certificate, and its sign-in links use the first name, or else the first address."
+  fi
+  if [ "$count" -eq 0 ]; then
+    if command -v ip >/dev/null 2>&1; then
+      say "This machine has no address another computer could reach it at, as \`ip address\` shows it."
+    else
+      say "There is no \`ip\` command here to read this machine's addresses with."
+    fi
+  fi
+  if [ ${#LISTED[@]} -gt 0 ]; then
+    say "This machine's own:"
+    i=0
+    while [ "$i" -lt ${#LISTED[@]} ]; do
+      if [ "$i" -lt "$count" ]; then say "  $((i + 1))  ${LISTED[i]}"; else say "  $((i + 1))  ${LISTED[i]}  (its hostname)"; fi
+      i=$((i + 1))
+    done
+  fi
+  if [ -n "$RESTORE" ]; then
+    say "Type its number, or the name or address itself."
+  else
+    if [ ${#LISTED[@]} -gt 0 ]; then
+      say "Type the numbers of the ones they will use, separated by spaces, or type an address or a DNS"
+      say "name of your own."
+    else
+      say "Type the address they will use and a DNS name for nervus, separated by spaces."
+    fi
+    say "At least one must be an IP address: nervus's certificate needs one, and VMs fetch uploads from it."
+    [ -z "$HOST_FAULT" ] || say "And one must be a DNS name, which the certificate needs too: $HOST_FAULT."
+  fi
+  # A key pressed while the release downloaded, Enter above all, would answer unseen: what waits at the
+  # terminal is thrown away before the question is put. Never answers piped in, which are meant.
+  if [ -t 0 ]; then python3 -I -c 'import termios; termios.tcflush(0, termios.TCIFLUSH)' 2>/dev/null || true; fi
+  while :; do
+    if [ -n "$RESTORE" ]; then printf 'Name or address'; else printf 'Addresses and names'; fi
+    if [ "$count" -gt 0 ]; then printf ' (Enter alone takes 1, %s): ' "${LISTED[0]}"; else printf ': '; fi
+    read -r line || { say ""; die "no answer to which address or name your clients reach nervus at; nothing changed"; }
+    [ -n "$line" ] || [ "$count" -eq 0 ] || line=1
+    take_answers "$line" && break
+    say "  $WHY. Try again."
+  done
+  url_hosts
+}
 
 confirm() {
   [ -n "$YES" ] && return 0
@@ -375,7 +593,7 @@ hold_off_backups() {
   for i in $(seq 1 600); do systemctl is-active --quiet nervus-backup.service || break; sleep 1; done
 }
 
-GOES_BACK= SWITCHED= STARTED= COPY_DB= KEPT_BEFORE_STOP=
+GOES_BACK= SWITCHED= STARTED= COPY_DB= KEPT_BEFORE_STOP= RECOVERY_UNSHOWN=
 
 # ending: how a run that has held off the backups ends, however it ends. Before the stop and once nervus
 # is judged up, it only lets the backups go on; between them it goes back first (question 7). Nothing
@@ -392,6 +610,14 @@ ending() {
   # an ordinary backup again. (One that stopped nervus drops or leaves its own, by how it ends.)
   if [ -n "$KEPT_BEFORE_STOP" ]; then
     "$REL/.venv/bin/nervus-ctl" --unit "$UNIT" upgrade-backup drop "$RELEASE" >/dev/null 2>&1 || true
+  fi
+  # A recovery key the upgrade made, and a step after it stopped the run before it was shown: its
+  # private half, held nowhere else, shown now, as an install's is.
+  if [ -n "$RECOVERY_UNSHOWN" ]; then
+    say ""
+    say "install.sh stopped before its end, after it made the recovery key. Its private half, shown this once:"
+    printf '%s\n' "$RECOVERY" | sed 's/^/  /'
+    say "Keep it as docs/install.md step 2 says; what stopped the run is above."
   fi
   systemctl start nervus-backup.timer || true
   exit "$status"
@@ -648,10 +874,11 @@ missing_commands() {
   command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 || { MISSING+=("age"); PACKAGES+=(age); }
 }
 
-# Python first. install.sh needs it itself before it can read this tree: to check --address, and to
-# name the release (tools/release-name). A machine without one is given it at a yes of its own, and
-# then read as any other. ADR-0023 question 5a promised it Python; checked with the Python it lacked,
-# its address was called no address instead, and naming its release would have stopped it next.
+# Python first. install.sh needs it itself before it can read this tree: to check --address, or to
+# ask for it, and to name the release (tools/release-name). A machine without one is given it at a
+# yes of its own, and then read as any other. ADR-0023 question 5a promised it Python; checked with
+# the Python it lacked, its address was called no address instead, and naming its release would have
+# stopped it next.
 if ! command -v python3 >/dev/null 2>&1; then
   if ! command -v apt-get >/dev/null 2>&1; then
     MISSING+=("python3, 3.11 or later")
@@ -670,7 +897,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   ok "installed python3 python3-venv"
   STAYS="python3 and python3-venv, installed first, stay installed"
 fi
-[ -n "$UPGRADE" ] || check_address
+[ -n "$UPGRADE$ASK" ] || { check_address; check_names; }
 if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
   die "Python $(python3 -c 'import platform; print(platform.python_version())') is too old; nervus needs 3.11 or later"
 elif ! python3 -c 'import venv, ensurepip' 2>/dev/null; then
@@ -891,7 +1118,16 @@ copy = sqlite3.connect(sys.argv[2]); sqlite3.connect(sys.argv[1]).backup(copy); 
     ok "nervus is up on $RELEASE: active and steady, answering MCP and its web UI as itself"
     RECOVERY=
     if [ ! -e "$OPT/secrets/recovery.pub" ]; then
-      RECOVERY=$("$VENV/bin/nervus-ctl" --unit "$UNIT" recovery-key) || RECOVERY="  NOTE  no recovery key could be made: run $VENV/bin/nervus-ctl recovery-key"
+      # Ctrl-C ignored until ending would show the key, as at install (below).
+      INT_WAS=$(trap -p INT)
+      trap '' INT
+      if RECOVERY=$("$VENV/bin/nervus-ctl" --unit "$UNIT" recovery-key); then
+        # Shown at the end; until then, however the run ends, by ending (above).
+        RECOVERY_UNSHOWN=1
+      else
+        RECOVERY="  NOTE  no recovery key could be made: run $VENV/bin/nervus-ctl recovery-key"
+      fi
+      eval "${INT_WAS:-trap - INT}"
     fi
     [ -z "$COPY_DB" ] || rm -f "$COPY_DB"
     # The release before kept whole, for going back; any older removed (question 3a).
@@ -912,6 +1148,7 @@ copy = sqlite3.connect(sys.argv[2]); sqlite3.connect(sys.argv[1]).backup(copy); 
       changes clients
     fi
     [ -z "$RECOVERY" ] || { say ""; printf '%s\n' "$RECOVERY" | sed 's/^/  /'; }
+    RECOVERY_UNSHOWN=
     say ""
     say "Check the backup made before the upgrade, kept until the next one, with the recovery key, as after every upgrade:"
     say "  sudo $VENV/bin/nervus-ctl backup --check ${CHECK:-${BACKUP:-<its name>}}"
@@ -921,7 +1158,11 @@ copy = sqlite3.connect(sys.argv[2]); sqlite3.connect(sys.argv[1]).backup(copy); 
   exit 1
 fi
 
-# --- 2. the plan -------------------------------------------------------------------
+# --- 2. its address, if not given, and the plan ------------------------------------
+
+# Asked last of all it reads, so that nothing which could still refuse the install is found only
+# after the person has answered.
+[ -z "$ASK" ] || ask_address
 
 say ""
 say "It will install nervus $NUMBER from $SOURCE:"
@@ -935,7 +1176,7 @@ if [ -n "$RESTORE" ]; then
   say "      $RESTORE (it asks for the recovery key), and nervus started in lockdown"
 else
   say "  - nervus's SSH key, and its TLS authority and certificate for:"
-  say "      ${NAMES[*]:+${NAMES[*]}, }$ADDRESS, and this machine's own addresses and hostname"
+  say "      $(printf '%s, ' ${NAMES[@]+"${NAMES[@]}"} "$ADDRESS" ${MORE_ADDRESSES[@]+"${MORE_ADDRESSES[@]}"})and this machine's own addresses and hostname"
   say "  - a recovery key, which every backup is locked to; its private half is shown once, at the end"
 fi
 say "  - a backup once a day, into $STATE/backups (nervus-backup.timer)"
@@ -990,7 +1231,7 @@ if [ -z "$RESTORE" ]; then
   ok "nervus's SSH certificate authority: $(runuser -u nervus -- timeout --foreground 10 cut -d' ' -f1,2 "$OPT/secrets/nervus_ca_ed25519.pub" | cut -c1-40)…"
 
   TLS_NAMES=()
-  for n in ${NAMES[@]+"${NAMES[@]}"} "$ADDRESS"; do TLS_NAMES+=(--name "$n"); done
+  for n in ${NAMES[@]+"${NAMES[@]}"} "$ADDRESS" ${MORE_ADDRESSES[@]+"${MORE_ADDRESSES[@]}"}; do TLS_NAMES+=(--name "$n"); done
   (cd "$OPT" && runuser -u nervus -- "$VENV/bin/nervus" tls-init --bind-host 0.0.0.0 "${TLS_NAMES[@]}")
   ok "nervus's TLS authority and certificate"
 fi
@@ -1037,17 +1278,43 @@ else
   trap - EXIT
   ok "nervus is running"
   RECOVERY=
+  # Ctrl-C ignored, by install.sh and so by nervus-ctl, from before the key is made until a stop would
+  # show it: acted on between nervus-ctl keeping the key's public half and printing its private one, it
+  # would lock every backup to a key no one has. A Ctrl-C then is dropped, and the run goes on.
+  INT_WAS=$(trap -p INT)
+  trap '' INT
   if ! RECOVERY=$("$VENV/bin/nervus-ctl" --unit "$UNIT" recovery-key); then
     die "nervus is running, but no recovery key was made, so no backup can be: run $VENV/bin/nervus-ctl recovery-key"
   fi
   ok "the recovery key"
+  # Its private half is printed once, at the end, where the steps do not scroll it away. Nothing else
+  # holds it: a run that stops before then prints it as it stops.
+  recovery_unshown() {
+    say ""
+    say "install.sh stopped before its end, after it made the recovery key. Its private half, shown this once:"
+    printf '%s\n' "$RECOVERY" | sed 's/^/  /'
+    say "Keep it as docs/install.md step 2 says; what stopped the run is above."
+  }
+  trap recovery_unshown EXIT
+  eval "${INT_WAS:-trap - INT}"
 fi
 systemctl enable --now nervus-backup.timer
 ok "a backup once a day"
 
 # --- 4. what to do next ------------------------------------------------------------
 
-ROOT_FP=$(cd "$OPT" && runuser -u nervus -- "$VENV/bin/nervus" tls-fingerprint | sed -n 's/.*root certificate SHA-256 //p')
+SHOWN=$(cd "$OPT" && runuser -u nervus -- "$VENV/bin/nervus" tls-fingerprint)
+ROOT_FP=$(sed -n 's/.*root certificate SHA-256 //p' <<<"$SHOWN")
+# nervus's key as each line it gives to run pins it: a page reaching the person through a browser
+# nothing has checked could show a line with another key in it, so the person checks the key the
+# page shows above it against this one, read here on nervus's own machine (ADR-0032 question 4).
+KEY_PIN=$(sed -n 's/.*public key pin //p' <<<"$SHOWN")
+# key_check: what to do with that key, said where the fingerprint is.
+key_check() {
+  say "  $KEY_PIN"
+  say "The web UI's Machines and Clients pages show this key above each line they give you to run."
+  say "Before you run one, check that the key shown there is this one; if it is not, do not run it."
+}
 say ""
 if [ -n "$RESTORE" ]; then
   # The tier, the machines, the tokens and every client's trust came back with the backup
@@ -1057,6 +1324,9 @@ if [ -n "$RESTORE" ]; then
   say ""
   say "Its root certificate's fingerprint, the backup's, unchanged by the restore:"
   say "  $ROOT_FP"
+  say ""
+  say "nervus's key, the backup's too, as the lines its web UI gives you carry it:"
+  key_check
   say ""
   say "Clients and machines need nothing changed: the same root, tokens and certificate authority as"
   say "before. A client that reaches nervus at the same name or address as before works as it is once"
@@ -1075,9 +1345,14 @@ else
   say "nervus is installed and running."
   say ""
   printf '%s\n' "$RECOVERY" | sed 's/^/  /'
+  trap - EXIT
   say ""
-  say "Its root certificate's fingerprint (keep it with your tokens; each client machine compares it once):"
+  say "Its root certificate's fingerprint (keep it with nervus's key below; on a computer with a copy of"
+  say "this repository, tools/nervus-trust compares it):"
   say "  $ROOT_FP"
+  say ""
+  say "nervus's key, as the lines its web UI gives you carry it (keep it with the fingerprint above):"
+  key_check
   say ""
   say "Next, from docs/install.md and docs/clients.md:"
   say "  1. Sign in to the web UI with this link (it works once, within 5 minutes; nervus-ctl signin makes another):"
@@ -1085,7 +1360,9 @@ else
   say "  2. On its setup page, the first it shows, choose nervus's tier (docs/install.md step 3)."
   say "  3. On its Machines page, add each machine nervus will reach (docs/install.md step 3), and on"
   say "     its Clients page, issue a token for each client."
-  say "  4. On each client machine, in your copy of this repository:"
+  say "  4. On each computer a client runs on, run the line the Clients page gives you when you issue"
+  say "     the client's token, once you have checked that the key it shows above the line is the one"
+  say "     printed above. On a computer with a copy of this repository, this saves nervus's root instead:"
   say "       tools/nervus-trust https://$URL_HOST:8000/mcp --expect '$ROOT_FP'"
 fi
 say ""

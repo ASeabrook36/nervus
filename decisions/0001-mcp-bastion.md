@@ -2,6 +2,7 @@
 
 **Status:** **Accepted 2026-09-11** — all six acceptance criteria observed on the machines, not inferred. Evidence in procedure 004.
 **Amended 2026-10-28** by ADR-0025, Accepted by the operator the same day: s4, a host's `authorized_keys` trusts nervus's SSH certificate authority, not nervus's key; s5, attribution in a host's journal comes from the certificate nervus signs for each call, not from the separate `agent` user.
+**Amended 2026-11-23** by ADR-0031, Accepted by the operator the same day: s6, a token says which machines it may reach and, on a machine with a read-only account, whether it is read-only or read-write there.
 **Date:** 2026-09-10
 **Rewritten:** 2026-10-16, under ADR-0019 F, to name no installation: every decision keeps its number and its meaning. The operator's original text, written for their own fleet, is kept whole in the deployment record (deployment note 0001). Where a section below speaks of the first installation, that note has the specifics.
 **Implements:** the operator's standing agreement about what agents may control (Context)
@@ -36,6 +37,8 @@ More than one project will drive agents against the same machines. The need is a
 *Amended 2026-10-28 by ADR-0025:* the separate `agent` user tells nervus's logins apart from everyone else's in a host's journal, but not one client from another; the certificate does that, its key ID logged by the host's `sshd` at each login. A witness, not a protected one: a client with full access to a host can edit its journal afterwards (ADR-0007 decision 8, as amended). Revocation is still one move: removing the `cert-authority` line.
 
 **6. Clients and tokens.** One static bearer token per (client, project) pair — e.g. Claude Code in project A, Codex in project A — generated and stored in the operator's password manager, deployed to `nervus` as a 0600 token file. Each token carries a host allowlist. This is the one authorization check the MCP layer performs: coarse, before SSH, "may this token reach this host at all." It is not command filtering. v1 tokens list every v1 host.
+
+*Amended 2026-11-23 by ADR-0031:* a token also carries a level on each machine with a read-only account: read-only or read-write, chosen when it is issued and fixed after. nervus logs a read-only call in to that read-only account, which the machine keeps read-only, and refuses `put`, uploads and the `proxmox` tool there itself. Still not command filtering: the machine does the refusing.
 
 **7. Consumer integration.** A consuming project wires itself in by committing its own client configuration pointing at `nervus`: a project-scoped `.mcp.json` for Claude Code and a project-scoped `.codex/config.toml` for Codex, both referencing the token by environment variable rather than by value. The mechanism is validated on a real client before load-bearing use.
 

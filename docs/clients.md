@@ -1,22 +1,87 @@
 # Connecting a client to nervus
 
-How an AI client (Claude Code, Codex, Cursor) reaches your machines through nervus: connecting,
-checking, saving a file from a host or VM onto your own machine, and making a VM to work in.
-Replace `<nervus>` with the name your clients reach nervus by. Each section says which decision
-record (`decisions/`) explains why it works this way.
+How an AI client (Claude Code, Codex, Cursor) reaches your machines through nervus: setting up the
+computer it runs on, checking it, saving a file from a host or VM onto your own machine, and making
+a VM to work in. Replace `<nervus>` with the name your clients reach nervus by. Each section says
+which decision record (`decisions/`) explains why it works this way.
+
+## Set up the computer your client runs on, with one line (ADR-0032)
+
+Nothing to install first, and no copy of this repository: the line nervus gives you does it.
+
+1. **Issue a token** on nervus's Clients page: an id, the client it is for (Claude Code, Codex, or
+   another, by its name), a project, and the machines it may reach.
+2. **Check nervus's key.** The next page shows it first, as `sha256//…`. The installer printed it
+   when it installed nervus, and `nervus tls-fingerprint` prints it on nervus's machine. If they
+   differ, stop: something other than your nervus may have sent you that page. The lines carry
+   this key, and refuse any server whose key is not it.
+3. **Run the line** on the computer the client runs on, as yourself, not as root or an
+   administrator. On macOS and Linux, in a terminal:
+
+   <!-- laptop:sh -->
+   ```bash
+   curl -fsSk --pinnedpubkey 'sha256//<nervus's key>' 'https://<nervus>:8000/laptop/<one-time code>' | sh
+   ```
+
+   On Windows, in PowerShell:
+
+   <!-- laptop:windows -->
+   ```powershell
+   iex (curl.exe -fsSk --pinnedpubkey 'sha256//<nervus's key>' 'https://<nervus>:8000/laptop/<one-time code>/windows' | Out-String)
+   ```
+
+   It works once, within 15 minutes. Whatever runs it first gets the token: if yours says its code
+   was used and you did not run it, revoke the token on the Clients page and issue another. If the
+   line expires unused, the Clients page offers that token a new one.
+4. **Run the commands it prints**, then start a new session of your client. The line changes none of
+   your client's settings itself: every change to your computer's settings is one you make
+   (ADR-0032 question 6).
+
+**What the line does**, in `~/.config/nervus` (`.config\nervus` in your home folder on Windows),
+and nothing else. The script it fetches says the same at its top; to read it first, run only the
+line's `curl` part, which prints the script and spends nothing.
+
+- It asks nervus whether its code is still good, before anything else.
+- It checks that nervus answers at the address in the line as nervus's root vouches, then saves
+  that root as `root-<nervus>.pem` and gathers every nervus root saved there into `roots.pem`: the
+  files `tools/nervus-trust` writes (below).
+- It puts there `nervus-headers` (`nervus-headers.ps1` on Windows), the helper a client runs as it
+  connects, which prints the header that carries the token.
+- It fetches the token, once, and keeps it where only you can read it: on a Mac in your login
+  keychain, as the item `nervus-<nervus>-<token id>`, which asks you before every read; on Linux in
+  the file `token-<nervus>-<token id>` there, `0600`; on Windows in that file, encrypted by Windows
+  for your account alone. The token is never on the screen, in a clipboard, in a command's
+  arguments, or in your client's environment.
+- It prints the commands that tell your client to use nervus:
+
+  | client | what it prints |
+  |---|---|
+  | Claude Code | `claude mcp add-json --scope user nervus '{…, "headersHelper": "…/nervus-headers <name>"}'`, and a command that sets `NODE_EXTRA_CA_CERTS` in `~/.claude/settings.json` to `roots.pem` |
+  | Codex | a command that adds `[mcp_servers.nervus]` to `~/.codex/config.toml` with its `url` and `http_headers_helper` (`codex mcp add` has no flag for the helper), and one that sets `CODEX_CA_CERTIFICATE` to `roots.pem` |
+  | another client | nervus's address, the helper, and the roots, for that client's own settings |
+
+Nothing in the script runs until all of it has arrived, so a download cut partway changes nothing.
+
+**On a Mac**, each time your client connects, macOS asks whether `security` may use the token's
+item: choose Allow, never Always Allow, which would let anything read the token silently. Claude
+Code gives its helper about 10 seconds; if the question waits longer, reconnect nervus.
 
 ## What a client needs
 
 ```
 URL     https://<nervus>:8000/mcp
-Auth    Authorization: Bearer <token>
-Trust   nervus's root, saved once on the client's machine (below)
+Auth    Authorization: Bearer <token>, printed by the helper when the client connects
+Trust   nervus's root, saved once on the client's machine
 ```
 
-**One token per client and project**, for example Claude Code in project A and Codex in project
-A each get their own (ADR-0001 s6). Every client reaches a host as the same `agent` account, so
-the audit log is the only thing that tells their work apart, and it can only do that if no two
-share a token.
+The line above gives a client all three. The sections below say how each works, and how to give
+them by hand, from a copy of this repository: the way a client set up before ADR-0032 has them,
+which keeps working unchanged.
+
+**One token per client application**, for example Claude Code and Codex on your laptop each get
+their own (ADR-0030; ADR-0001 s6). Every client given the same access to a machine reaches it as the
+same account of nervus's there, so the audit log is the only thing that tells their work apart, and
+it can only do that if no two share a token.
 
 Use the name of the nervus machine, one its certificate is for, not an address a DHCP server may
 move.
@@ -34,7 +99,8 @@ address. That key is kept in nervus's `secrets/`, beside nervus's SSH key, and n
 only inside a backup locked to your recovery key: anyone who has it has nervus's SSH key as well,
 a far greater loss.
 
-Save it once on each machine, in your clone of this repository:
+The line saves it, with the root it carries, which came pinned to nervus's key. **By hand**, save it
+once on each machine, in your clone of this repository:
 
 ```bash
 tools/nervus-trust https://<nervus>:8000/mcp --expect '<root certificate SHA-256>'
@@ -51,36 +117,44 @@ saved there, for Claude Code, which takes one file. Cursor is not yet tested wit
 
 **Plain HTTP** remains possible on a network you control: nervus started with
 `--insecure-plain-http` serves MCP over `http://`, and warns at every start, since tokens then
-cross the network unencrypted. Use `http://` in the examples below, and leave out the root.
+cross the network unencrypted. Over plain HTTP there is no key to pin, so the Clients page gives no
+line: it shows the token's value once instead (ADR-0032 question 13). Set the client up by hand,
+use `http://` in the examples below, and leave out the root.
 
 ## Where the token lives
 
-**Never in a repository.** The client's configuration names an environment variable or a
-helper, and the token is supplied from outside.
+**Never in a repository.** The client's configuration names a helper or an environment variable,
+and the token is supplied from outside.
 
-There are two ways to supply it, each with a cost:
-
-- **An environment variable.** The simplest. But it is readable by every process running as the
-  same user (`ps -E` on macOS shows another process's environment), so a token delivered that way
-  is delivered to everything on that machine (ADR-0006). **GUI apps on macOS inherit nothing from a
-  terminal**, so for the Claude or Cursor desktop app the variable has to go into the login session
-  (`launchctl setenv`, then quit and reopen the app; it lasts until logout). **For a client in a
-  terminal,** on Linux or macOS, keep the token in a file only you can read, for example
+- **A helper, which reads it from where only you can read it, as the client connects.** What the
+  line sets up: the helper is `~/.config/nervus/nervus-headers`, the token in the macOS keychain, a
+  `0600` file on Linux, or a file Windows encrypts for your account. The token is never in any
+  process's environment. On a Mac every read asks you first: on every new session and every
+  reconnect. Worth it for a token that reaches a lot (ADR-0009 decision 5). By hand, from a clone,
+  `tools/nervus-headers` is the same for the macOS keychain alone (below).
+- **An environment variable**, by hand. The simplest. But it is readable by every process running
+  as the same user (`ps -E` on macOS shows another process's environment), so a token delivered that
+  way is delivered to everything on that machine (ADR-0006). **GUI apps on macOS inherit nothing
+  from a terminal**, so for the Claude or Cursor desktop app the variable has to go into the login
+  session (`launchctl setenv`, then quit and reopen the app; it lasts until logout). **For a client
+  in a terminal,** on Linux or macOS, keep the token in a file only you can read, for example
   `~/.config/nervus/token-claude-code` (`chmod 600`), and export it from your login shell's file,
   `~/.profile` on Linux or `~/.zprofile` on macOS:
   `export NERVUS_CLAUDE_CODE="$(cat ~/.config/nervus/token-claude-code)"`. Log in again, or open a
   new terminal on macOS, and it is set.
-- **The operating system's keystore, fetched by a helper when the client connects**
-  (`tools/nervus-headers`, macOS's keychain). The token is never in any process's environment, and
-  every read asks you first. The cost is that prompt: on every new session and every reconnect.
-  Worth it for a token that reaches a lot (ADR-0009 decision 5).
 
 To see whether a variable is set, print its length, never its value:
 `printenv NERVUS_CODEX | wc -c`.
 
 ## Claude Code
 
-A project-scoped `.mcp.json`, committed in the project that uses nervus.
+**Set up by the line**, Claude Code has nervus at user scope, in every project: `claude mcp
+add-json --scope user nervus '{"type": "http", "url": "https://<nervus>:8000/mcp", "headersHelper":
+"<your home>/.config/nervus/nervus-headers <name>"}'`, as the line prints it. If Claude Code has a
+server named `nervus` already, `claude mcp remove --scope user nervus` first; one in a project's own
+`.mcp.json` wins there.
+
+**By hand**, a project-scoped `.mcp.json`, committed in the project that uses nervus.
 
 **With an environment variable:**
 
@@ -97,7 +171,7 @@ A project-scoped `.mcp.json`, committed in the project that uses nervus.
 ```
 
 **With the token in the keystore.** Store it once, in the macOS keychain:
-`security add-generic-password -a nervus -s <item> -w -T ""`, where `<item>` names the token, for
+`security add-generic-password -a nervus -s <item> -T "" -w`, where `<item>` names the token, for
 example `nervus-token-claude-code-project-a`. The `-T ""` trusts no application to read the item
 without asking, so every read prompts you, as `tools/nervus-headers` relies on (procedure 009);
 without it the keychain would let some programs read the token silently. Then:
@@ -125,39 +199,55 @@ add
 {"env": {"NODE_EXTRA_CA_CERTS": "<the path nervus-trust printed for Claude Code>"}}
 ```
 
-and start a new session: Claude Code reads it only when a session starts. Claude's desktop app
-reads the same file, and a new session there is enough; the app itself need not be restarted.
+and start a new session: Claude Code reads it only when a session starts. The line prints a command
+that makes this change (on a Mac with its own JavaScript, `osascript`; on Linux with `python3`; on
+Windows with PowerShell), keeping the rest of the file as it is. Claude's desktop app reads the same
+file, and a new session there is enough; the app itself need not be restarted.
 
 The path is `~/.config/nervus/roots.pem`, written out in full: every nervus's root saved on this
 machine. Claude Code takes one file, and this setting wins over the environment, so a file holding
 one nervus's root alone shuts out every other nervus (`SELF_SIGNED_CERT_IN_CHAIN`). With
 `roots.pem`, trusting another nervus later, a friend's or yours restored at another address, is
-`tools/nervus-trust` for it and a new session; this line stays as it is. If `NODE_EXTRA_CA_CERTS`
-is already set, for a company's root say, add nervus's roots to that file instead;
-`tools/nervus-trust` says when a setting names another file. Tested on macOS, by a real call from a
-new session in the desktop app, and on Linux, by a connection; one file holding two nervus roots,
-by Claude Code 2.1.312 connecting to both (procedure 047).
+the line or `tools/nervus-trust` for it and a new session; this line stays as it is. If
+`NODE_EXTRA_CA_CERTS` is already set, for a company's root say, add nervus's roots to that file
+instead; the line and `tools/nervus-trust` say when a setting names another file. Tested on macOS,
+by a real call from a new session in the desktop app, and on Linux, by a connection; one file
+holding two nervus roots, by Claude Code 2.1.312 connecting to both (procedure 047).
 
-**The first time you start Claude Code in the project**, it asks whether you trust the folder, and
-to approve the project's `nervus`: say yes. Until you have, `claude mcp list` shows nervus as
-"Pending approval", and a run with `claude -p` goes without it. Seen with Claude Code 2.1.319 on
-Linux, whose first call through nervus then worked (procedure 054).
+**The first time you start Claude Code in the project**, for a server in a project's own
+`.mcp.json`, it asks whether you trust the folder, and to approve the project's `nervus`: say yes.
+Until you have, `claude mcp list` shows nervus as "Pending approval", and a run with `claude -p`
+goes without it. Seen with Claude Code 2.1.319 on Linux, whose first call through nervus then
+worked (procedure 054). A server added at user scope, as the line's command adds it, is not asked
+about.
 
 ## Codex
 
-**Codex's desktop app ignores MCP servers in a project's `.codex/config.toml`**, silently (openai/
-codex issue 13025, open). The server has to be in the global `~/.codex/config.toml`, so it
-applies in every project. That breaks "one token per client and project": a token named for one
-project would be used from every project, and the audit log would say the wrong project, which is
-worse than saying none. Three ways out:
+**Set up by the line**, Codex has nervus in its global `~/.codex/config.toml`, its token given by
+`http_headers_helper`, the same helper Claude Code runs, so the token is never in Codex's
+environment. Codex runs it as it connects, and sends what it prints on every request to nervus.
+Seen with Codex 0.171 against a server on the network, not on `localhost` (ADR-0032 verification 8).
+The table the line's command appends:
 
-1. **Name the token for what it is**, for example `codex-unscoped`, so the log never claims a
-   project it cannot vouch for. The simplest; you lose telling Codex's projects apart.
-2. **Use one project's token**, and only use Codex with nervus from that project. Nothing
-   enforces it.
-3. **Give each project its own Codex settings folder** (`CODEX_HOME`), which Codex does honour.
-   Each project then has its own token, at the cost of separating all of Codex's state per
-   project and launching it from a terminal with the folder set.
+```toml
+[mcp_servers.nervus]
+url = "https://<nervus>:8000/mcp"
+http_headers_helper = "<your home>/.config/nervus/nervus-headers <name>"
+```
+
+`codex mcp add` puts a server among the others in the file and has no flag for the helper, so the
+line's command appends the table whole; if Codex has a server named `nervus` already, the line
+prints `codex mcp remove nervus` first.
+
+**Codex's desktop app ignores MCP servers in a project's `.codex/config.toml`**, silently (openai/
+codex issue 13025, open), so nervus is in the global file and applies in every project. That fits
+one token for each client application (ADR-0030): name the token for Codex, as the Clients page
+records it, not for one project, so the log never claims a project it cannot vouch for. To tell
+Codex's projects apart, give each its own Codex settings folder (`CODEX_HOME`), which Codex does
+honour, at the cost of separating all of Codex's state per project and launching it from a terminal
+with the folder set; the line's commands follow `CODEX_HOME`.
+
+**By hand**, with the token in an environment variable:
 
 ```toml
 [mcp_servers.nervus]
@@ -169,28 +259,32 @@ Or, without editing the file: `codex mcp add nervus --url https://<nervus>:8000/
 --bearer-token-env-var NERVUS_CODEX`. The ChatGPT desktop app's "Connect to a custom MCP" dialog
 writes the same file; choose its **Streamable HTTP** type.
 
-**Trusting nervus's root:** `CODEX_CA_CERTIFICATE=<path to the root>` in Codex's environment. It
-adds the root to the ones Codex already trusts. **Not `SSL_CERT_FILE`:** Codex then trusts that file
-alone, and its own connection to OpenAI fails.
+**Trusting nervus's root:** `CODEX_CA_CERTIFICATE=<path to the root>` in Codex's environment; the
+line names `roots.pem`, which Codex reads whole, every nervus's root in it. It adds the roots to the
+ones Codex already trusts. **Not `SSL_CERT_FILE`:** Codex then trusts that file alone, and its own
+connection to OpenAI fails.
 
-- **Codex's command line:** export it in the terminal Codex starts from.
+- **Codex's command line:** export it in the terminal Codex starts from; the line prints the command
+  that adds it to your login shell's file.
 - **The ChatGPT desktop app**, where Codex also runs, sees no terminal's variables. Put this one in
-  the login session, as its token variable is, then quit the app completely (⌘Q) and reopen it. It
-  lasts until you log out:
+  the login session, then quit the app completely (⌘Q) and reopen it. It lasts until you log out:
 
   ```bash
   launchctl setenv CODEX_CA_CERTIFICATE '<path to the root>'
   ```
 
-Tested: the desktop app made a real call, approved; the command line connected and listed nervus's
-tools, but made no call, since `codex exec` refuses any tool call that needs approval.
+Tested by hand: the desktop app made a real call, approved; the command line connected and listed
+nervus's tools, but made no call, since `codex exec` refuses any tool call that needs approval.
 
 Codex asks for approval on every nervus call, and its default time limit per tool call is 60
 seconds: longer work belongs in `exec_bg` (ADR-0001 consequences).
 
 ## Check it
 
-`tools/nervus-status` speaks MCP exactly as a client does: name, port, certificate, token,
+**Set up by the line:** start a new session of your client and ask it to call nervus's `hosts`
+tool, then find the call in the audit log, below. Nothing else is needed on that computer.
+
+**With a clone**, `tools/nervus-status` speaks MCP exactly as a client does: name, port, certificate, token,
 session, `hosts`, then a real command on every host in the inventory. Green there means a client
 will work. It finds nervus as a client does, by a name in DNS, in `/etc/hosts` or a `.local` name,
 or by address, and checks nervus's certificate against `NERVUS_CACERT` before it sends the token.
@@ -208,8 +302,11 @@ result after, joined by their `id`. If it failed, the result's `error` says why.
   code proves nothing; `nervus-status` checks the body.
 - **A client's own error text is not evidence about nervus.** A client has reported "nervus
   rejects the command" when nervus received nothing. The audit log is the evidence.
-- **`exec` does not run as root.** It runs as `agent`. On a machine at full, `agent` has
-  passwordless sudo, so a privileged command needs `sudo -n`. Without it, nothing can answer a
+- **`exec` does not run as root.** It runs as one of nervus's accounts on the machine: on one
+  added on the Machines page since 0.3.0, `nervusagent` if your token is read-write there and
+  `nervusagent-readonly` if it is read-only, unless its owner gave other names; on a VM, a machine
+  set up by hand, or one added before 0.3.0, `agent`. On a machine at full, the read-write account has passwordless
+  sudo, so a privileged command needs `sudo -n`. Without it, nothing can answer a
   password prompt: a bare `reboot` is refused; `sudo -n systemctl reboot` works. At any other level
   there is no `sudo` (below).
 
@@ -231,8 +328,10 @@ every token, so what you set up above stays as it is.
 keeps the tool descriptions it was given. It still works, since each release keeps the last one's
 tools working as clients called them, but it does not see what is new until you start a new session.
 `CHANGES.md` says when that matters, under what each client must do, and `install.sh --upgrade` prints
-that as it ends. If a release changes something on the client's own side, such as `tools/nervus-trust`,
-it says so there too: pull this repository on each client machine, and run what it says.
+that as it ends. If a release changes something on the client's own side, such as the helper the
+line puts there, or `tools/nervus-trust`, it says so there too: for a computer set up by the line,
+issue its client a new token and run its line; with a clone, pull this repository on each client
+machine, and run what it says.
 
 ## What each machine lets you do (ADR-0024)
 
@@ -254,7 +353,7 @@ is refused, nothing runs, and the answer says how its owner adds one.
 | level | `exec`, `exec_bg`, `job` | `get`, `export` | `put`, uploads | `sudo` |
 |---|---|---|---|---|
 | read-only | yes, but no file outside `~/.nervus` can change | yes | refused | no |
-| standard | yes, changing only what `agent` owns | yes | into `agent`'s own folders | no |
+| standard | yes, changing only what nervus's read-write account owns | yes | into that account's own folders | no |
 | full | yes | yes | anywhere, `root=1` through `sudo` | yes, `sudo -n` |
 
 **On a read-only machine, or one you are read-only on:**
@@ -267,7 +366,7 @@ is refused, nothing runs, and the answer says how its owner adds one.
   files and build output.
 - **`/tmp` is private to each command and empty at the start of the next.** Anything a later call
   needs goes in `~/.nervus`.
-- You can still read anything `agent` can read, run programs, and reach the network.
+- You can still read anything the read-only account can read, run programs, and reach the network.
 
 ## Save a file from a host or VM onto your own machine (ADR-0016)
 
@@ -290,9 +389,29 @@ reason; a new attempt needs a new key.
 
 **3. Download it with your own token, from standard input.** The token goes into curl through a
 pipe, so it is never in a command's arguments, where other processes could list it, and never in
-the URL. `NERVUS_CACERT` names nervus's root, as above. Replace `<export_id>` and `<file>`:
+the URL. Replace `<export_id>` and `<file>`.
 
-Codex, with its token in `NERVUS_CODEX`:
+A client set up by the line, with its helper, whichever client it is: `<name>` is the one its helper
+is named with in the client's settings, `<nervus>-<token id>` (the same question as connecting, on a
+Mac, approved the same way):
+
+<!-- download:laptop -->
+```bash
+~/.config/nervus/nervus-headers <name> | sed -E 's/^\{"(Authorization)": "(.*)"\}$/\1: \2/' | curl -fsS -C - --cacert ~/.config/nervus/roots.pem -H @- -o '<file>' 'https://<nervus>:8000/exports/<export_id>'
+```
+
+On Windows, set up by the line, in PowerShell:
+
+<!-- download:windows -->
+```powershell
+$h = (powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME\.config\nervus\nervus-headers.ps1" <name> | ConvertFrom-Json).Authorization; "Authorization: $h" | curl.exe -fsS -C - --ssl-no-revoke --cacert "$HOME\.config\nervus\roots.pem" -H '@-' -o '<file>' 'https://<nervus>:8000/exports/<export_id>'; $h = $null
+```
+
+The token is in a PowerShell variable for the length of the line, and reaches curl on its standard
+input, never in its arguments.
+
+Set up by hand, `NERVUS_CACERT` naming nervus's root, as above. Codex, with its token in
+`NERVUS_CODEX`:
 
 <!-- download:codex -->
 ```bash
@@ -340,10 +459,24 @@ only then renames it into place. The bytes never pass through the model, and the
 of JSON. Use this instead of pasting a file into `exec`.
 
 **Send it.** Replace `<file>` (on your machine), `<host>`, `<path>` (the absolute path to write)
-and `<key>` (a request key you make up, unique to this file). `NERVUS_CACERT` names nervus's root,
-as above.
+and `<key>` (a request key you make up, unique to this file).
 
-Codex, with its token in `NERVUS_CODEX`:
+A client set up by the line, with its helper, `<name>` as for downloads:
+
+<!-- upload:laptop -->
+```bash
+f='<file>'; ~/.config/nervus/nervus-headers <name> | sed -E 's/^\{"(Authorization)": "(.*)"\}$/\1: \2/' | curl -sS --fail-with-body --cacert ~/.config/nervus/roots.pem -H @- -T "$f" --url-query 'host=<host>' --url-query 'path=<path>' --url-query "sha256=$(shasum -a 256 "$f" | cut -c1-64)" --url-query 'key=<key>' 'https://<nervus>:8000/uploads'
+```
+
+On Windows, set up by the line, in PowerShell:
+
+<!-- upload:windows -->
+```powershell
+$f = '<file>'; $h = (powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME\.config\nervus\nervus-headers.ps1" <name> | ConvertFrom-Json).Authorization; "Authorization: $h" | curl.exe -sS --fail-with-body --ssl-no-revoke --cacert "$HOME\.config\nervus\roots.pem" -H '@-' -T $f --url-query 'host=<host>' --url-query 'path=<path>' --url-query "sha256=$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())" --url-query 'key=<key>' 'https://<nervus>:8000/uploads'; $h = $null
+```
+
+Set up by hand, `NERVUS_CACERT` naming nervus's root, as above. Codex, with its token in
+`NERVUS_CODEX`:
 
 <!-- upload:codex -->
 ```bash
@@ -385,7 +518,14 @@ wrong), `not_allowed` (your token does not reach that destination), `key_reused`
 a new key). 401: no token, a wrong one, or this client is switched off.
 
 **Ask again, or retry.** Sending the same file with the same key never delivers it twice: it
-answers with that upload. To only ask, without sending the file again:
+answers with that upload. To only ask, without sending the file again, by the line's helper:
+
+<!-- upload-status:laptop -->
+```bash
+~/.config/nervus/nervus-headers <name> | sed -E 's/^\{"(Authorization)": "(.*)"\}$/\1: \2/' | curl -sS --fail-with-body --cacert ~/.config/nervus/roots.pem -H @- 'https://<nervus>:8000/uploads/<key>'
+```
+
+or with the token in an environment variable:
 
 <!-- upload-status:codex -->
 ```bash

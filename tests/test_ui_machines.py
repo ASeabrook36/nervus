@@ -1,5 +1,6 @@
 """The UI's machines page (ADR-0024 step 4): adding a machine makes a one-time
-code and shows its two lines once; a machine's address can be changed; a
+code and shows its one line once (ADR-0032 question 7), with the script it
+runs beneath it; a machine's address can be changed; a
 machine removed is forgotten, with what takes nervus off it; tokens may name
 enrolled machines. Every change is audited, and undone if its record cannot
 be written, except a removal, which takes access away and stands. Driven
@@ -11,6 +12,8 @@ import re
 import shlex
 
 import pytest
+from starlette.applications import Starlette
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from nervus.audit import AuditLog
@@ -18,20 +21,23 @@ from nervus.auth import Token, Tokens
 from nervus.database import Database
 from nervus.enrolled_hosts import EnrolledHostStore
 from nervus.enrollment_codes import EnrollmentCodes
-from nervus.host_enrollment import remove_commands
+from nervus.host_enrollment import HostEnrollment, enroll_endpoint, enroll_url, remove_commands
 from nervus.pages import PLAIN_HTTP
+from nervus.token_codes import TokenCodes
 from nervus.ui import Machines, Management, build_ui
 
 ORIGIN = "https://nervus.example:8443"
 PIN = "sha256//47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+# nervus's certificate authority's public key, as the script carries it (ADR-0025).
+CA_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeNervusKeyForTheseTestsOnly0123456789ab nervus-ca"
 MACHINE = "0123456789abcdef0123456789abcdef"
 BY_HAND = ["node-a", "hv"]
 FILE_TOKENS = {"file-value": Token(id="codex-anywhere", client="codex", project="p", hosts=frozenset({"nas"}))}
 
 
 class World:
-    def __init__(self, tmp_path, pin=PIN, nervus_host=""):
+    def __init__(self, tmp_path, pin=PIN, nervus_host="", enrollment=None):
         self.db = Database(tmp_path / "nervus.db")
         self.db.open()
         self.audit = AuditLog(path=tmp_path / "audit.jsonl")
@@ -40,9 +46,12 @@ class World:
         switches = tmp_path / "switches.yaml"
         switches.write_text("lockdown: false\ndisabled: []\n")
         self.tokens = Tokens(FILE_TOKENS, self.db.token)
-        self.machines = Machines(self.codes, self.store, lambda: self.pin, 8000, BY_HAND, nervus_host)
+        # With `enrollment`, a HostEnrollment made from this world, the page shows the script each line runs.
+        shown = {} if enrollment is None else {"shown": enrollment(self).shown}
+        self.machines = Machines(self.codes, self.store, lambda: self.pin, 8000, BY_HAND, nervus_host, **shown)
         self.browser = TestClient(build_ui(
-            self.db, self.audit, secure=True, management=Management(self.tokens, switches, BY_HAND),
+            self.db, self.audit, secure=True,
+            management=Management(self.tokens, switches, BY_HAND, codes=TokenCodes(self.db), pin=lambda: self.pin),
             machines=self.machines), base_url=ORIGIN, follow_redirects=False)
         link, _ = self.db.make_link()
         assert self.browser.post("/signin", data={"link": link}, headers={"Origin": ORIGIN}).status_code == 303
@@ -84,6 +93,10 @@ def _lines(page):
     return html.unescape(re.search(r"<pre class=\"lines\"><code>(.*?)</code></pre>", page, re.S).group(1))
 
 
+def _all_lines(page):
+    return [html.unescape(found) for found in re.findall(r"<pre class=\"lines\"><code>(.*?)</code></pre>", page, re.S)]
+
+
 def _code(lines):
     return re.search(r"/enroll/([A-Za-z0-9_-]+)", lines).group(1)
 
@@ -123,15 +136,17 @@ def test_read_only_is_the_level_offered_first(world):
 
 # --- adding -----------------------------------------------------------------------------
 
-def test_adding_shows_the_two_lines_once_and_the_code_in_them_works(world):
+def test_adding_shows_the_one_line_once_and_the_code_in_it_works(world):
+    # ADR-0032 question 7: one line, the script fetched pinned to nervus's key and run as root.
     page = world.act(action="add", name="nas", confirm="nas", address="192.0.2.20", level="read-only")
     assert page.status_code == 200 and "Add nas, read-only" in page.text
-    lines = _lines(page.text)
-    first, second = lines.strip().splitlines()
-    value = _code(first)
-    assert shlex.split(first) == ["curl", "-fsSk", "--pinnedpubkey", PIN, "-o", "nervus-enroll.sh",
-                                  f"https://nervus.example:8000/enroll/{value}"]
-    assert second == "less nervus-enroll.sh && sh nervus-enroll.sh"
+    line, root_line = _all_lines(page.text)
+    assert len(line.strip().splitlines()) == 1
+    value = _code(line)
+    url = f"https://nervus.example:8000/enroll/{value}"
+    assert shlex.split(line) == ["curl", "-fsSk", "--pinnedpubkey", PIN, url, "|", "sudo", "sh"]
+    # In a root shell, as on a machine without sudo, the same line ending in `| sh`.
+    assert shlex.split(root_line) == ["curl", "-fsSk", "--pinnedpubkey", PIN, url, "|", "sh"]
     code = world.codes.find(value)
     assert (code.name, code.address, code.level, code.made_by) == ("nas", "192.0.2.20", "read-only", "operator")
     later = world.browser.get("/machines").text
@@ -146,6 +161,64 @@ def test_the_making_is_audited_by_the_code_id_never_the_code(world):
     assert record["code_id"] == world.codes.find(value).id
     assert record["machine_address"] == "where its report comes from" and record["address"]
     assert value not in world.audit.path.read_text()
+
+
+def test_the_page_shows_the_key_the_line_checks_to_compare_with_the_installer_s(world):
+    page = html.unescape(re.sub(r"<[^>]+>", "", world.act(action="add", name="nas", confirm="nas", level="standard").text))
+    said = " ".join(page.split())
+    assert f"The key it checks is {PIN}." in said and "if they differ, stop" in said
+
+
+def test_beneath_the_line_the_page_shows_the_very_script_the_line_runs(tmp_path):
+    # ADR-0032 question 7: for anyone who wants to read it first. The text is the route's own, for the
+    # same code and URL, and showing it records no fetch: the page's making of the code is recorded.
+    made = []
+
+    def enrollment(world):
+        made.append(HostEnrollment(world.codes, world.store, world.audit, key=lambda: CA_KEY, connect=None,
+                                   pin=lambda: world.pin, own_machine_id=MACHINE, reserved=lambda: BY_HAND))
+        return made[0]
+    world = World(tmp_path, enrollment=enrollment)
+    enrollment = made[0]
+    page = world.act(action="add", name="nas", confirm="nas", level="standard").text
+    value = _code(_lines(page))
+    url = f"https://nervus.example:8000/enroll/{value}"
+    shown = html.unescape(re.search(r'<pre class="script"><code>(.*?)</code></pre>', page, re.S).group(1))
+    assert "<summary>The script this line runs" in page
+    fetches = lambda: [r for r in map(json.loads, world.audit.path.read_text().splitlines())  # noqa: E731
+                       if r.get("tool") == "enroll"]
+    assert fetches() == []
+    # What the route itself serves at the line's URL, fetched as the line fetches it.
+    route = Starlette(routes=[Route("/enroll/{code}", enroll_endpoint(enrollment), methods=["GET", "POST"])])
+    served = TestClient(route, base_url="https://nervus.example:8000").get(f"/enroll/{value}")
+    assert served.status_code == 200 and shown == served.text
+    assert shown.rstrip().endswith("nervus_enroll </dev/null\n}")
+
+
+def test_where_the_route_would_refuse_the_line_the_page_says_why_in_place_of_the_script(tmp_path):
+    # In lockdown the route refuses the line (ADR-0024): the page says so, and shows no script it would not serve.
+    made = []
+
+    def enrollment(world):
+        made.append(HostEnrollment(world.codes, world.store, world.audit, key=lambda: CA_KEY, connect=None,
+                                   pin=lambda: world.pin, own_machine_id=MACHINE, reserved=lambda: BY_HAND,
+                                   locked=lambda: True))
+        return made[0]
+    world = World(tmp_path, enrollment=enrollment)
+    page = html.unescape(world.act(action="add", name="nas", confirm="nas", level="standard").text)
+    assert '<pre class="script">' not in page and len(_all_lines(page)) == 2
+    assert "cannot be shown here: nervus is locked down, so it refuses this line until lockdown is lifted" in page
+
+
+def test_on_port_443_the_line_names_no_port_as_curl_asks_for_none():
+    # curl leaves :443 out of what it asks for, so the script the route writes names no port: nor does the line.
+    assert enroll_url("nervus.example", 443, "C") == "https://nervus.example/enroll/C"
+    assert enroll_url("2001:db8::5", 443, "C") == "https://[2001:db8::5]/enroll/C"
+
+
+def test_where_there_is_no_script_to_show_the_line_stands_alone(world):
+    page = world.act(action="add", name="nas", confirm="nas", level="standard").text
+    assert '<pre class="script">' not in page and len(_all_lines(page)) == 2
 
 
 def test_the_lines_name_nervus_as_its_ui_url_does(tmp_path):

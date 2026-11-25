@@ -1,7 +1,7 @@
 """Enrolling by an admin login (ADR-0026 step 3): nervus fetches a machine's host
 key to show, logs in pinned to exactly that key with an account and password
-its owner typed, becomes root there directly or by `sudo`, and runs ADR-0024's
-two lines. The password is held for one run and kept nowhere.
+its owner typed, becomes root there directly or by `sudo`, and runs the script
+ADR-0024's line runs. The password is held for one run and kept nowhere.
 
 A real asyncssh server on loopback plays the machine: it takes one account and
 password (by `password` or `keyboard-interactive`), records every password and
@@ -491,7 +491,7 @@ async def test_an_account_with_sudo_runs_the_two_lines_through_it_with_its_passw
 @pytest.mark.parametrize("sudo, play, says", [
     ("password", dict(sudo_password="another password"), "cannot use sudo with that password (sudo said: Sorry, try again.)"),
     ("denied", {}, "cannot use sudo with that password (sudo said: alice is not in the sudoers file.)"),
-    ("missing", {}, "alice is not root, and this machine has no sudo: give root's login, or add it with the two lines"),
+    ("missing", {}, "alice is not root, and this machine has no sudo: give root's login, or add it with a line run on it yourself"),
 ])
 async def test_a_failed_sudo_stops_before_curl_runs_saying_which(world, sudo, play, says):
     world.stand.play(sudo=sudo, **play)
@@ -519,7 +519,7 @@ async def test_a_wrong_password_says_so_and_nothing_runs(world):
 async def test_a_server_that_takes_only_keys_says_so_without_a_password_going_anywhere(world):
     world.playing.methods = ("publickey",)
     run, *_ = await world.enroll()
-    assert run.outcome == "127.0.0.1 takes no password for alice, only keys, so nervus cannot log in. Add it with the two lines (Advanced)."
+    assert run.outcome == "127.0.0.1 takes no password for alice, only keys, so nervus cannot log in. Add it with a line run on it yourself (Advanced)."
     assert world.playing.passwords == [] and world.playing.commands == []
 
 
@@ -901,7 +901,7 @@ async def test_a_run_that_is_still_going_is_kept_whatever_its_age(world):
     world.stand.gate.touch()
 
 
-# --- the two lines as nervus runs them, in real shells ------------------------------------------
+# --- the line's work as nervus does it, in real shells ------------------------------------------
 
 SHELLS = [shell for shell in ("sh", "dash", "bash") if shutil.which(shell)]
 ODD_URL = "https://nervus.example:8000/enroll/it's \"x\" $y `z` ; (w)"

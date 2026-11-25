@@ -3,6 +3,7 @@ sign-out, the protections every page carries, and the audit records of
 decision 6. Driven through Starlette's test client, which speaks HTTP to the
 application without a network."""
 
+import html
 import json
 import re
 import time
@@ -17,6 +18,7 @@ from nervus.ui import SECURITY_HEADERS, build_ui, form_token
 
 ORIGIN = "https://nervus.example:8443"
 COOKIE = "__Host-nervus-session"
+PIN = "sha256//47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
 
 
 @pytest.fixture
@@ -393,6 +395,7 @@ def test_the_log_is_read_off_the_thread_that_answers_requests(ui, db, audit, mon
 
 from nervus.auth import Token, Tokens  # noqa: E402
 from nervus.switches import load_switches  # noqa: E402
+from nervus.token_codes import TokenCodes  # noqa: E402
 from nervus.ui import Management  # noqa: E402
 
 FILE_TOKENS = {"file-value": Token(id="codex-anywhere", client="codex", project="unscoped",
@@ -407,7 +410,9 @@ def managed(db, audit, tmp_path):
     switches = tmp_path / "switches.yaml"
     switches.write_text("lockdown: false\ndisabled: []\n")
     tokens = Tokens(FILE_TOKENS, db.token)
-    client = TestClient(build_ui(db, audit, secure=True, management=Management(tokens, switches, HOSTS, NEVER_ISSUED)),
+    # ADR-0032 question 5: each token issued with a line that hands it over, pinned to nervus's key.
+    management = Management(tokens, switches, HOSTS, NEVER_ISSUED, codes=TokenCodes(db), pin=lambda: PIN)
+    client = TestClient(build_ui(db, audit, secure=True, management=management),
                         base_url=ORIGIN, follow_redirects=False)
     _sign_in(client, db)
     return client, tokens, switches
@@ -471,19 +476,111 @@ def test_lockdown_on_and_off(managed, audit):
     assert [(r["action"], r["target"]) for r in _ui_records(audit)][1:] == [("lock", "all"), ("unlock", "all")]
 
 
-def test_issuing_shows_the_value_once_and_it_works_at_once(managed, audit, db):
-    """ADR-0006 verification 9 and ADR-0014 verification 1: no file of
-    nervus's edited, no restart."""
+def test_issuing_shows_its_line_once_and_the_token_it_hands_over_works_at_once(managed, audit, db):
+    """ADR-0006 verification 9 and ADR-0014 verification 1: no file of nervus's edited, no restart.
+    Since ADR-0032 question 5, the page shows the line that hands the token over, never its value."""
     client, tokens, _ = managed
     response = _act(client, action="issue", id="laptop", client="claude-code", project="laptop",
                     hosts=["node-a", "hv"])
     assert response.status_code == 200, response.text
-    value = re.search(r"<pre><code>([A-Za-z0-9_-]{43})</code></pre>", response.text).group(1)
+    code = re.search(r"/laptop/([A-Za-z0-9_-]+)", html.unescape(response.text)).group(1)
+    assert not re.search(r"(?<![A-Za-z0-9_/-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])", response.text.replace(code, ""))
+    value, _ = TokenCodes(db).hand_over(code, "192.0.2.7")
     token = tokens.get(value)
     assert (token.id, sorted(token.hosts)) == ("laptop", ["hv", "node-a"])
     record, = _ui_records(audit, "issue_token")
-    assert (record["target"], record["hosts"], record["client"]) == ("laptop", ["hv", "node-a"], "claude-code")
-    assert value not in audit.path.read_text()
+    assert (record["target"], record["hosts"], record["client"], record["client_kind"]) == (
+        "laptop", ["hv", "node-a"], "claude-code", "claude-code")
+    assert value not in audit.path.read_text() and code not in audit.path.read_text()
+
+
+def _line_code(page_text):
+    return re.search(r"/laptop/([A-Za-z0-9_-]+)", html.unescape(page_text)).group(1)
+
+
+def test_the_issued_page_shows_nervus_s_key_first_then_the_two_lines_with_one_code(managed, db):
+    # ADR-0032 questions 4 and 11: one line for macOS and Linux, one for PowerShell, the same code in both.
+    client, _, _ = managed
+    page = html.unescape(_act(client, action="issue", id="laptop", client="codex", project="p", hosts=["node-a"]).text)
+    code = _line_code(page)
+    lines = re.findall(r'<pre class="lines"><code>(.*?)</code></pre>', page, re.S)
+    assert [line.strip() for line in lines] == [
+        PIN,
+        f"curl -fsSk --pinnedpubkey {PIN} https://nervus.example:8000/laptop/{code} | sh",
+        f"iex (curl.exe -fsSk --pinnedpubkey '{PIN}' 'https://nervus.example:8000/laptop/{code}/windows' | Out-String)"]
+    assert "Token issued: laptop, for Codex" in page
+    assert TokenCodes(db).find(code).client == "codex"
+
+
+def test_another_client_is_issued_by_its_name_and_needs_one(managed, db):
+    client, tokens, _ = managed
+    refused = _act(client, action="issue", id="laptop", client="other", project="p", hosts=["node-a"])
+    assert refused.status_code == 400 and "give the other client's name" in html.unescape(refused.text)
+    assert db.issued_tokens() == []
+    page = _act(client, action="issue", id="laptop", client="other", **{"client-name": "cursor"}, project="p",
+                hosts=["node-a"])
+    assert page.status_code == 200 and "for another client" in page.text
+    [issued] = db.issued_tokens()
+    assert issued.token.client == "cursor" and TokenCodes(db).find(_line_code(page.text)).client == "other"
+
+
+def test_a_client_not_on_the_list_is_refused_and_nothing_issued(managed, db):
+    client, _, _ = managed
+    refused = _act(client, action="issue", id="laptop", client="free text", project="p", hosts=["node-a"])
+    assert refused.status_code == 400 and "choose the client it is for" in refused.text and db.issued_tokens() == []
+
+
+def test_over_plain_http_a_token_is_issued_and_shown_once(db, audit, tmp_path):
+    # ADR-0032 question 13 a: no line can pin a key over plain HTTP, so the value is shown once, as before.
+    switches = tmp_path / "switches.yaml"
+    switches.write_text("lockdown: false\ndisabled: []\n")
+    tokens = Tokens(FILE_TOKENS, db.token)
+    management = Management(tokens, switches, HOSTS, NEVER_ISSUED, codes=TokenCodes(db), pin=lambda: None)
+    browser = TestClient(build_ui(db, audit, secure=True, management=management), base_url=ORIGIN,
+                         follow_redirects=False)
+    _sign_in(browser, db)
+    page = html.unescape(browser.get("/clients").text)
+    assert 'value="issue"' in page and "the next page shows the token's value once" in page
+    shown = _act(browser, action="issue", id="laptop", client="codex", project="p", hosts=["node-a"])
+    assert shown.status_code == 200 and "/laptop/" not in shown.text
+    value = re.search(r"<pre><code>([A-Za-z0-9_-]{43})</code></pre>", shown.text).group(1)
+    assert tokens.get(value).id == "laptop" and value not in audit.path.read_text()
+    record, = _ui_records(audit, "issue_token")
+    assert record["shown_once"] is True and TokenCodes(db).of_tokens() == {}
+
+
+def test_the_clients_page_says_where_each_token_stands_with_its_line(managed, db):
+    client, _, _ = managed
+    code = _line_code(_act(client, action="issue", id="laptop", client="codex", project="p", hosts=["node-a"]).text)
+    page = client.get("/clients").text
+    assert "waiting for its line, which works until" in page and 'value="new-line"' not in page
+    TokenCodes(db).hand_over(code, "192.0.2.77")
+    page = client.get("/clients").text
+    assert "handed over by its line" in page and "to 192.0.2.77" in page
+
+
+def test_a_line_expired_unused_can_be_made_again_and_the_new_one_hands_the_token_over(managed, db, audit):
+    client, tokens, _ = managed
+    _act(client, action="issue", id="laptop", client="codex", project="p", hosts=["node-a"])
+    with db.transaction() as raw:
+        raw.execute("UPDATE token_code SET expires_at = 0")
+    page = client.get("/clients").text
+    assert "its line expired unused" in page and 'value="new-line"' in page
+    again = _act(client, action="new-line", id="laptop")
+    assert again.status_code == 200 and "Token issued: laptop" in again.text
+    value, _ = TokenCodes(db).hand_over(_line_code(again.text), "192.0.2.7")
+    assert tokens.get(value).id == "laptop"
+    record, = _ui_records(audit, "token_code")
+    assert record["target"] == "laptop" and record["code_id"]
+    refused = _act(client, action="new-line", id="laptop")
+    assert refused.status_code == 400 and "handed over already" in refused.text
+
+
+def test_revoking_a_token_forgets_its_lines(managed, db):
+    client, _, _ = managed
+    code = _line_code(_act(client, action="issue", id="laptop", client="codex", project="p", hosts=["node-a"]).text)
+    assert _act(client, action="revoke", id="laptop", confirm="laptop").status_code == 303
+    assert TokenCodes(db).of_tokens() == {} and TokenCodes(db).find(code) is None
 
 
 @pytest.mark.parametrize("fields, why", [
@@ -495,7 +592,7 @@ def test_issuing_shows_the_value_once_and_it_works_at_once(managed, audit, db):
 ])
 def test_a_token_that_cannot_be_issued_is_refused_and_says_why(managed, db, fields, why):
     client, _, _ = managed
-    data = {"action": "issue", "id": "laptop", "client": "c", "project": "p", "hosts": ["node-a"], **fields}
+    data = {"action": "issue", "id": "laptop", "client": "codex", "project": "p", "hosts": ["node-a"], **fields}
     response = _act(client, **data)
     assert response.status_code == 400 and why in response.text
     assert db.issued_tokens() == []
@@ -509,7 +606,7 @@ def _refusals(audit, page):
     ({"action": "off", "id": "nobody"}, "nobody", "There is no token nobody."),
     ({"action": "on", "id": "codex-anywhere"}, "codex-anywhere", "codex-anywhere is not switched off."),
     ({"action": "revoke", "id": "codex-anywhere"}, "codex-anywhere", "was not issued here"),
-    ({"action": "issue", "id": "laptop", "client": "c", "project": "p", "hosts": ["elsewhere"]}, "laptop",
+    ({"action": "issue", "id": "laptop", "client": "codex", "project": "p", "hosts": ["elsewhere"]}, "laptop",
      "Not in the inventory: elsewhere."),
 ])
 def test_a_refused_form_on_the_clients_page_is_recorded_with_what_was_asked_and_why(managed, audit, fields, target, reason):
@@ -597,7 +694,7 @@ def test_without_its_audit_record_only_taking_access_away_stands(managed, audit,
     assert load_switches(switches).lockdown is True  # stands
     assert _act(client, action="lockdown-off").status_code == 500
     assert load_switches(switches).lockdown is True
-    response = _act(client, action="issue", id="laptop", client="c", project="p", hosts=["node-a"])
+    response = _act(client, action="issue", id="laptop", client="codex", project="p", hosts=["node-a"])
     assert response.status_code == 500 and "<pre><code>" not in response.text
     assert db.issued_tokens() == []
     assert "not audited" in capsys.readouterr().err
@@ -605,7 +702,7 @@ def test_without_its_audit_record_only_taking_access_away_stands(managed, audit,
 
 def test_the_clients_pages_carry_the_protections(managed):
     client, _, _ = managed
-    for response in (client.get("/clients"), _act(client, action="issue", id="laptop", client="c", project="p",
+    for response in (client.get("/clients"), _act(client, action="issue", id="laptop", client="codex", project="p",
                                                   hosts=["node-a"])):
         for name, value in SECURITY_HEADERS.items():
             assert response.headers.get(name) == value, name

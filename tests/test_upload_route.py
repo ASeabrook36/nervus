@@ -590,3 +590,25 @@ async def test_another_client_read_write_on_that_machine_still_uploads(limited):
     response = await _put(limited, token=MINE)
     assert response.status_code == 200, response.text
     assert len(limited.deliver.calls) == 1
+
+
+@curl
+def test_the_commands_for_a_client_set_up_by_the_line_send_and_ask_through_its_helper(served_tls, tmp_path):
+    # ADR-0032: the line's helper, its roots and its token, as test_download sets them up.
+    from test_download import _set_up_by_the_line
+
+    if shutil.which("shasum") is None:
+        pytest.skip("shasum is not installed")
+    served_tls.tokens[LONG] = served_tls.tokens[MINE]
+    env, name = _set_up_by_the_line(tmp_path, served_tls)
+    file = tmp_path / "f.bin"
+    file.write_bytes(BIG)
+    command = _as_run(served_tls, _documented("upload:laptop"), file).replace("<name>", name)
+    done = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    body = json.loads(done.stdout)
+    assert body["state"] == "delivered" and LONG not in command
+    status = subprocess.run(["bash", "-c", _as_run(served_tls, _documented("upload-status:laptop"), file)
+                             .replace("<name>", name)], env=env, capture_output=True, text=True, timeout=60)
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["upload_id"] == body["upload_id"]

@@ -3,7 +3,7 @@
 nervus fetches the machine's SSH host key and shows it (`host_key`). The owner
 checks it and types an admin account and its password. This file logs in to the
 machine as that account, becomes root there (it is root, or uses `sudo` with
-that password), and runs ADR-0024's two lines itself. From the moment the
+that password), and fetches and runs ADR-0024's script itself, as the line would. From the moment the
 script runs, everything is ADR-0024's: the same script, report, check and row.
 
 This is the only code that ever holds an owner's admin password.
@@ -110,7 +110,7 @@ _CURL_FIRST = ("if ! command -v curl >/dev/null 2>&1; then "
 
 
 def root_command(url: str, pin: str, shown: str) -> str:
-    """The two lines as nervus runs them as root: fetch the script to a file of
+    """The line's work as nervus does it as root: fetch the script to a file of
     its own that is removed on every way out, then run it with nothing on its
     standard input. Before them, on a machine that has no curl to fetch with,
     curl is installed (question 10). `shown` is the URL with `<code>` for the
@@ -402,7 +402,7 @@ class LoginEnrollment:
             methods = await self._methods(address, login)
             if "password" not in methods and "keyboard-interactive" not in methods:
                 raise LoginRefused(f"{address} takes no password for {login}, only keys, so nervus cannot log in. "
-                                   f"Add it with the two lines (Advanced).") from None
+                                   f"Add it with a line run on it yourself (Advanced).") from None
             if login == "root":
                 raise LoginRefused(f"{address} refused root with that password. Most machines refuse root's "
                                    f"password over SSH (PermitRootLogin); use an account that can use "
@@ -435,7 +435,7 @@ class LoginEnrollment:
         said = [line for line in str(found.stderr or "").splitlines() if line.strip()]
         if found.exit_status == 127 or (said and "not found" in said[-1]):
             raise LoginRefused(f"{login} is not root, and this machine has no sudo: give root's login, or add it "
-                               f"with the two lines from a root shell")
+                               f"with a line run on it yourself, from a root shell")
         raise LoginRefused(scrub(f"{login} cannot use sudo with that password (sudo said: "
                                  f"{said[-1][:LINE_CHARS] if said else 'nothing'})"))
 

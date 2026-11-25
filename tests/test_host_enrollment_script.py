@@ -11,6 +11,7 @@ under its folder, and its su fails as bwrap does there until nervus's profile
 is loaded. Procedure 036 tried the
 read-only shell itself on real machines; the trial in step 6 runs this."""
 
+import re
 import shlex
 import shutil
 import subprocess
@@ -39,7 +40,8 @@ STANDINS = {
     # Each account is a file under $W/users holding its uid, and its groups, where it has others, under
     # $W/groups (ADR-0031: the script names two accounts, and says an existing one's groups).
     # Its own group's id is its uid, unless $W/gids says another; a group's other members are in $W/members.
-    "id": ('case "$1" in -u) if [ -n "${2:-}" ]; then [ -e "$W/users/$2" ] && cat "$W/users/$2" || exit 1; '
+    # Asked to, it also keeps what it is given on its standard input, as any command in the body could read it.
+    "id": ('[ -n "${READ_STDIN:-}" ] && cat >> "$W/stdin"; case "$1" in -u) if [ -n "${2:-}" ]; then [ -e "$W/users/$2" ] && cat "$W/users/$2" || exit 1; '
            'else echo "${AS_UID:-0}"; fi; exit;; -g) [ -e "$W/users/$2" ] || exit 1; '
            'cat "$W/gids/$2" 2>/dev/null || cat "$W/users/$2"; exit;; -Gn) [ -e "$W/users/$2" ] || exit 1; '
            'cat "$W/groups/$2" 2>/dev/null || echo "$2"; exit;; esac; exit 1'),
@@ -166,14 +168,26 @@ class Machine:
         """The home of the account the level is about: the read-only one at read-only, else the read-write one."""
         return self.home_of(RO if self.level == "read-only" else RW)
 
-    def run(self, level="read-only", shell="sh", nervus_machine=ELSEWHERE, script_args=None, **env):
-        """The script for `level`, run here; nervus runs on `nervus_machine`."""
+    def script(self, level="read-only", nervus_machine=ELSEWHERE, script_args=None) -> str:
+        """The script for `level`, as nervus writes it; nervus runs on `nervus_machine`."""
+        own = own_hash(URL.rsplit("/", 1)[1], nervus_machine) if level == "full" else None
+        return enroll_script(name="web", level=level, origin="https://192.0.2.1:8000", url=URL,
+                             pin=PIN, key=KEY, own_hash=own, **(script_args or {}))
+
+    def run(self, level="read-only", shell="sh", nervus_machine=ELSEWHERE, script_args=None, piped=False,
+            text=None, **env):
+        """The script for `level`, run here; nervus runs on `nervus_machine`. `piped`: handed to the shell
+        on its standard input, as the page's line does (`curl … | sudo sh`, ADR-0032 question 7), not
+        from a file. `text`: these bytes instead of the whole script, a download cut short."""
         self.level = level
         script = self.w / "nervus-enroll.sh"
-        own = own_hash(URL.rsplit("/", 1)[1], nervus_machine) if level == "full" else None
-        script.write_text(enroll_script(name="web", level=level, origin="https://192.0.2.1:8000", url=URL,
-                                        pin=PIN, key=KEY, own_hash=own, **(script_args or {})))
-        base = {"PATH": str(self.bin), "W": str(self.w), "NERVUS_ENROLL_ROOT": str(self.root), "LANG": "C"}
+        script.write_text(self.script(level, nervus_machine, script_args) if text is None else text)
+        base = {"PATH": str(self.bin), "W": str(self.w), "NERVUS_ENROLL_ROOT": str(self.root), "LANG": "C",
+                "TMPDIR": str(self.w / "tmp")}
+        (self.w / "tmp").mkdir(exist_ok=True)
+        if piped:
+            return subprocess.run([shutil.which(shell)], input=script.read_text(), capture_output=True, text=True,
+                                  env={**base, **env}, timeout=30)
         return subprocess.run([shutil.which(shell), str(script)], capture_output=True, text=True,
                               env={**base, **env}, timeout=30)
 
@@ -489,7 +503,7 @@ def test_its_opening_comment_says_what_this_level_does_and_nothing_else(level, s
 def test_its_values_reach_the_shell_exactly(tmp_path):
     url = "https://n:8000/enroll/a'b\"$(touch x)`id`"
     script = enroll_script(name="web", level="standard", origin="o", url=url, pin=PIN, key=KEY)
-    assignments = script.split("\nset -u\n")[1].split("root=")[0]
+    assignments = script.split("\nset -u\n")[1].split("nervus_enroll() {")[0]
     out = subprocess.run(["sh", "-c", assignments + 'printf "%s\\n" "$url" "$pin" "$key" "$level"'],
                          capture_output=True, text=True, cwd=tmp_path).stdout
     assert out.splitlines() == [url, PIN, KEY, "standard"] and not (tmp_path / "x").exists()
@@ -688,3 +702,93 @@ def test_read_only_s_opening_comment_names_the_three_and_when():
                   BWRAP_COPY_PATH, APPARMOR_PROFILE_PATH, APT_HOOK_PATH, f"only {RO} may run",
                   "and its apt hook first"):
         assert words in flat, words
+
+
+# --- one line, `curl … | sudo sh`, and a download cut partway (ADR-0032 question 7) ------------
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("level", ["read-only", "standard", "full"])
+def test_piped_to_the_shell_as_the_line_does_it_enrolls_as_from_a_file(tmp_path, shell, level):
+    piped, filed = Machine(tmp_path / "piped"), Machine(tmp_path / "filed")
+    done = piped.run(level, shell=shell, piped=True)
+    assert done.returncode == 0, done.stderr
+    same = lambda m, lines: [re.sub(r"[^\s'\"@]*/(?:tmp|nervus-enroll)\.\w+", "<temporary>", line.replace(str(m.w), "<machine>"))  # noqa: E731
+                             for line in lines]
+    assert same(piped, done.stdout.splitlines()) == same(filed, filed.run(level, shell=shell).stdout.splitlines())
+    assert same(piped, piped.log) == same(filed, filed.log)
+    assert piped.keys == filed.keys and piped.readonly_keys == filed.readonly_keys
+
+
+def test_the_body_reads_nothing_from_the_pipe_it_came_down(machine):
+    # Whatever follows the script in the pipe is never read by a command in it: the call gives it /dev/null.
+    # A command that reads its standard input (the `id` stand-in, asked to) is given nothing.
+    text = machine.script("standard") + "MARKER-AFTER-THE-SCRIPT\n"
+    done = machine.run("standard", piped=True, text=text, READ_STDIN="1")
+    assert "nervus: web is enrolled" in done.stdout
+    assert (machine.w / "stdin").exists() and "MARKER" not in (machine.w / "stdin").read_text()
+    assert machine.script("standard").endswith("\nnervus_enroll </dev/null\n}\n")
+
+
+def test_the_check_reads_the_pipe_once_the_call_has_no_dev_null(tmp_path):
+    # The test above sees a body that reads the pipe: the same script with its call's </dev/null taken off.
+    machine = Machine(tmp_path)
+    text = machine.script("standard").replace("nervus_enroll </dev/null\n}", "nervus_enroll\n}") + "MARKER\n"
+    machine.run("standard", piped=True, text=text, READ_STDIN="1")
+    assert "MARKER" in (machine.w / "stdin").read_text()
+
+
+def _snapshot(folder: Path) -> dict:
+    return {str(p.relative_to(folder)): (p.read_bytes() if p.is_file() and not p.is_symlink() else None)
+            for p in sorted(folder.rglob("*"))}
+
+
+def _cuts(script: str) -> list[int]:
+    """Where to cut the script: every byte of every line outside its body's function (its values, the group's
+    opening, and the lines that call it), where a cut in the middle of a word would leave a command of its own
+    if the line stood alone; every point of its last 200 bytes; just before and after every fifth line ending;
+    around each here-document's end; and every 211 bytes besides. Inside the group every cut is the same, an
+    unfinished group. Up to the group's closing brace: a script that has it has arrived whole."""
+    last = script.rindex("}")
+    body = script.index("nervus_enroll() {")
+    top = script.index("\n{\n")
+    points = set(range(top, body + len("nervus_enroll() {") + 1))
+    # From the body's own closing brace, the last before its call, to the group's.
+    points.update(range(script.rindex("\n}\n", 0, script.rindex("nervus_enroll </dev/null")), last))
+    points.update(range(max(0, len(script) - 200), last))
+    for n, i in enumerate(i for i, c in enumerate(script) if c == "\n"):
+        if n % 5 == 0:
+            points.update((i, i + 1))
+    for end in ("NERVUS_READONLY_SHELL", "NERVUS_APPARMOR", "NERVUS_APT_HOOK", "nervus_enroll() {", "}\n"):
+        at = script.find(end)
+        while at >= 0:
+            points.update(range(at - 2, at + len(end) + 2))
+            at = script.find(end, at + 1)
+    points.update(range(0, len(script), 211))
+    return sorted(p for p in points if 0 <= p < last)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("level", ["read-only", "full"])
+def test_a_download_cut_partway_runs_nothing_and_changes_nothing(machine, shell, level):
+    """ADR-0032 verification 4: wherever the download stops, the shell is given only that much, as `curl | sh`
+    gives it, and nothing of it runs: no stand-in is called (each writes the log), no file is made or changed
+    anywhere under the machine's folder, temporary files included, and nothing is said."""
+    script = machine.script(level)
+    (machine.w / "tmp").mkdir()
+    before = _snapshot(machine.w)
+    temporary = sorted(Path("/tmp").glob("nervus-enroll.*"))  # the script makes its own in /tmp itself
+    cuts = _cuts(script)
+    assert len(cuts) > 600
+    for at in cuts:
+        done = machine.run(level, shell=shell, piped=True, text=script[:at])
+        assert machine.log == [], (at, script[max(0, at - 60):at])
+        # Nothing said by the script itself, and no command looked for: the shell's syntax error, which may quote
+        # the line it stopped in, is all there is. A part of a word run as a command would be "not found" here,
+        # PATH holding only the stand-ins; a builtin run so, such as set, would print.
+        assert done.stdout == "" and "not found" not in done.stderr, (at, done.stdout, done.stderr)
+        assert not any(line.startswith("nervus enrollment:") for line in done.stderr.splitlines()), (at, done.stderr)
+    (machine.w / "nervus-enroll.sh").unlink()
+    assert _snapshot(machine.w) == before
+    assert sorted(Path("/tmp").glob("nervus-enroll.*")) == temporary
+    # And the whole of it, which does run.
+    assert machine.run(level, shell=shell, piped=True).returncode == 0 and machine.log

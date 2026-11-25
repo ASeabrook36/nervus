@@ -71,7 +71,7 @@ def test_what_the_preview_supports_is_what_adr_0023_decided():
     assert rows[separate] == ("1", "**yes, recommended**")
     assert rows[everyday] == ("2", "yes")
     assert rows[vm][0] == "3" and rows[vm][1].startswith("yes; declare it as tier 3")
-    for name in ("macOS natively", "Windows (WSL2)", "a container image"):
+    for name in ("macOS natively", "Windows", "a container image"):
         assert not rows[name][1].startswith("yes"), name
 
 
@@ -592,7 +592,7 @@ def test_the_clients_guide_says_where_a_terminal_s_token_variable_is_set_and_its
 
 
 def test_the_readme_says_nervus_upgrades_and_how_far_that_is_shown():
-    _says(README.read_text(), "upgrading to a newer release with one command",
+    _says(README.read_text(), "upgrading to a newer release with one line",  # the release page's (ADR-0032)
           "goes back by itself if the new release does not come up",
           "ADR-0029; shown by tests and on throwaway machines")
 
@@ -621,3 +621,25 @@ def test_ubuntu_24_04_and_26_04_are_said_to_be_tried_for_nervus_and_for_read_onl
     assert "not yet tried on Ubuntu 24.04" not in readme and "not yet on later Ubuntu releases" not in readme
     assert "Read-only is tried on Debian 13, Ubuntu 24.04 and Ubuntu 26.04, not yet on Ubuntu's other releases." \
         in readme
+
+
+def test_the_guide_s_release_lines_are_the_ones_the_release_page_gives():
+    # ADR-0032 question 2: what tools/release-archive writes on the release page, for install and upgrade.
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("release_archive", str(REPO / "tools" / "release-archive"))
+    spec = importlib.util.spec_from_loader("release_archive", loader)
+    tool = importlib.util.module_from_spec(spec)
+    loader.exec_module(tool)
+    page = tool.page("https://example.test/download", "ab" * 32, "9.8.7", [])
+    given = re.findall(r"```bash\n(curl .*?)\n```", page)
+    guide = (REPO / "docs" / "install.md").read_text()
+
+    def block(name):
+        found = re.search(rf"<!-- install:{name} -->\n *```bash\n *(.*?)\n *```", guide, re.S)
+        assert found, f"docs/install.md has no install:{name} block"
+        return (found.group(1).replace("<the release's download folder>", "https://example.test/download")
+                .replace("<its SHA-256>", "ab" * 32).replace("<number>", "9.8.7"))
+    assert block("release") == given[0] and given[0].endswith("&& sudo ./install.sh")
+    assert block("release-upgrade") in given and block("release-upgrade").endswith("sudo ./install.sh --upgrade")

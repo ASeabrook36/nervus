@@ -167,10 +167,11 @@ def test_main_builds_and_runs_server_on_valid_config(tmp_path, monkeypatch):
     fake_server = object()
 
     def fake_build_server(*, settings, tokens, audit, proxmox=None, exporter=None, uploader=None, vms=None,
-                          enrolled=None, enrollment=None, machine_accounts=None):
+                          enrolled=None, enrollment=None, machine_accounts=None, laptop=None):
         calls["vms"] = vms
         calls["enrolled"] = enrolled
         calls["enrollment"] = enrollment
+        calls["laptop"] = laptop
         calls["settings"] = settings
         calls["tokens"] = tokens
         calls["proxmox"] = proxmox
@@ -236,7 +237,7 @@ def test_main_builds_and_runs_server_on_valid_config(tmp_path, monkeypatch):
     assert calls["vms"] is None
     # Machines enrolled from the UI, in the same database (ADR-0024 decision 3).
     assert calls["enrolled"].database.path == Path(os.environ["NERVUS_DATABASE"])
-    # Enrolled with two lines on the machine (ADR-0024 step 3): into that
+    # Enrolled with the line run on the machine (ADR-0024 step 3): into that
     # store, never under a hosts.yaml name; over plain HTTP, refused.
     enrollment = calls["enrollment"]
     assert enrollment.store is calls["enrolled"] and enrollment.codes.database.path == enrollment.store.database.path
@@ -251,6 +252,11 @@ def test_main_builds_and_runs_server_on_valid_config(tmp_path, monkeypatch):
     login = machines.login
     assert login is not None and login.codes is machines.codes and login.audit.path == enrollment.audit.path
     assert login.port == calls["settings"].ssh_port == 2222 and login.locked() == enrollment.locked()
+    # A laptop set up by one line (ADR-0032): the route hands over tokens by the same codes the Clients page makes,
+    # in the same database, pinned as enrollment is, and refused in the same lockdown; over plain HTTP, refused.
+    laptop = calls["laptop"]
+    assert laptop is not None and laptop.pin() is None and laptop.locked() == enrollment.locked()
+    assert laptop.codes.database.path == Path(os.environ["NERVUS_DATABASE"])
 
 
 def _write_proxmox(tmp_path, ca_file, mode=0o600):
@@ -283,7 +289,7 @@ def test_main_passes_a_proxmox_client_when_configured(tmp_path, monkeypatch, pki
     calls = {}
 
     def fake_build_server(*, settings, tokens, audit, proxmox=None, exporter=None, uploader=None, vms=None,
-                          enrolled=None, enrollment=None, machine_accounts=None):
+                          enrolled=None, enrollment=None, machine_accounts=None, laptop=None):
         calls["proxmox"] = proxmox
         calls["exporter"] = exporter
         calls["vms"] = vms
@@ -397,6 +403,7 @@ def test_a_connection_that_never_finishes_does_not_hold_up_a_stop(tmp_path):
 # Flag handling in-process; serving against a real nervus process, as the stop
 # test above does. Certificates are made at run time in tmp_path (rule 7).
 
+import base64
 import datetime
 import hashlib
 import http.client
@@ -410,10 +417,11 @@ import sys
 import time
 
 from nervus.certs import CertificateAuthority
-from nervus.tls import ServingCertificate, certificate_fingerprint, fingerprint, generate_self_signed
+from nervus.tls import ServingCertificate, certificate_fingerprint, fingerprint, generate_self_signed, key_pin
 
 FINGERPRINT = re.compile(r"public key SHA-256 ((?:[0-9A-F]{2}:){31}[0-9A-F]{2})")
 ROOT_FINGERPRINT = re.compile(r"root certificate SHA-256 ((?:[0-9A-F]{2}:){31}[0-9A-F]{2})")
+PIN = re.compile(r"public key pin (sha256//[A-Za-z0-9+/]{43}=)")
 TOKEN = "t" * 43
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
     "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
@@ -605,6 +613,24 @@ def test_tls_fingerprint_prints_the_roots_beside_the_keys(secrets, capsys):
         certificate_fingerprint((secrets / "tls-root.crt").read_bytes())]
     assert FINGERPRINT.findall(out) == [fingerprint((secrets / "tls.crt").read_bytes())]
     assert f"{secrets / 'tls-root.crt'}: root certificate SHA-256" in out
+
+
+def test_tls_fingerprint_prints_the_key_as_the_lines_nervus_gives_pin_it(secrets, capsys):
+    """ADR-0032 question 4: the key the Machines and Clients pages show above each line they give,
+    in the form the line carries it, for the person to check before running one. The key of the
+    certificate nervus serves, which a machine's line pins (key_pin), and the one whose SHA-256 the
+    line before it prints."""
+    from cryptography import x509
+
+    _init(secrets)
+    capsys.readouterr()
+    assert main(["tls-fingerprint", *_tls_args(secrets)]) == 0
+    out = capsys.readouterr().out
+    served = x509.load_pem_x509_certificates((secrets / "tls.crt").read_bytes())[0].public_key()
+    assert PIN.findall(out) == [key_pin(served)]
+    pinned = base64.b64decode(PIN.findall(out)[0].removeprefix("sha256//"))
+    assert pinned.hex(":").upper() == FINGERPRINT.findall(out)[0]
+    assert f"{secrets / 'tls.key'}: public key pin sha256//" in out
 
 
 def test_tls_fingerprint_of_an_install_without_a_root_prints_the_key_alone(secrets, capsys):

@@ -1,7 +1,10 @@
-"""Enrolling a machine with two lines run on it as root (ADR-0024 decision 2).
+"""Enrolling a machine with one line run on it as root (ADR-0024 decision 2,
+as ADR-0032 question 7 made its two lines one).
 
-The owner fetches the enrollment script from nervus with a one-time code,
-over HTTPS pinned to nervus's own key, reads it, and runs it. The script
+The owner's line fetches the enrollment script from nervus with a one-time
+code, over HTTPS pinned to nervus's own key, and runs it: `curl … | sudo sh`,
+or `| sh` in a root shell. The Machines page shows the script's text beneath
+the line, for anyone who wants to read it first. The script
 makes nervus's accounts and their restrictions for the level the owner chose,
 gives each exactly nervus's line, and sends the machine's host keys and
 machine id back to nervus with the same code.
@@ -19,8 +22,17 @@ This file holds the script, written for one code, and the route that serves
 it and takes the report back.
 
 What the script holds to:
+- **A download cut partway runs nothing and changes nothing** (ADR-0032
+  question 7). Below its opening comment, all of it, its values, its body and
+  the call, is one group, `{` to the last line's `}`: a shell given part of it
+  finds the group unfinished, which is a syntax error, and runs none of it. A
+  shell runs a part of a last line that arrived as a command of its own, so
+  nothing is left outside the group but comments: a cut in the middle of a word
+  above the body would otherwise run that much of the word. Inside, the body is
+  one function, called last, given no standard input, so nothing in it can read
+  what follows in the pipe.
 - **It does only what its opening comment says**, which names this
-  machine's level and nothing else, for the owner reading it with `less`.
+  machine's level and nothing else, for the owner reading it on the page.
 - **nervus's key goes in last.** A script that stops partway leaves an
   account nervus cannot log in to, never one with more than the level: the
   read-only account's line after its shell is tried, the read-write one's last,
@@ -93,6 +105,7 @@ import asyncio
 import hashlib
 import re
 import shlex
+import urllib.parse
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -163,7 +176,9 @@ _HEAD = """#!/bin/sh
 # nervus: {doing}.
 #
 # nervus, at {origin}, wrote this for the machine you added in its web page.
-# Run it as root. It does exactly this, and nothing else:
+# Run it as root. Nothing runs until all of it has arrived: below this comment,
+# everything is one group, {{ to the last line's }}, and the body one function in it.
+# It does exactly this, and nothing else:
 #   1. makes the account{plural} {accounts}, where missing, with no password, and installs
 #      tmux for nervus's background jobs, if it is missing. An account already here is
 #      used as it is, its groups said, and its SSH keys replaced by nervus's line alone;
@@ -176,6 +191,7 @@ _HEAD = """#!/bin/sh
 # it installed stay.
 # Once enrolled, nervus's page shows the commands that take all of this off again.
 
+{{
 set -u
 name={q_name} level={q_level} kind={q_kind}
 rw={q_rw} ro={q_ro} off={q_off}
@@ -186,7 +202,10 @@ plainkey={q_plainkey}
 own={q_own}
 """
 
-_BODY = r"""root=${NERVUS_ENROLL_ROOT:-}  # set only by nervus's own tests
+# The body is one function, called last in the group the script is (ADR-0032 question 7). Not indented: its
+# here-documents end at the start of a line.
+_BODY = r"""nervus_enroll() {
+root=${NERVUS_ENROLL_ROOT:-}  # set only by nervus's own tests
 umask 022
 # Once this has begun to change the machine, a stop puts back everything it changed, as nervus not adding
 # the machine does (ADR-0031 question 12).
@@ -194,7 +213,7 @@ changing=
 fail() { echo "nervus enrollment: $*" >&2; [ -z "$changing" ] || undo; exit 1; }
 say() { echo "nervus enrollment: $*"; }
 
-[ "$(id -u)" = 0 ] || fail "run this as root: in a root shell, or with sudo sh nervus-enroll.sh"
+[ "$(id -u)" = 0 ] || fail "run this as root: end nervus's line with | sudo sh, or with | sh in a root shell"
 [ -x "$root/usr/sbin/sshd" ] || fail "this machine has no SSH server: install openssh-server, then run this again"
 command -v curl >/dev/null 2>&1 || fail "curl is not installed"
 
@@ -236,7 +255,7 @@ want() {
 # fetch carries a spent code: it stops here, before changing anything.
 first=$(curl -sSk --pinnedpubkey "$pin" -o /dev/null -w '%{http_code}' "$url") \
   || fail "could not reach nervus at $url. Nothing here was changed."
-[ "$first" = 200 ] || fail "this script's code is used or expired (nervus answered $first): make new lines in nervus's page. Nothing here was changed."
+[ "$first" = 200 ] || fail "this script's code is used or expired (nervus answered $first): make a new line in nervus's page. Nothing here was changed."
 
 # The accounts nervus's page named (ADR-0031 question 8): only an ordinary
 # account, never root or one of this machine's own system accounts: below
@@ -636,6 +655,12 @@ for u in $off; do
   esac
 done
 [ -z "$left" ] || fail "nervus added this machine, but could not take its line or sudoers file off$left: take them off by hand"
+}
+
+# Only now, with every line of it here, does anything run; with nothing on its standard input, which a pipe
+# would otherwise be.
+nervus_enroll </dev/null
+}
 """
 
 
@@ -778,18 +803,22 @@ def remove_readonly_commands(readonly: str, made: Iterable[str] = (), keys: Iter
 
 
 def enroll_url(host: str, port: int, code: str) -> str:
-    """Where a machine fetches its script: nervus's MCP port at `host`."""
+    """Where a machine fetches its script: nervus's MCP port at `host`. Port 443
+    is left out, as curl leaves it out of what it asks for, so the script's own
+    `url` is the line's."""
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # an IPv6 address
-    return f"https://{host}:{port}/enroll/{code}"
+    return f"https://{host}{'' if port == 443 else f':{port}'}/enroll/{code}"
 
 
-def enroll_lines(url: str, pin: str) -> str:
-    """The two lines the owner runs as root on the machine (decision 2a): the
-    first fetches the script, checked against nervus's key; the second shows
-    it, then runs it."""
-    return (f"curl -fsSk --pinnedpubkey {shlex.quote(pin)} -o nervus-enroll.sh {shlex.quote(url)}\n"
-            "less nervus-enroll.sh && sh nervus-enroll.sh\n")
+def enroll_line(url: str, pin: str, *, sudo: bool = True) -> str:
+    """The line the owner runs on the machine (ADR-0032 question 7, a): it
+    fetches the script, checked against nervus's key, and runs it as root,
+    `| sudo sh`, or `| sh` in a root shell. `-k` only stops curl asking the
+    machine's own certificate authorities, which do not know nervus's; the pin
+    is still checked. `-f`: an answer that is not the script (a used code's,
+    say) is never handed to the shell."""
+    return f"curl -fsSk --pinnedpubkey {shlex.quote(pin)} {shlex.quote(url)} | {'sudo sh' if sudo else 'sh'}\n"
 
 
 # --- The route: GET /enroll/<code> serves the script; POST takes the report --
@@ -815,11 +844,11 @@ HTTPS_ONLY = ("this nervus serves plain HTTP, and enrollment needs HTTPS: the ma
               "before it runs anything nervus sends. Serve MCP over HTTPS (docs/install.md), then make a new code.")
 UNKNOWN = "this enrollment code is unknown, used or expired; make a new one in nervus's page"
 OLDER_CODE = ("this enrollment code was made by a release of nervus before this one, which kept no accounts for "
-              "its script; make new lines in nervus's page")
+              "its script; make a new line in nervus's page")
 NOT_ITS_OWN = ("the key that answered nervus's login at {address} is not one of this machine's own "
                "host keys, so something between nervus and the machine may have answered instead and "
                "seen {login}'s password. nervus did not add the machine. Change that password, then add "
-               "the machine with the two lines.")
+               "the machine with the line run on it yourself.")
 
 
 class Refused(Exception):
@@ -908,23 +937,52 @@ class HostEnrollment:
                                                  "address": code.address, "level": code.level})
         return code, run_id
 
-    def script(self, value: str, url: str, origin: str, client: str) -> str:
-        code, run_id = self._open(value, "fetch", client)
+    def _write(self, code, value: str, url: str, origin: str) -> str:
+        """The script for this code, or Refused (a code from a release before
+        this one; full, where nervus cannot read its own machine id)."""
         made = self.codes.accounts_of(code.id)
         if made is None:
-            self.audit.record_result(run_id, TOOL, {"failure_message": OLDER_CODE})
             raise Refused(409, OLDER_CODE)
         own = None
         if code.level == "full":
             if self.own_machine_id is None:
-                self.audit.record_result(run_id, TOOL, {"failure_message": FULL_UNKNOWN})
                 raise Refused(403, FULL_UNKNOWN)
             own = own_hash(value, self.own_machine_id)
-        text = enroll_script(name=code.name, level=code.level, origin=origin, url=url, pin=self.pin(),
+        return enroll_script(name=code.name, level=code.level, origin=origin, url=url, pin=self.pin(),
                              key=self.key(), own_hash=own, readwrite=made.readwrite, readonly=made.readonly,
                              off=made.off, kind=made.kind, nervus_key=self.nervus_key())
+
+    def script(self, value: str, url: str, origin: str, client: str) -> str:
+        code, run_id = self._open(value, "fetch", client)
+        try:
+            text = self._write(code, value, url, origin)
+        except Refused as exc:
+            self.audit.record_result(run_id, TOOL, {"failure_message": exc.message})
+            raise
         self.audit.record_result(run_id, TOOL, {"served": True})
         return text
+
+    def shown(self, value: str, url: str) -> tuple[str | None, str]:
+        """The script a code's line will fetch, as the Machines page shows it
+        beneath the line (ADR-0032 question 7), and "": the same text the route
+        serves at `url`, the code's. The page that made the code wrote its
+        record, so showing it records nothing more. Where the route would
+        refuse the line, no script and why, in words for the page: lockdown,
+        plain HTTP, a full code where nervus cannot read its own machine id."""
+        if self.pin() is None:
+            return None, HTTPS_ONLY
+        if self.locked():
+            return None, "nervus is locked down, so it refuses this line until lockdown is lifted, within its 15 minutes"
+        code = self.codes.find(value)
+        if code is None:
+            return None, UNKNOWN
+        parts = urllib.parse.urlsplit(url)
+        try:
+            return self._write(code, value, url, f"{parts.scheme}://{parts.netloc}"), ""
+        except Refused as exc:
+            return None, exc.message
+        except (OSError, ValueError) as exc:
+            return None, f"nervus could not write the script ({type(exc).__name__})"
 
     async def report(self, value: str, body: str, client: str) -> str:
         code, run_id = self._open(value, "report", client)

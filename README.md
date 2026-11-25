@@ -22,9 +22,11 @@ runs every day on its author's own machines. Expect rough edges, and please say 
 | `export` | save a file from a machine or a VM onto the client's own computer, checked by SHA-256 |
 | `proxmox` | the Proxmox API, if you have a Proxmox host: make, use and destroy VMs |
 
-**Nothing is installed on the machines nervus reaches.** It logs in over SSH as an account it was
-given. That is a choice, argued in ADR-0005: every connection also lands in the machine's own SSH
-log, a second record nervus cannot edit.
+**Nothing of nervus's runs on the machines it reaches.** It logs in over SSH, as accounts it makes
+there when a machine is added, with what the machine's level needs (`tmux` for background jobs,
+`bubblewrap` to keep a read-only account read-only, `sudo` at full). No program of its own stays
+running there. That is a choice, argued in ADR-0005: every connection also lands in the machine's
+own SSH log, a second record nervus cannot edit.
 
 **The boundary is the machine's, not a filter in nervus.** nervus does not inspect commands
 (ADR-0001 s5); what a client can do is what the account it reaches can do. A web UI lets you
@@ -87,15 +89,18 @@ sequenceDiagram
 one command (ADR-0027; shown by tests and on throwaway machines), the web UI with sign-in and first-run setup (ADR-0015), the off
 switch, client tokens issued from the UI, downloads and uploads (ADR-0016, ADR-0020), VMs made from a template on Proxmox and
 used by their id, enrolled by nervus on the first call (ADR-0022), machines added from the web UI
-by an admin login given once, or with two lines run on them, at the level their owner chooses:
-read-only, standard or full (ADR-0024, ADR-0026), HTTPS that Claude Code and Codex trust: each client machine saves nervus's root
-once, with `tools/nervus-trust`, after comparing one fingerprint (ADR-0021), and upgrading to a newer release with one command, which
-keeps everything of yours and goes back by itself if the new release does not come up (ADR-0029; shown by tests and on throwaway
-machines).
+by an admin login given once, or with one line run on them, at the level their owner chooses:
+read-only, standard or full (ADR-0024, ADR-0026), a client read-only on a machine other clients may change, chosen
+for each machine as its token is issued (ADR-0031), nervus installed by one line from a release, checked by its SHA-256, with
+nothing cloned (ADR-0032), each client's computer, macOS, Linux or Windows, set up by one line from nervus's web UI, which saves the
+root Claude Code and Codex trust nervus by (ADR-0021) and fetches the client's token by a one-time code, the token never shown and
+kept where only you can read it (ADR-0032), and upgrading to a newer release with one line, which keeps everything of yours and goes
+back by itself if the new release does not come up (ADR-0029; shown by tests and on throwaway machines).
 
 **Not yet:**
-- **No container image.** One script installs it on its machine; the rest happens in its web UI:
-  `docs/install.md`.
+- **No container image.** One line installs it on a Linux machine; the rest happens in its web UI:
+  `docs/install.md`. So nervus itself does not yet run on a Mac or on Windows, except in a Linux VM
+  (below); the clients on them do.
 - **Cursor is not yet tested** over HTTPS with nervus's root, and the connector that would remove
   even the one-file step for every client is later work (ADR-0008).
 - **The machines nervus reaches must be Linux.** A Mac is not covered yet. Read-only is tried on
@@ -151,43 +156,59 @@ The ordinary case, not the worst one: your agent reads something someone else wr
 pull request, a web page, a package's README) and that text tells it to run a command through
 nervus. Agents follow such text more often than anyone would like. nervus does not filter commands,
 since a filter is easy to talk around (ADR-0001 s5, ADR-0007 decision 1). What bounds the damage is
-where the agent's token reaches, and at what level each machine was added:
+where the agent's token reaches, and at what level: the machine's own level, and, where clients may
+change the machine, whether you made the token read-only or read-write there (ADR-0031):
 
-- On a **read-only** machine it can read whatever nervus's account there can read, and run
+- On a **read-only** machine, or one its token is read-only on, it can read whatever nervus's account there can read, and run
   programs, but the machine's own kernel refuses any change outside nervus's folder `~/.nervus`,
   whatever nervus is told. Read-only stops changes, not reading: what that account can read, the
   agent can send anywhere the machine can reach.
-- On a **standard** machine it can change what nervus's account owns there, and nothing that needs
-  root.
-- On a **full** machine it can do anything you could as root, wiping the machine included.
+- On a **standard** machine, read-write, it can change what nervus's account owns there, and
+  nothing that needs root.
+- On a **full** machine, read-write, it can do anything you could as root, wiping the machine included.
 - Machines its token does not name are out of its reach.
 
 When it happens, switch that client off in the web UI at once; the audit log shows what it ran,
 where and when, and each machine's own SSH log holds a second record nervus cannot edit. So give each
 client the fewest machines at the lowest level its work needs: read-only unless it must change
-something.
+something. A machine can be standard or full for the clients that work on it and still read-only
+for the rest: each token is read-only or read-write on each machine.
 
 ## Getting started
+
+**On a separate box on your network: the way to run it.** A small always-on machine of its own: a
+container or a VM on a hypervisor host such as Proxmox, a mini PC, a single-board computer. Linux
+with systemd. Paste the install line from the **[latest release](../../releases/latest)** there:
+it downloads the release, checks its SHA-256, and runs the installer, which asks which address your
+clients will use, shows its plan, and waits for `yes`. Nothing on your everyday computer can get
+into nervus there (tier 1, `docs/install.md`, "Where nervus may run").
+
+**Try it on this computer: less safe.** On your everyday Linux computer, the same line installs
+nervus under an account of its own, so your programs cannot read its files without admin rights,
+but the operating system is then the only wall (tier 2). On a Mac or on Windows, nervus itself
+waits for the container image (ADR-0005); until then run it on a separate box, or, on a Mac, in a
+Linux VM the Mac hosts, which a program running as you can open (tier 3). The clients on a Mac or
+Windows are set up as on any computer, below.
 
 ```mermaid
 %%{init: {"flowchart": {"diagramPadding": 200}}}%%
 flowchart LR
-    s1["Install it:<br/>one command"] --> s2["Sign in,<br/>say where<br/>it runs"]
+    s1["Install it:<br/>one line from<br/>a release"] --> s2["Sign in,<br/>say where<br/>it runs"]
     s2 --> s3["Add machines:<br/>read-only,<br/>standard or full"]
-    s3 --> s4["Give each<br/>client a token"]
+    s3 --> s4["Each client:<br/>a token, and<br/>one line on<br/>its computer"]
     s4 --> s5["Check your<br/>recovery key<br/>opens a backup"]
     s5 --> s6(["Agents work;<br/>you read<br/>the audit log"])
 ```
 
 1. Install it: **`docs/install.md`**. If you hand it to your own AI agent, it is written to be
    followed step by step, with a check after each.
-2. Connect your clients: **`docs/clients.md`**.
+2. Connect your clients: issue each a token on nervus's Clients page, and run the line it gives on
+   the computer the client runs on, macOS, Linux or Windows: **`docs/clients.md`**.
 3. To use nervus from Claude Code while working in this repository, copy `.mcp.json.example` to
    `.mcp.json` and put nervus's name in it. It reads the token from the environment variable
    `NERVUS_CLAUDE_CODE`, and Claude Code trusts nervus once `NODE_EXTRA_CA_CERTS` names its root
-   (`docs/clients.md`, "Trust nervus's certificate").
-   `docs/clients.md` shows the other way: the token kept in macOS's keychain and fetched by
-   `tools/nervus-headers` when Claude Code connects.
+   (`docs/clients.md`, "Trust nervus's certificate"). A client set up by the line needs none of this:
+   it has nervus in every project.
 
 ## Reading this repository
 

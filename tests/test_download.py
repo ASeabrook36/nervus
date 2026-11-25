@@ -415,3 +415,37 @@ def test_the_claude_code_command_downloads_through_the_keychain_helper(served_tl
                           capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
     assert hashlib.sha256(out.read_bytes()).hexdigest() == SHA
+
+
+def _set_up_by_the_line(tmp_path, served, name="nervus.test-laptop"):
+    """A home where the laptop's line has run (ADR-0032): its helper, its roots, and the token where the
+    helper reads it, in a file and, for a Mac, through a stand-in keychain."""
+    from nervus.laptop import TARGET
+
+    home = tmp_path / "home"
+    folder = home / ".config" / "nervus"
+    folder.mkdir(parents=True)
+    shutil.copy(TARGET / "nervus-headers", folder / "nervus-headers")
+    (folder / "nervus-headers").chmod(0o755)
+    shutil.copy(served.root, folder / "roots.pem")
+    (folder / f"token-{name}").write_text(LONG + "\n")
+    fake = tmp_path / "security"
+    fake.write_text(f"#!/bin/sh\n[ \"$*\" = 'find-generic-password -a nervus -s nervus-{name} -w' ] && echo {LONG}\n")
+    fake.chmod(0o755)
+    return {**os.environ, "HOME": str(home), "NERVUS_SECURITY_BIN": str(fake)}, name
+
+
+@curl
+@pytest.mark.parametrize("shell", ["zsh", "bash"])
+def test_the_command_for_a_client_set_up_by_the_line_downloads_through_its_helper(served_tls, tmp_path, shell):
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    served = served_tls
+    served.tokens[LONG] = served.tokens[MINE]
+    env, name = _set_up_by_the_line(tmp_path, served)
+    out = tmp_path / "saved"
+    command = _as_run(served, _documented("laptop"), out).replace("<name>", name)
+    done = subprocess.run([shell, "-c", command], env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert hashlib.sha256(out.read_bytes()).hexdigest() == SHA
+    assert LONG not in command

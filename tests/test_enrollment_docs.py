@@ -1,6 +1,6 @@
 """docs/install.md step 3 and docs/clients.md on enrolled machines (ADR-0024
 step 5, ADR-0026 step 5), tested as written: the commands that check the key
-Connect shows print the fingerprint the page shows; the two lines and the removal commands are the
+Connect shows print the fingerprint the page shows; the line and the removal commands are the
 ones nervus's page shows; the levels are the three decided, read-only said
 honestly (decision 1's "the docs must say exactly that"); and what the docs
 tell a client about a read-only machine is what the read-only shell does."""
@@ -17,7 +17,7 @@ import pytest
 
 from nervus.enrolled_hosts import LEVELS
 from nervus.accounts import READONLY, READWRITE
-from nervus.host_enrollment import READONLY_SHELL, enroll_lines, enroll_url, remove_commands
+from nervus.host_enrollment import READONLY_SHELL, enroll_line, enroll_url, remove_commands
 from nervus.host_login import fingerprint
 from nervus.pages import NON_GOALS
 from test_first_run_docs import README
@@ -45,11 +45,19 @@ def _table(section):
     return [r for r in rows if not all(re.fullmatch(r"-+", c) for c in r)]
 
 
-def test_the_two_lines_are_the_ones_the_page_shows():
+def test_the_line_is_the_one_the_page_shows():
+    # ADR-0032 question 7: one line, as the page shows it.
     written = _block("enroll").replace("<nervus's key>", PIN[len("sha256//"):]).replace(
         "<nervus>", "nervus.example").replace("<one-time code>", "C0DE")
-    shown = enroll_lines(enroll_url("nervus.example", 8000, "C0DE"), PIN)
-    assert [shlex.split(line) for line in written.splitlines()] == [shlex.split(line) for line in shown.splitlines()]
+    shown = enroll_line(enroll_url("nervus.example", 8000, "C0DE"), PIN)
+    assert len(written.splitlines()) == 1
+    assert shlex.split(written) == shlex.split(shown)
+
+
+def test_the_guide_says_the_root_shell_form_and_that_a_cut_download_changes_nothing():
+    said = " ".join(_section(INSTALL, "3. Sign in, choose the tier, and add the machines nervus reaches").split())
+    assert "In a root shell, as on a machine with no `sudo`, end it with `| sh` instead" in said
+    assert "so a download cut partway changes nothing" in said
 
 
 def test_the_removal_commands_are_the_ones_the_page_shows():
@@ -69,7 +77,7 @@ def test_step_3_offers_the_three_levels_read_only_first_and_says_what_read_only_
 
 def test_step_3_says_reinstalling_is_adding_again_not_removing():
     said = " ".join(_section(INSTALL, "3. Sign in, choose the tier, and add the machines nervus reaches").split())
-    assert "add it again under its name, by Connect or the two lines. Don't remove it first" in said
+    assert "add it again under its name, by Connect or the line. Don't remove it first" in said
 
 
 def test_the_hand_steps_are_kept_and_say_what_they_give():
@@ -96,8 +104,9 @@ def test_what_clients_are_told_of_a_read_only_machine_is_what_its_shell_does():
 def test_step_3_says_what_the_script_does_since_procedure_037():
     said = " ".join(_section(INSTALL, "3. Sign in, choose the tier, and add the machines nervus reaches").split())
     script = (Path(__file__).resolve().parent.parent / "src" / "nervus" / "host_enrollment.py").read_text()
-    assert "the script checks its code first, so a used or expired one, or a copy left from an earlier try, " \
-           "changes nothing" in said
+    # One line leaves no file behind to run again (ADR-0032 question 7); a used or expired code is still refused
+    # before anything changes.
+    assert "the script checks its code first, so a used or expired one changes nothing" in said
     assert '|| fail "could not reach nervus at $url. Nothing here was changed."' in script
     assert "and `tmux` for background jobs at every level" in said and "need tmux tmux" in script
 
@@ -128,10 +137,10 @@ def test_the_commands_that_check_the_key_print_the_fingerprint_the_page_shows(tm
         assert done.returncode == 0 and shown in done.stdout.split(), (command, done.stdout, done.stderr)
 
 
-def test_step_3_offers_connect_first_and_keeps_the_two_lines_as_advanced():
+def test_step_3_offers_connect_first_and_keeps_the_line_as_advanced():
     step = _section(INSTALL, "3. Sign in, choose the tier, and add the machines nervus reaches")
     said = " ".join(step.split())
-    assert said.index("**Connect.**") < said.index("**Log in once**") < said.index("### Advanced: two lines run on")
+    assert said.index("**Connect.**") < said.index("**Log in once**") < said.index("### Advanced: one line run on")
     assert said.index("<!-- install:fingerprint -->") < said.index("### Advanced") < said.index("<!-- install:enroll -->")
     for words in ("a `.local` name works only where nervus's machine runs mDNS", "`avahi-daemon` and `libnss-mdns`",
                   "the account name, in its audit log", "never the password",
@@ -145,4 +154,4 @@ def test_the_readme_and_the_setup_page_say_whoever_runs_nervus_could_see_a_passw
     readme = " ".join(README.read_text().split())
     words = "rewrite its audit log, and see a password you type to add a machine."
     assert words in readme and any(goal.endswith(words) for goal in NON_GOALS)
-    assert "by an admin login given once, or with two lines run on them" in readme
+    assert "by an admin login given once, or with one line run on them" in readme

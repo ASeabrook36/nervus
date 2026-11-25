@@ -1,8 +1,11 @@
 # ADR-0031: a client can be read-only on a machine, through a second account the machine keeps read-only
 
-**Status:** **Decided by the operator, 2026-11-20: the model below, in their words. Built for
-0.3.0 and tried on throwaway machines (procedure 068); not yet deployed. Accepted when its
-verification is observed.** Step 1 of the order of work tries it on machines before any
+**Status:** **Accepted 2026-11-23, at the operator's word** ("Yes, accept it"). Every verification
+item was observed on throwaway machines by the trial (procedure 068, section 11). Items 1, 2's second
+half, 4's `put`, 6 and 8 were observed again on the first installation, deployed 2026-11-21, with its
+first read-only token (procedure 068, sections 16 to 18). Item 3 was seen on the trial alone, since
+that token is read-only on every machine it names. Its amendments to ADR-0001 s6 and ADR-0024 are
+marked there. **Decided by the operator, 2026-11-20: the model below, in their words.** Step 1 of the order of work tries it on machines before any
 code. The file keeps the name it was proposed under. **Three questions the record did not answer
 were put to the operator before the build and answered the same day (questions 4 to 6, procedure
 067).** **Two more, found at the start of the build, were answered the same day (questions 7 and 8,
@@ -27,8 +30,8 @@ read-only); ADR-0009 decision 1 (one machine as two entries, behind two accounts
 (tokens issued in the web UI; decision F, changing the database without breaking a rollback);
 ADR-0024 and ADR-0026 (a machine added from the web UI, its level chosen then); ADR-0025 (a
 certificate nervus signs for each connection, naming the account).
-**Would amend:** ADR-0001 s6 (a token says which machines, and now what level on each) and
-ADR-0024 (what enrollment asks and makes), each to be marked where it stands once this is built.
+**Amends:** ADR-0001 s6 (a token says which machines, and now what level on each) and ADR-0024
+(what enrollment asks and makes), each marked there, 2026-11-23.
 **Written to the policy of ADR-0019:** this record names no system.
 
 ## The decision, in the operator's words (2026-11-20)

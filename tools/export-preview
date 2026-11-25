@@ -43,8 +43,10 @@ untracked goes out. In order, stopping at the first thing that fails:
      the bytecode Python writes as step 7 runs the tests.
 
 Exit 0: the preview in <out-dir> passed every check; commit it in the preview repository as
-"Export of <commit>, <date>". Exit 1: something failed, said above; <out-dir> is left for
-reading, and nothing in it should be committed. Exit 2: it could not run.
+"Export of <commit>, <date>". Then, on that commit, run tools/release-archive <preview checkout>
+--out <folder>, which makes the release's download from it, checks it, and writes its release
+page (ADR-0032 step 2). Exit 1: something failed, said above; <out-dir> is left for reading, and
+nothing in it should be committed. Exit 2: it could not run.
 """
 
 from __future__ import annotations
@@ -298,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
         say(f"{out} is left for reading; commit nothing from it")
         return 1
     say(f"done. Commit it in the preview repository as: Export of {sha[:7]}, {date.today().isoformat()}")
+    say("then, on that commit, make the release's download and its release page (ADR-0032 step 2): "
+        f".venv/bin/python tools/release-archive {previous} --out <folder>")
     return 0
 
 

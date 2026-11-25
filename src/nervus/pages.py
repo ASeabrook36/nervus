@@ -404,7 +404,19 @@ def _action(action: str, form_token: str, label: str, token_id: str = "", extra:
     )
 
 
-def _client_row(row: ClientRow, view: ClientsView, form_token: str) -> Markup:
+def _line_state(row: ClientRow, now: float) -> str:
+    """Where a token issued here stands with its laptop's line (ADR-0032 question 5)."""
+    line = row.line
+    if line is None:
+        return "issued in the UI" if row.issued else "token file"
+    if line.used_at is not None:
+        return f"issued in the UI; handed over by its line {_second(line.used_at)}, to {line.used_from or 'an unknown address'}"
+    if line.expires_at > now:
+        return f"issued in the UI; waiting for its line, which works until {_second(line.expires_at)}"
+    return "issued in the UI; its line expired unused, so it has no value yet: make it a new line, or revoke it"
+
+
+def _client_row(row: ClientRow, view: ClientsView, form_token: str, now: float | None = None) -> Markup:
     if view.unreadable:
         state = "refused: the switch file is unreadable"
     elif row.off:
@@ -418,6 +430,9 @@ def _client_row(row: ClientRow, view: ClientsView, form_token: str) -> Markup:
     revoke = _action("revoke", form_token, "Revoke", row.id, extra=Markup(
         '<input type="text" name="confirm" placeholder="type its id to revoke" autocomplete="off">\n'
     )) if row.issued else Markup("")
+    now = time.time() if now is None else now
+    expired = row.line is not None and row.line.used_at is None and row.line.expires_at <= now
+    again = _action("new-line", form_token, "New line", row.id) if expired else Markup("")
     return render(
         """<tr>
 <td><code>{id}</code><br><span class="muted">{label}</span></td>
@@ -426,23 +441,26 @@ def _client_row(row: ClientRow, view: ClientsView, form_token: str) -> Markup:
 <td>{where}</td>
 <td class="state">{state}</td>
 <td>{last_call}</td>
-<td class="actions">{switch}{revoke}</td>
+<td class="actions">{again}{switch}{revoke}</td>
 </tr>
 """,
         id=row.id, label=UNCONFINED, client=row.client, project=row.project,
         hosts=", ".join(f"{h} (read-only)" if h in row.readonly else h for h in row.hosts),
-        where="issued in the UI" if row.issued else "token file", state=state,
+        where=_line_state(row, now), state=state,
         last_call="no call yet" if row.last_call is None else _second(row.last_call),
-        switch=switch, revoke=revoke,
+        again=again, switch=switch, revoke=revoke,
     )
 
 
 def page_clients(view: ClientsView, hosts: list[str], until: float, form_token: str,
-                 standing: Standing = NO_STANDING, notice: str = "", both: frozenset[str] = frozenset()) -> Markup:
+                 standing: Standing = NO_STANDING, notice: str = "", both: frozenset[str] = frozenset(),
+                 by_line: bool = True) -> Markup:
     """Every client: on or off, lockdown, issuing a fallback token, and revoking
     one issued here (ADR-0014). `hosts` is the inventory's entries a token may
     be issued for: an entry marked `issue: never` is not among them (ADR-0009
-    decision 3, ADR-0019 decision D). `notice` says why an action did not happen."""
+    decision 3, ADR-0019 decision D). `notice` says why an action did not happen. `by_line` is
+    false while MCP serves plain HTTP, when no line can hand a token over and its value is shown
+    once instead (ADR-0032 question 13)."""
     if view.lockdown:
         lockdown = render("""<div class="banner" role="status">Lockdown is on: every client is refused.</div>
 {button}""", button=_action("lockdown-off", form_token, "Lift lockdown"))
@@ -483,35 +501,75 @@ too, run <code>nervus-ctl lock &lt;id&gt; --kill-work</code> on the nervus machi
 </section>
 <section>
 <h2>Issue a token</h2>
-<form method="post" action="clients" class="issue">
+{issue}</section>""",
+        notice=render('<p class="notice">{notice}</p>\n', notice=notice) if notice else Markup(""),
+        unreadable=unreadable, lockdown=lockdown, form_token=form_token,
+        issue=render("""<form method="post" action="clients" class="issue">
 <input type="hidden" name="form_token" value="{form_token}">
 <input type="hidden" name="action" value="issue">
 <label>Id <input type="text" name="id" placeholder="laptop-codex" autocomplete="off"></label>
-<label>Client <input type="text" name="client" placeholder="codex"></label>
+<label>Client <select name="client">
+<option value="" selected disabled>choose</option>
+<option value="claude-code">Claude Code</option>
+<option value="codex">Codex</option>
+<option value="other">Another client, named here:</option>
+</select></label>
+<label>Another client&#x27;s name <input type="text" name="client-name" placeholder="cursor" autocomplete="off"></label>
 <label>Project <input type="text" name="project" placeholder="laptop"></label>
 <fieldset><legend>Hosts</legend>
 {boxes}</fieldset>
 {picks_note}{picks}<button type="submit">Issue</button>
 </form>
-<p class="muted">Its value is shown once, on the next page. Its hosts, and its level on each, cannot be changed
-later: issue another and revoke this one.</p>
-</section>""",
-        notice=render('<p class="notice">{notice}</p>\n', notice=notice) if notice else Markup(""),
-        unreadable=unreadable, lockdown=lockdown, form_token=form_token, boxes=boxes, picks=picks,
-        picks_note=Markup('<p class="muted">Each machine below has a read-only account beside its read-write one: '
-                          'choose for each whether this token is on it, and if so read-only or read-write.</p>\n')
-        if picks else Markup(""),
+<p class="muted">{next_page} Its hosts, and its level on each, cannot be changed later: issue another and revoke
+this one.</p>
+""", form_token=form_token, boxes=boxes, picks=picks,
+            next_page="The next page gives a line to run on the computer the client runs on, which sets it up and "
+                      "fetches the token there, once; the token itself is never shown." if by_line else PLAIN_HTTP_TOKENS,
+            picks_note=Markup('<p class="muted">Each machine below has a read-only account beside its read-write '
+                              'one: choose for each whether this token is on it, and if so read-only or '
+                              'read-write.</p>\n') if picks else Markup("")),
         rows=join(_client_row(row, view, form_token) for row in view.rows),
     ), until, form_token, standing, wide=True)
 
 
-def page_token_issued(token_id: str, value: str, until: float, form_token: str, standing: Standing = NO_STANDING) -> Markup:
-    """A newly issued token's value, shown this once (ADR-0006 decision 7).
-    nervus keeps only its hash; nothing can show it again."""
+def page_token_issued(token_id: str, client: str, pin: str, host: str, line: str, windows_line: str,
+                      until: float, form_token: str, standing: Standing = NO_STANDING) -> Markup:
+    """A newly issued token's lines, shown this once (ADR-0032 questions 4, 5 and 11): run on the
+    computer its client runs on, as the person, each fetches a script with nervus's key pinned,
+    which sets that computer up and fetches the token there, once. The token is never on the
+    screen. nervus's key comes first, for the person to check against the one the installer
+    printed: a page that reached them through something other than nervus could carry another."""
+    return _frame("nervus: token issued", render(
+        """<h1>Token issued: {id}, for {client}</h1>
+<p><strong>First, check nervus&#x27;s key.</strong> The installer printed it when it installed nervus. The lines
+below carry this one, and refuse any server whose key is not it:</p>
+<pre class="lines"><code>{pin}</code></pre>
+<p>If it is not the one the installer printed, stop: something other than your nervus may have sent this page.</p>
+<p>Then, on the computer {client} runs on, as yourself, not as root or an administrator, run the line for it.
+It sets that computer up to reach nervus, fetches the token there and keeps it where only you can read it, and
+prints the commands that tell {client} to use nervus, which you run. The token is never shown.</p>
+<h2>macOS or Linux, in a terminal</h2>
+<pre class="lines"><code>{line}</code></pre>
+<h2>Windows, in PowerShell</h2>
+<pre class="lines"><code>{windows_line}</code></pre>
+<p>The line works once, within 15 minutes, and is shown only now. Whatever runs it first gets the token: if
+yours says its code was used, and you did not run it, revoke {id} on the Clients page. If the computer reaches
+nervus by an address other than <code>{host}</code>, put that one in the line instead.</p>
+<p><a href="clients">Back to clients</a>, which shows when the line was used, and from where.</p>""",
+        id=token_id, client=client, pin=pin, host=host, line=line, windows_line=windows_line,
+    ), until, form_token, standing)
+
+
+def page_token_shown(token_id: str, value: str, until: float, form_token: str, standing: Standing = NO_STANDING) -> Markup:
+    """A newly issued token's value, shown this once, where nervus serves plain HTTP and no line can
+    pin its key (ADR-0032 question 13 a), as every token was shown before ADR-0032. nervus keeps
+    only its hash; nothing can show it again."""
     return _frame("nervus: token issued", render(
         """<h1>Token issued: {id}</h1>
-<p>This is the only time its value is shown. Put it in your password manager now, then give it to the client
-through that client's own setting for a header or an environment variable.</p>
+<p>This nervus serves MCP over plain HTTP, so there is no line to set the client&#x27;s computer up with: over
+plain HTTP there is no key for it to check. This is the only time the token&#x27;s value is shown. Put it in
+your password manager now, then give it to the client through that client&#x27;s own setting for a header or an
+environment variable (docs/clients.md, by hand).</p>
 <pre><code>{value}</code></pre>
 <p>It is a static token, unconfined: whatever can read where the client keeps it can use it.</p>
 <p><a href="clients">Back to clients</a></p>""",
@@ -534,6 +592,10 @@ LEVEL_WORDS = {
             "Does nervus run on this machine, as a VM or container? Then a client given full access here can "
             "rewrite nervus's audit log.",
 }
+PLAIN_HTTP_TOKENS = ("This nervus serves MCP over plain HTTP, so no line can hand a token to the computer its client "
+                     "runs on: that computer checks nervus's key before it runs anything nervus sends, and there is no "
+                     "key without HTTPS. So the next page shows the token's value once, for you to give the client by "
+                     "hand (ADR-0032 question 13).")
 PLAIN_HTTP = ("This nervus serves MCP over plain HTTP, so it cannot enroll a machine: the machine checks "
               "nervus's key before it runs anything nervus sends, and there is no key without HTTPS. Serve MCP "
               "over HTTPS first (docs/install.md).")
@@ -664,7 +726,7 @@ def page_machines(machines: list[EnrolledHost], codes: list[EnrollmentCode], by_
     the codes made lately and what became of each; and the form that adds a
     machine, or gives one already here a new level (ADR-0024 decisions 2 to 5):
     Connect, which logs in once with an admin account (ADR-0026), where
-    `can_login`, and Advanced, the two lines to run on the machine. `by_hand`
+    `can_login`, and Advanced, the line to run on the machine. `by_hand`
     names hosts.yaml's machines, which are not changed here. `can_enroll` is
     false when MCP serves plain HTTP. `restored`, after a restore until the
     next backup, says what the backup cannot have (ADR-0027 question 6)."""
@@ -681,9 +743,9 @@ def page_machines(machines: list[EnrolledHost], codes: list[EnrollmentCode], by_
                  "address if that can change.")
         how = (render('<p class="muted">Connect shows the key the machine answers with, then asks once for an admin '
                       'login, root or an account that can use sudo, and does the rest, keeping no password. Advanced '
-                      'gives two lines to run as root on the machine instead; they work once, within 15 minutes. '
+                      'gives one line to run as root on the machine instead; it works once, within 15 minutes. '
                       'In Advanced, leave {blank}', blank=blank) if can_login else
-               render('<p class="muted">The next page shows two lines to run as root on the machine; they work '
+               render('<p class="muted">The next page shows one line to run as root on the machine; it works '
                       'once, within 15 minutes. Leave {blank}', blank=blank))
         add = render(
             """<form method="post" action="machines" class="enroll">
@@ -693,7 +755,7 @@ def page_machines(machines: list[EnrolledHost], codes: list[EnrollmentCode], by_
  autocomplete="off"></label>
 <fieldset><legend>Level</legend>
 {levels}</fieldset>
-{boxes}{connect}<button type="submit" name="action" value="add" class="secondary">Advanced: two lines to run on the machine yourself</button>
+{boxes}{connect}<button type="submit" name="action" value="add" class="secondary">Advanced: a line to run on the machine yourself</button>
 </form>
 {how} To change a machine&#x27;s level, add it again under its name. To reinstall a
 machine, add it again under its name too, without removing it: the tokens that name it keep reaching
@@ -705,10 +767,10 @@ it.</p>""",
     hand = render('<p class="muted">Also reached, described by hand in hosts.yaml and not changed here: {names}.</p>\n',
                   names=", ".join(by_hand)) if by_hand else Markup("")
     if described and can_enroll:
-        # ADR-0031 question 4: a machine described by hand gains a read-only account by two lines.
+        # ADR-0031 question 4: a machine described by hand gains a read-only account by its line.
         hand = join((hand, render(
             """<h3>A read-only account on a machine described by hand</h3>
-<p class="muted">Two lines to run as root on it make one account, read-only, beside the one it is described with,
+<p class="muted">A line to run as root on it makes one account, read-only, beside the one it is described with,
 which stays as it is; nervus then checks it and records it. Once it has one, a token can be read-only there.</p>
 <div class="table">
 <table>
@@ -722,7 +784,7 @@ which stays as it is; nervus then checks it and records it. Once it has one, a t
 <td class="actions">{action}</td></tr>
 """, name=d_name, account=d_account, has=render("<code>{r}</code>", r=d_readonly) if d_readonly else "none",
                 action=(_machine_action("forget-readonly", form_token, "Forget it", d_name) if d_readonly else
-                        _machine_action("readonly-account", form_token, "Two lines to add one", d_name, extra=render(
+                        _machine_action("readonly-account", form_token, "A line to add one", d_name, extra=render(
                             '<input type="text" name="readonly" value="{ro}" autocomplete="off" '
                             'aria-label="the read-only account\'s name">\n', ro=READONLY))))
                 for d_name, d_account, d_readonly in described))))
@@ -765,7 +827,7 @@ def page_enroll_confirm(name: str, level: str, address: str, reason: str, tokens
     """Before a code for a reused name or a raised level (ADR-0024 question
     8): which tokens reach what this changes, and the name typed to go on.
     The form carries what was asked for, so only the name is typed again, and
-    goes on with `action`: `add`, the two lines, or `connect`, which shows the
+    goes on with `action`: `add`, the line, or `connect`, which shows the
     machine's key and asks for the login again (ADR-0026)."""
     return _frame("nervus: add a machine", render(
         """<h1>Add {name}?</h1>
@@ -788,21 +850,44 @@ def page_enroll_confirm(name: str, level: str, address: str, reason: str, tokens
     ), until, form_token, standing)
 
 
-def page_enroll_lines(name: str, level: str, lines: str, nervus_host: str, until: float, form_token: str,
-                      standing: Standing = NO_STANDING) -> Markup:
-    """The two lines for one code, shown this once: nervus keeps only the
-    code's hash (ADR-0024 decision 2)."""
+def page_enroll_lines(name: str, level: str, line: str, root_line: str, pin: str, nervus_host: str,
+                      script: str | None, until: float, form_token: str, standing: Standing = NO_STANDING,
+                      no_script: str = "") -> Markup:
+    """The line for one code, shown this once: nervus keeps only the code's
+    hash (ADR-0024 decision 2). One line, as ADR-0032 question 7 made the two:
+    it fetches nervus's script, checked against nervus's key, and runs it as
+    root. The key it pins is shown, for the owner to check against the one the
+    installer printed; the script it runs is shown beneath it, for anyone who
+    wants to read it first. Where the route would refuse the line,
+    `no_script` says why in its place."""
+    if script:
+        shown = render(
+            """<details>
+<summary>The script this line runs, to read first if you want to</summary>
+<pre class="script"><code>{script}</code></pre>
+<p class="muted">The line, as it is above, fetches exactly this from nervus, and runs it; with another address
+for nervus in it, the script names that address instead. Nothing in it runs until all of it has arrived, so a
+download cut partway changes nothing. It asks nervus whether its code is still good before it changes anything,
+so reading it here costs nothing.</p>
+</details>
+""", script=script)
+    else:
+        shown = render('<p class="notice">The script it fetches cannot be shown here: {why}.</p>\n',
+                       why=no_script) if no_script else Markup("")
     return _frame("nervus: add a machine", render(
         """<h1>Add {name}, {level}</h1>
-<p>On {name}, in a root shell, run these two lines. The first fetches nervus&#x27;s script and checks it
-came from this nervus, by its key. The second shows you the script; read it, quit with q, and it runs.</p>
-<pre class="lines"><code>{lines}</code></pre>
-<p>They work once, within 15 minutes, and are shown only now. Not in a root shell? Put <code>sudo</code>
-before <code>sh</code>.</p>
-<p>If {name} reaches nervus by an address other than <code>{host}</code>, put that one in the first line
-instead.</p>
-<p>The script ends by saying whether {name} was enrolled; <a href="machines">Machines</a> shows it too.</p>""",
-        name=name, level=level, lines=lines, host=nervus_host,
+<p>On {name}, run this line. It fetches nervus&#x27;s script, checks it came from this nervus by its key, and
+runs it as root.</p>
+<pre class="lines"><code>{line}</code></pre>
+<p>In a root shell, as on a machine without <code>sudo</code>, run it ending in <code>| sh</code> instead:</p>
+<pre class="lines"><code>{root_line}</code></pre>
+<p>The key it checks is <code>{pin}</code>. The installer printed nervus&#x27;s key when it installed nervus,
+and <code>nervus tls-fingerprint</code> prints it on nervus&#x27;s machine: if they differ, stop.</p>
+<p>It works once, within 15 minutes, and is shown only now. If curl says the URL returned error 404, the line
+was used or has expired: make another.</p>
+<p>If {name} reaches nervus by an address other than <code>{host}</code>, put that one in the line instead.</p>
+{shown}<p>The script ends by saying whether {name} was enrolled; <a href="machines">Machines</a> shows it too.</p>""",
+        name=name, level=level, line=line, root_line=root_line, pin=pin, host=nervus_host, shown=shown,
     ), until, form_token, standing)
 
 
@@ -844,7 +929,7 @@ holding this key. If it does not match, stop: something else may be answering at
 <p class="muted">nervus logs in once, becomes root, directly or with sudo and this password, and runs its
 enrollment script: it makes nervus&#x27;s accounts with nervus&#x27;s key and sets up the level. nervus keeps no
 password. Whoever controls this nervus right now could see it; if you would rather nervus never saw it, or you do
-not trust this network, use the two lines.</p>
+not trust this network, use the line run on the machine yourself.</p>
 <form method="post" action="machines" class="enroll">
 <input type="hidden" name="form_token" value="{form_token}">
 <input type="hidden" name="action" value="add">
@@ -852,7 +937,7 @@ not trust this network, use the two lines.</p>
 <input type="hidden" name="address" value="{address}">
 <input type="hidden" name="level" value="{level}">
 <input type="hidden" name="confirm" value="{confirm}">
-{carried}<button type="submit" class="secondary">Advanced: two lines to run on the machine yourself instead</button>
+{carried}<button type="submit" class="secondary">Advanced: a line to run on the machine yourself instead</button>
 </form>
 <p><a href="machines">Back to machines</a></p>""",
         name=name, address=address, fingerprint=fingerprint, host_key=host_key, confirm=confirm,
@@ -881,7 +966,7 @@ def page_enrolling(run: LoginRun, until: float, form_token: str, standing: Stand
 <input type="hidden" name="name" value="{name}">
 <input type="hidden" name="address" value="{address}">
 <input type="hidden" name="level" value="{level}">
-<button type="submit" class="secondary">Advanced: two lines to run on the machine yourself</button>
+<button type="submit" class="secondary">Advanced: a line to run on the machine yourself</button>
 </form>
 <p><a href="machines">Try again</a>, from Machines, with the key and login asked for afresh.</p>
 """, form_token=form_token, name=run.name, address=run.address, level=run.level))
@@ -1108,6 +1193,7 @@ installing and after each upgrade, on nervus&#x27;s machine, as root, with the r
 
 
 PAGES = (page_signed_out, page_signin, page_home, page_audit, page_audit_row, page_clients, page_token_issued,
+         page_token_shown,
          page_machines, page_enroll_confirm, page_names_confirm, page_enroll_login, page_enrolling, page_enroll_lines,
          page_machine_removed, page_setup, page_backups)
 
@@ -1174,6 +1260,8 @@ form.enroll input[type="text"], form.enroll input[type="password"] { width: min(
 button.secondary { color: var(--muted); }
 ol.steps { padding-left: 1.5rem; }
 pre.lines { white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.script { max-height: 30rem; overflow: auto; font-size: 0.85rem; }
+details summary { cursor: pointer; }
 td.actions { white-space: nowrap; }
 mark { padding: 0 0.15em; border-radius: 3px; color: var(--alert-fg); background: var(--alert-bg); font-weight: 600; }
 """

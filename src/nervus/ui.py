@@ -11,7 +11,7 @@ A, ADR-0012). Later pieces add the rest of its screens.
     GET  /machines    machines enrolled here, codes made lately, and adding
                       a machine (ADR-0024)
     POST /machines    connect to a machine and ask for its admin login, enroll
-                      it with that login, make a code and show its two lines,
+                      it with that login, make a code and show its line,
                       change a machine's address, or remove one and show what
                       takes nervus off it (ADR-0026)
     GET  /enrolling   the progress of an enrollment by login, by its code's id
@@ -89,10 +89,13 @@ from nervus.enrollments import EnrollmentRefused, host_keys
 from nervus.exposure import Exposure
 from nervus.first_run import FirstRun, SetupRefused
 from nervus.accounts import READONLY, READWRITE, MachineAccounts, has_both
-from nervus.host_enrollment import enroll_lines, enroll_url, remove_commands, remove_readonly_commands
+from nervus.host_enrollment import enroll_line, enroll_url, remove_commands, remove_readonly_commands
+from nervus.laptop import laptop_line, laptop_url, powershell_line
+from nervus.token_codes import CLIENTS, TokenCodes
 from nervus.host_login import LoginEnrollment, LoginRefused, LoginRun, fingerprint, key_file
 from nervus.pages import (
     PLAIN_HTTP,
+    PLAIN_HTTP_TOKENS,
     STYLESHEET,
     Markup,
     Standing,
@@ -113,6 +116,7 @@ from nervus.pages import (
     page_signed_out,
     page_signin,
     page_token_issued,
+    page_token_shown,
 )
 from nervus.switches import Switches, SwitchesSwapped, SwitchesUnreadable, change_switches
 
@@ -163,6 +167,13 @@ class Management:
     switches: Path
     hosts: list[str]
     never_issued: frozenset[str] = frozenset()
+    # ADR-0032 question 5: the one-time codes that hand each token issued here to its laptop; nervus's key as
+    # curl pins it, None while MCP serves plain HTTP; MCP's port; and the host a laptop reaches nervus at,
+    # from --ui-url, or "" for the one the browser used.
+    codes: TokenCodes | None = None
+    pin: Callable[[], str | None] = lambda: None
+    port: int = 8000
+    nervus_host: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,6 +202,9 @@ class Machines:
     # nervus's key words, its authority's and its own, as a line holds them: the removal commands take the line
     # off an account that was there before nervus by them (ADR-0031 question 9).
     key_words: Callable[[], tuple] = lambda: ()
+    # The script a code's line fetches, by the code and its URL, shown beneath the line (ADR-0032 question 7),
+    # and "", or no script and why the line would be refused.
+    shown: Callable[[str, str], tuple[str | None, str]] = lambda value, url: (None, "")
 
 
 @dataclass(frozen=True)
@@ -452,10 +466,23 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                            status: int = 200) -> Response:
         assert management is not None
         view = await anyio.to_thread.run_sync(lambda: clients_view(
-            management.tokens, database.issued_tokens(), management.switches, audit.path))
+            management.tokens, database.issued_tokens(), management.switches, audit.path,
+            lines=management.codes.of_tokens() if management.codes is not None else {}))
         offered = [h for h in await issuable() if h not in management.never_issued]
         return page(page_clients(view=view, hosts=offered, until=session.expires_at, both=await both_accounts(),
-                                 form_token=form_token(value), standing=await standing_now(), notice=notice), status)
+                                 form_token=form_token(value), standing=await standing_now(), notice=notice,
+                                 by_line=management.codes is not None and management.pin() is not None), status)
+
+    def laptop_page(request: Request, token_id: str, code, code_value: str, session: Session, value: str,
+                    standing: Standing) -> Markup:
+        """The lines that hand a token to its laptop, and nervus's key to check first (ADR-0032 questions 4,
+        5 and 11), shown this once: nervus keeps only the code's hash."""
+        pin = management.pin()
+        host = management.nervus_host or request.url.hostname or ""
+        return page_token_issued(token_id=token_id, client=CLIENTS[code.client], pin=pin, host=host,
+                                 line=laptop_line(laptop_url(host, management.port, code_value), pin),
+                                 windows_line=powershell_line(laptop_url(host, management.port, code_value, True), pin),
+                                 until=session.expires_at, form_token=form_token(value), standing=standing)
 
     async def clients(request: Request) -> Response:
         found = await signed_in(request)
@@ -565,27 +592,67 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                                    f"read-only or read-write.")
                 readonly = sorted(h for h, level in picked.items() if level == "read-only")
                 hosts += [h for h, level in picked.items() if level in ("read-only", "read-write")]
-                client, project = str(form.get("client", "")), str(form.get("project", ""))
+                # ADR-0032 question 5: the client from a list, so the laptop's script can rely on it; "other" by name.
+                kind, project = str(form.get("client", "")), str(form.get("project", ""))
+                if kind not in CLIENTS:
+                    raise _Refused("Not issued: choose the client it is for: Claude Code, Codex, or another.")
+                client = kind if kind != "other" else str(form.get("client-name", "")).strip()
+                if not client:
+                    raise _Refused("Not issued: give the other client's name.")
+                if management.codes is None or management.pin() is None:
+                    # ADR-0032 question 13 a: over plain HTTP no line can pin nervus's key, so the value is shown
+                    # once, as before ADR-0032.
+                    try:
+                        issued = await anyio.to_thread.run_sync(lambda: database.issue_token(
+                            token_id, client, project, hosts, taken=management.tokens.file_ids(),
+                            never_issued=management.never_issued, readonly=readonly))
+                    except TokenRefused as exc:
+                        raise _Refused(f"Not issued: {exc}.") from exc
+                    failed = await recorded("issue_token", {"target": token_id, "client": client.strip(),
+                                                            "client_kind": kind, "project": project.strip(),
+                                                            "hosts": sorted(set(hosts)), "read_only": readonly,
+                                                            "shown_once": True, **where},
+                                            undo=lambda: database.revoke_token(token_id))
+                    if failed:
+                        return await clients_page(request, value, session, failed, 500)
+                    return page(page_token_shown(token_id=token_id, value=issued, until=session.expires_at,
+                                                 form_token=form_token(value), standing=standing))
                 try:
-                    issued = await anyio.to_thread.run_sync(lambda: database.issue_token(
-                        token_id, client, project, hosts, taken=management.tokens.file_ids(),
+                    code_value, code = await anyio.to_thread.run_sync(lambda: management.codes.issue(
+                        token_id, kind, client, project, hosts, taken=management.tokens.file_ids(),
                         never_issued=management.never_issued, readonly=readonly))
                 except TokenRefused as exc:
                     raise _Refused(f"Not issued: {exc}.") from exc
+
+                def unissue() -> None:
+                    database.revoke_token(token_id)  # its code with it
                 failed = await recorded("issue_token", {"target": token_id, "client": client.strip(),
-                                                        "project": project.strip(), "hosts": sorted(set(hosts)),
-                                                        "read_only": readonly, **where},
-                                        undo=lambda: database.revoke_token(token_id))
+                                                        "client_kind": kind, "project": project.strip(),
+                                                        "hosts": sorted(set(hosts)), "read_only": readonly,
+                                                        "code_id": code.id, **where}, undo=unissue)
                 if failed:
                     return await clients_page(request, value, session, failed, 500)
-                return page(page_token_issued(token_id=token_id, value=issued, until=session.expires_at,
-                                              form_token=form_token(value), standing=standing))
+                return page(laptop_page(request, token_id, code, code_value, session, value, standing))
+            elif action == "new-line":
+                # ADR-0032 question 5: a token whose line expired unused gets another; one handed over, never.
+                if management.codes is None or management.pin() is None:
+                    raise _Refused(PLAIN_HTTP_TOKENS)
+                try:
+                    code_value, code = await anyio.to_thread.run_sync(management.codes.again, token_id)
+                except ValueError as exc:
+                    raise _Refused(f"No new line: {exc}.") from exc
+                failed = await recorded("token_code", {"target": token_id, "code_id": code.id, **where},
+                                        undo=lambda: management.codes.cancel(code.id))
+                if failed:
+                    return await clients_page(request, value, session, failed, 500)
+                return page(laptop_page(request, token_id, code, code_value, session, value, standing))
             elif action == "revoke":
                 ours = {i.token.id for i in await anyio.to_thread.run_sync(database.issued_tokens)}
                 if token_id not in ours:
                     raise _Refused(f"{token_id} was not issued here, so it cannot be revoked here.")
                 if str(form.get("confirm", "")) != token_id:
                     raise _Refused(f"To revoke {token_id}, type its id exactly. Nothing was revoked.")
+                # Its one-time codes go with it, in the same transaction (ADR-0032).
                 await anyio.to_thread.run_sync(database.revoke_token, token_id)
                 await recorded("revoke_token", {"target": token_id, **where})
             else:
@@ -637,7 +704,7 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                         standing: Standing, confirmed_level: str | None = None,
                         carried: Markup = Markup("")) -> tuple[list[str], Response | None]:
         """ADR-0024 question 8, asked the same way before Connect, the login and
-        the two lines: tokens follow the name, so ask before they would reach a
+        the line: tokens follow the name, so ask before they would reach a
         machine they did not, or a higher level. Returns the tokens shown, and
         the page asking if the name was not typed; `action` is what that page
         goes on with. `confirmed_level`, for a name typed on an earlier page, is
@@ -707,6 +774,22 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
             raise _Refused("Not connected: give exactly one host key, the one the machine answered with.")
         return keys[0]
 
+    async def enroll_page(name: str, level: str, host: str, code_value: str, pin: str, session: Session, value: str,
+                          standing: Standing) -> Markup:
+        """The one line for a code, its root-shell form, and the script it runs
+        beneath them (ADR-0032 question 7). The script is read in a thread, as
+        the database is everywhere here; one that cannot be shown is said, and
+        the line still stands."""
+        url = enroll_url(host, machines.port, code_value)
+        try:
+            script, why = await anyio.to_thread.run_sync(machines.shown, code_value, url)
+        except Exception as exc:  # the line was made and recorded: losing the page would lose it
+            script, why = None, f"nervus could not show the script ({type(exc).__name__})"
+        return page_enroll_lines(name=name, level=level, line=enroll_line(url, pin),
+                                 root_line=enroll_line(url, pin, sudo=False), pin=pin, nervus_host=host,
+                                 script=script, no_script=why, until=session.expires_at,
+                                 form_token=form_token(value), standing=standing)
+
     async def manage_machines(request: Request) -> Response:
         if not same_origin(request):
             return await not_ours(request, "machines", ANOTHER_SITE)
@@ -757,15 +840,12 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                 if failed:
                     return await machines_page(value, session, failed, 500)
                 host = machines.nervus_host or request.url.hostname or ""
-                lines = enroll_lines(enroll_url(host, machines.port, code_value), pin)
-                return page(page_enroll_lines(name=code.name, level=code.level, lines=lines, nervus_host=host,
-                                              until=session.expires_at, form_token=form_token(value),
-                                              standing=standing))
+                return page(await enroll_page(code.name, code.level, host, code_value, pin, session, value, standing))
             if action in ("connect", "login"):
                 return await connect_or_login(request, form, action, name=name, value=value, session=session,
                                               standing=standing, where=where)
             if action == "readonly-account":
-                # ADR-0031 question 4: a machine described by hand gains a read-only account by two lines.
+                # ADR-0031 question 4: a machine described by hand gains a read-only account by its line.
                 pin = machines.pin()
                 if pin is None:
                     raise _Refused(PLAIN_HTTP)
@@ -792,10 +872,8 @@ def build_ui(database: Database, audit: AuditLog, secure: bool, management: Mana
                 if failed:
                     return await machines_page(value, session, failed, 500)
                 nervus_at = machines.nervus_host or request.url.hostname or ""
-                lines = enroll_lines(enroll_url(nervus_at, machines.port, code_value), pin)
-                return page(page_enroll_lines(name=code.name, level=f"the read-only account {readonly}", lines=lines,
-                                              nervus_host=nervus_at, until=session.expires_at,
-                                              form_token=form_token(value), standing=standing))
+                return page(await enroll_page(code.name, f"the read-only account {readonly}", nervus_at, code_value,
+                                              pin, session, value, standing))
             if action == "forget-readonly":
                 kept = await anyio.to_thread.run_sync(machines.accounts.get, name) if machines.accounts else None
                 if kept is None or kept.enrolled_at is not None or name not in machines.described:

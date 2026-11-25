@@ -1,9 +1,9 @@
 """One-time enrollment codes (ADR-0024 decision 2).
 
 The UI makes a code for a machine's name, the address nervus will use, and
-the level its owner chose, and puts it in the two lines the owner runs as
-root on the machine. The first line fetches the enrollment script with the
-code; the script sends the machine's host keys back with it.
+the level its owner chose, and puts it in the line the owner runs as root
+on the machine (ADR-0032 question 7): it fetches the enrollment script with
+the code, and the script sends the machine's host keys back with it.
 
 What it holds to:
 - **Only a hash of the code is kept** (ADR-0012), so a copy of the database

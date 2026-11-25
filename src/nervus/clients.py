@@ -14,6 +14,7 @@ from nervus.audit_view import Query, read_page
 from nervus.auth import Token, Tokens
 from nervus.database import IssuedToken
 from nervus.switches import SwitchesUnreadable, load_switches
+from nervus.token_codes import TokenCode
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,9 @@ class ClientRow:
     off: bool  # switched off one by one; lockdown and an unreadable file are the view's
     last_call: float | None  # when its newest call began; None if the log has none
     readonly: tuple[str, ...] = ()  # ADR-0031: the hosts it is read-only on
+    # ADR-0032 question 5: the token's latest line, for a token issued to wait for one; None for one issued
+    # before, whose value was shown.
+    line: TokenCode | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +50,8 @@ def _last_call(audit_log: Path, token_id: str) -> float | None:
     return rows[0].when if rows else None
 
 
-def clients_view(tokens: Tokens, issued: Iterable[IssuedToken], switches: Path, audit_log: Path) -> ClientsView:
+def clients_view(tokens: Tokens, issued: Iterable[IssuedToken], switches: Path, audit_log: Path,
+                 lines: dict[str, TokenCode] | None = None) -> ClientsView:
     try:
         state = load_switches(switches)
         lockdown, disabled, unreadable = state.lockdown, state.disabled, ""
@@ -56,7 +61,8 @@ def clients_view(tokens: Tokens, issued: Iterable[IssuedToken], switches: Path, 
     def row(token: Token, from_ui: bool) -> ClientRow:
         return ClientRow(id=token.id, client=token.client, project=token.project, hosts=tuple(sorted(token.hosts)),
                          issued=from_ui, off=token.id in disabled,
-                         last_call=_last_call(audit_log, token.id), readonly=tuple(sorted(token.readonly)))
+                         last_call=_last_call(audit_log, token.id), readonly=tuple(sorted(token.readonly)),
+                         line=(lines or {}).get(token.id) if from_ui else None)
 
     rows = [row(t, False) for t in tokens.in_file()] + [row(i.token, True) for i in issued]
     return ClientsView(rows=sorted(rows, key=lambda r: r.id), lockdown=lockdown, unreadable=unreadable)

@@ -6,8 +6,10 @@ each upload (ADR-0020 decision G; uploads.py uses it), and the VMs nervus has
 enrolled (ADR-0022 decision 5a; enrollments.py uses it), the machines enrolled from the
 UI (ADR-0024 decision 3; enrolled_hosts.py uses it), first-run setup's tier and
 ranges declared internal (ADR-0015; first_run.py uses it), the fingerprints of
-nervus's own keys (ADR-0027 question 6; identity.py uses it), and when backups
-were made, checked, downloaded and restored (ADR-0027 questions 4 and 7).
+nervus's own keys (ADR-0027 question 6; identity.py uses it), when backups
+were made, checked, downloaded and restored (ADR-0027 questions 4 and 7), and the
+one-time codes that hand a token to the computer its client runs on (ADR-0032
+question 5; token_codes.py uses it).
 
 - One file: /var/lib/nervus/nervus.db in the systemd unit, made 0600 by open().
 - Every change is one transaction. It lands whole or not at all, a second
@@ -29,7 +31,7 @@ import re
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -213,6 +215,16 @@ CREATE TABLE IF NOT EXISTS assigned_token (
     project TEXT NOT NULL,
     levels TEXT NOT NULL,
     issued_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS token_code (
+    id TEXT PRIMARY KEY,
+    hash TEXT NOT NULL UNIQUE,
+    token_id TEXT NOT NULL,
+    client TEXT NOT NULL,
+    made_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    used_at REAL,
+    used_from TEXT
 );
 """
 # ADR-0031: what a token may be on one of its machines. Read-write is the
@@ -434,9 +446,15 @@ class Database:
 
     def issue_token(self, id: str, client: str, project: str, hosts: list[str],
                     taken: object = (), never_issued: object = (), now: float | None = None,
-                    readonly: object = ()) -> str:
+                    readonly: object = (), waiting: Callable[[sqlite3.Connection], None] | None = None) -> str | None:
         """Issue a token and return its value, which exists only in what the
         caller shows, once. Raises TokenRefused.
+
+        With `waiting` (ADR-0032 question 5 a), the token has no value yet: it
+        is kept under the hash of one made and thrown away here, which nothing
+        can present, and None is returned. `waiting` is called in the same
+        transaction, to make the one-time code that will hand its value over
+        (nervus.token_codes): a token never waits without one.
 
         `taken` holds the ids already in the token file, so an id names one
         token wherever it lives. A token's hosts are fixed now: to change them,
@@ -472,6 +490,7 @@ class Database:
         if id in taken:
             raise TokenRefused(f"the id {id} is already a token's, in the token file")
         value = secrets.token_urlsafe(TOKEN_BYTES)
+        kept_as = _hash(value) if waiting is None else unknown_value_hash()
         with self._transaction() as db:
             if db.execute("SELECT 1 FROM issued_token WHERE id = ? UNION SELECT 1 FROM assigned_token WHERE id = ?",
                           (id, id)).fetchone():
@@ -480,13 +499,16 @@ class Database:
                 levels = {h: ("read-only" if h in set(readonly) else "read-write") for h in sorted(set(hosts))}
                 db.execute(
                     "INSERT INTO assigned_token (id, hash, client, project, levels, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (id, _hash(value), client.strip(), project.strip(), json.dumps(levels), now),
+                    (id, kept_as, client.strip(), project.strip(), json.dumps(levels), now),
                 )
             else:
                 db.execute(
                     "INSERT INTO issued_token (id, hash, client, project, hosts, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (id, _hash(value), client.strip(), project.strip(), json.dumps(sorted(set(hosts))), now),
+                    (id, kept_as, client.strip(), project.strip(), json.dumps(sorted(set(hosts))), now),
                 )
+            if waiting is not None:
+                waiting(db)
+                return None
         return value
 
     def token(self, value: str) -> Token | None:
@@ -513,11 +535,20 @@ class Database:
     def revoke_token(self, id: str) -> bool:
         """Delete an issued token, from whichever table holds it: its next call
         is refused as an unknown token's (ADR-0006 decision 8). False if there
-        was none."""
+        was none. Its one-time codes go in the same transaction (ADR-0032): a
+        code left behind could hand over a later token issued under the same
+        id, and take its client's value away."""
         with self._transaction() as db:
             gone = db.execute("DELETE FROM issued_token WHERE id = ?", (id,)).rowcount
             gone += db.execute("DELETE FROM assigned_token WHERE id = ?", (id,)).rowcount
+            db.execute("DELETE FROM token_code WHERE token_id = ?", (id,))
             return gone > 0
+
+
+def unknown_value_hash() -> str:
+    """The hash a token waiting for its code is kept under (ADR-0032 question 5 a): of a value
+    made and thrown away here, which nothing can present, so the token lets no one in."""
+    return _hash(secrets.token_urlsafe(TOKEN_BYTES))
 
 
 def _token(row: tuple) -> Token:

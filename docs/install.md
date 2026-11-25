@@ -1,8 +1,10 @@
 # Installing nervus
 
-**This is an early preview.** There is no container image yet (ADR-0005 decision 1). One script,
-`install.sh`, installs nervus on its machine; then, in its web UI, you choose where it runs, give it
-the machines it reaches, and connect your clients. Plan on half an hour. The steps are written to
+**This is an early preview.** There is no container image yet (ADR-0005 decision 1). One line, from
+the repository's latest release page, downloads nervus, checks it, and runs its installer on
+nervus's machine; then, in its web UI, you choose where it runs, give it the machines it reaches, and
+set up each client's computer with one line more (ADR-0032). Nothing is cloned anywhere. Plan on
+half an hour. The steps are written to
 be followed by a person or by their own AI agent, and say at each what should be true before the
 next. What the script does is also written out by hand, at the end, for reading or for a Linux it
 does not know.
@@ -50,11 +52,11 @@ So **which computer hosts nervus decides the tier**, not whether it is a VM or a
 | Linux on your everyday computer, under nervus's own account | 2 | yes |
 | Linux in a VM your everyday computer hosts | 3 | yes; declare it as tier 3 |
 | macOS natively | 2 or 3 | not yet: on a Mac with nothing else, run Linux in a VM the Mac hosts, tier 3 |
-| Windows (WSL2) | 3 | not tested |
+| Windows | 3 | not yet: the container image will cover it (ADR-0032 question 12); until then, run nervus on a separate computer |
 | a container image | 1 or 3 | not yet (ADR-0005 decision 1) |
 
 **Never give nervus root on the machine it runs on.** If nervus's own machine is also one of the
-machines it reaches, with root (the `agent` account and its `sudo`, step 3), then any agent can, through
+machines it reaches, with root (full access: nervus's read-write account and its `sudo`, step 3), then any agent can, through
 nervus itself, read nervus's SSH key, its tokens and its audit log, and reach every other machine
 as nervus. So do not put nervus on a server you also want agents to work on, unless that server is
 not one of nervus's hosts, or is added read-only or standard: nervus refuses full access to its own
@@ -74,10 +76,13 @@ needs no copy anywhere else (ADR-0007 decision 8, as ADR-0025 amended it).
   3.13, Ubuntu 24.04 with Python 3.12 and Ubuntu 26.04 with Python 3.14. Root there, once, to run
   the installer. A machine with no Python at all, as a small container can be, is asked first
   whether the installer may install it, where the machine has `apt-get`.
-- **This repository on that machine**: a clone, or a copy (see "By hand" for an archive). The
-  installer installs exactly the committed tree it sits in.
+- **Nothing to copy there first.** The release page's line downloads the release itself, with
+  `curl`; a minimal machine with no `curl`, as a fresh Debian container is, installs it first, in a
+  root shell: `apt-get update && apt-get install -y curl`. A clone of this repository works too,
+  and so does an archive of it ("By hand"): the installer installs exactly the committed tree it sits
+  in.
 - **An admin login on each machine nervus will reach, once**: root's, or an account that can use
-  `sudo`, with its password, given in the web UI (step 3); or root there, to run two lines
+  `sudo`, with its password, given in the web UI (step 3); or root there, to run one line
   instead. Linux with an SSH server; nervus installs what else the level needs, `tmux` for
   background jobs, and, by the login, `curl` where the machine has none. After that nervus needs
   no password anywhere, and keeps none.
@@ -126,16 +131,35 @@ never by name from a client.
 
 ## 2. Run the installer
 
-**On nervus**, in your copy of this repository:
+**On nervus**, paste the install line from the latest release's page, on this repository's
+Releases. It has this form, with the release's number and its SHA-256 written in:
+
+<!-- install:release -->
+```bash
+curl -fsSLO '<the release's download folder>/nervus-<number>.tar.gz' && echo '<its SHA-256>  nervus-<number>.tar.gz' | sha256sum -c - && tar -xzf nervus-<number>.tar.gz && cd nervus-<number> && sudo ./install.sh
+```
+
+It downloads the release, checks that its SHA-256 is the one the page names, so a file that is not
+that one is refused before anything is unpacked or run, unpacks it into a folder of its own,
+`nervus-<number>`, and runs the installer from there. Nothing is piped into a shell. In a root shell,
+as on a fresh container with no `sudo`, the page gives the same line without `sudo`. The hash proves
+the file is whole and the one the page names; it does not protect against someone who controls the
+repository's account (ADR-0032 question 1).
+
+**The installer asks which address and names your clients and machines will use** to reach nervus:
+it lists this machine's own addresses and its hostname, and you type their numbers, or an address
+or a name of your own. Enter alone takes the first address. Give an address, and the names too if
+your network gives nervus one ("Decide how clients will reach it", step 1); the first name given is
+the one sign-in links use. In a script, or to say it in the command, give them instead, which skips
+the question; from a clone, in its folder:
 
 <!-- install:installer -->
 ```bash
 cd <your copy of this repository> && sudo ./install.sh --address <nervus's address> --name <nervus's name>
 ```
 
-It runs as root: in a root shell, as on a fresh container with no `sudo`, leave `sudo` off and run
-`./install.sh` with the same arguments. Leave out `--name` if your network gives nervus none;
-`--name` may be given more than once. Then:
+Leave out `--name` if your network gives nervus none; `--name` may be given more than once. With
+`--yes`, which answers the plan's question, give `--address` too: there is no one to ask. Then:
 
 - It reads the machine first and changes nothing if anything it needs is missing (it names what),
   if your clone has uncommitted changes, or if nervus is already installed there, when it says which
@@ -153,9 +177,10 @@ It runs as root: in a root shell, as on a fresh container with no `sudo`, leave 
   the only thing that opens a backup: nervus keeps the public half, which can lock a backup but not
   open one. Lose it and every backup is lost with it; "Backups" below says how to make a new one.
 - It sets up a backup once a day (`nervus-backup.timer`).
-- It ends by printing **the root certificate's SHA-256**: keep it with your tokens, since each
-  client machine compares it once. It also prints the command each client machine runs to trust
-  nervus, and a sign-in link for the web UI.
+- It ends by printing **nervus's key**, as `sha256//…`: the Machines and Clients pages show it
+  above each line they give, and you check there that it is this one before you run a line. Keep
+  it, with **the root certificate's SHA-256**, which a clone's `tools/nervus-trust` compares. It also
+  prints a sign-in link for the web UI.
 
 `systemctl status nervus` then shows it active, and `journalctl -u nervus -n 20 --no-pager` shows it
 serving on port 8000 (clients) and 8443 (web UI).
@@ -228,7 +253,7 @@ Then, for each machine, on the UI's **Machines** page (ADR-0024, ADR-0026):
    answering at that address.
 4. **Log in once**, as root or as an account that can use `sudo`, with its password. nervus logs
    in, becomes root, directly or with `sudo` and that password, and runs its enrollment script
-   there, the same script the two lines below run: nervus's accounts, each with exactly nervus's
+   there, the same script the line below runs: nervus's accounts, each with exactly nervus's
    line, the level, and the machine's SSH host keys sent back to nervus, which logs in as each
    account, checks it, and only then adds the machine. A page shows each step as it happens, then the outcome, and the machine
    is in the list. Leaving that page does not stop it; Machines shows what became of it.
@@ -240,25 +265,27 @@ Then, for each machine, on the UI's **Machines** page (ADR-0024, ADR-0026):
    nervus refuses it, the script puts back everything it changed, and the page tells you to change
    that password.
 
-### Advanced: two lines run on the machine yourself
+### Advanced: one line run on the machine yourself
 
-Use these instead of Connect where the machine takes only SSH keys, no password; where only `su`
+Use it instead of Connect where the machine takes only SSH keys, no password; where only `su`
 reaches root there; where you do not trust the network between nervus and the machine (Connect
 trusts the first key it is shown, and the password passes through nervus); or where you want to
 read the script before it runs. On the Machines page, give the name and level, and choose
-**Advanced: two lines to run on the machine yourself**. The address may be left blank here, to use
-the one the machine reaches nervus from. The page shows two lines, once. **On the machine, as
-root**, run them:
+**Advanced: a line to run on the machine yourself**. The address may be left blank here, to use
+the one the machine reaches nervus from. The page shows one line, once. **On the machine**, run it:
 
 <!-- install:enroll -->
 ```bash
-curl -fsSk --pinnedpubkey 'sha256//<nervus's key>' -o nervus-enroll.sh 'https://<nervus>:8000/enroll/<one-time code>'
-less nervus-enroll.sh && sh nervus-enroll.sh
+curl -fsSk --pinnedpubkey 'sha256//<nervus's key>' 'https://<nervus>:8000/enroll/<one-time code>' | sudo sh
 ```
 
-The first fetches nervus's enrollment script, and refuses any server whose key is not nervus's (`-k`
-only stops curl asking the machine's own certificate authorities, which do not know nervus's). The
-second shows you the script; read it, quit with `q`, and it runs. It makes nervus's accounts, each
+In a root shell, as on a machine with no `sudo`, end it with `| sh` instead. It fetches nervus's
+enrollment script, refusing any server whose key is not nervus's (`-k` only stops curl asking the
+machine's own certificate authorities, which do not know nervus's), and runs it as root. The page
+shows the key the line checks: it is the one the installer printed as nervus's key, so if they
+differ, stop. Beneath the line, the page shows the script itself, for you to read first if you
+want to. Nothing in it runs until all of it has arrived: everything below its values is one
+function, called on its last line, so a download cut partway changes nothing. It makes nervus's accounts, each
 with exactly nervus's line, sets up the level (installing bubblewrap for the read-only account, and
 `sudo` for full, with `apt-get` if missing, and `tmux` for background jobs at every level), and
 sends the machine's SSH host keys back to nervus. Where the machine's AppArmor keeps bubblewrap from
@@ -267,17 +294,17 @@ it also gives nervus its own copy of bubblewrap, which only the read-only accoun
 AppArmor profile letting that copy alone make them, and an apt hook keeping the copy up to date
 (ADR-0024 question 9); removal takes all three off. nervus then logs in with those keys as each
 account, checks it, and only then adds the machine. The script ends by saying so, and the Machines page lists it.
-The lines work once, within 15 minutes; the script checks its code first, so a used or expired one,
-or a copy left from an earlier try, changes nothing. If anything fails, the script says why, and you
-make new ones. If nervus does not add the machine, or the script stops before it is done (Ctrl-C
+The line works once, within 15 minutes; the script checks its code first, so a used or expired one
+changes nothing, and curl says the URL returned error 404. If anything fails, the script says why, and
+you make a new line. If nervus does not add the machine, or the script stops before it is done (Ctrl-C
 included), it puts back everything it changed as it was: each account's SSH keys and sudoers line,
 nervus's read-only shell, and its copy of bubblewrap. It deletes the accounts it made, and leaves the
 packages it installed. So a failed attempt to change a machine's level leaves nervus the access it
 had there (ADR-0031 question 12). At full, on the machine nervus runs on, it refuses before changing
 anything.
 
-**What a machine needs:** Linux with an SSH server. For the two lines, also `curl`, which fetches
-them; by Connect, nervus installs `curl` itself where it is missing and the machine has `apt-get`,
+**What a machine needs:** Linux with an SSH server. For the line, also `curl`, which fetches
+the script; by Connect, nervus installs `curl` itself where it is missing and the machine has `apt-get`,
 and says so among its steps. For Connect, also a password login
 over SSH for root or for an account that can use `sudo`; most machines refuse root's password over
 SSH (OpenSSH's `PermitRootLogin`), so an account with `sudo` is the usual one. A machine you would
@@ -290,14 +317,14 @@ makes commands.
 
 **Later:**
 - **To reinstall a machine, or change its level**, add it again under its name, by Connect or the
-  two lines. Don't remove it first: the tokens that name it keep reaching it. If the change gives
+  line. Don't remove it first: the tokens that name it keep reaching it. If the change gives
   tokens something new (a higher level, or a name a removed machine had), the page lists them and
   asks you to type the name. **A machine added before 0.3.0** has one account, `agent`, and no
   read-only one; adding it again gives it both, and takes nervus's line, and its sudoers line, off
   `agent`.
 - **A machine described by hand**, in nervus's inventory rather than added here, gains a read-only
   account from the Machines page too: beside it, give the account's name, or keep nervus's, and
-  the page shows two lines like the ones above, to run on it as root. They make the read-only
+  the page shows a line like the one above, to run on it. It makes the read-only
   account alone and change nothing else there, not the account the machine is described with and
   not `sudo`; nervus then logs in as it, checks it is read-only, and records it. **Forget it** on
   the same page takes it away from nervus and shows the commands that take it off the machine.
@@ -327,20 +354,19 @@ makes commands.
 
 ## 4. Connect your clients
 
-- **Issue a token for each client and project**, on the UI's Clients page, choosing the machines it
-  may reach (ADR-0001 s6, ADR-0014). For each machine with both accounts, choose explicitly: not on
-  this token, read-only, or read-write (ADR-0031); nothing is chosen for you, and the token is not
-  issued until each has a choice. The UI shows it once; keep it where you keep secrets: it goes
-  to the client, never into a repository.
-- **On each client machine**, in your clone of this repository: save nervus's root, comparing it
-  with the value the installer printed, then run `tools/nervus-status` (`docs/clients.md`, "Trust
-  nervus's certificate" and "Check it"). Green there means a client will work.
-
-  ```bash
-  tools/nervus-trust https://<nervus's name or address>:8000/mcp --expect '<the root certificate SHA-256 the installer printed>'
-  ```
-- **Wire up the clients:** `docs/clients.md`. After a client's first call, find it in the UI's audit
-  log under its token id.
+- **Issue a token for each client application**, on the UI's Clients page: the client it is for,
+  from a list, and the machines it may reach (ADR-0001 s6, ADR-0014, ADR-0030). For each machine
+  with both accounts, choose explicitly: not on this token, read-only, or read-write (ADR-0031);
+  nothing is chosen for you, and the token is not issued until each has a choice.
+- **On the computer the client runs on**, run the line the next page gives, as yourself, once you
+  have checked that the key it shows is the one the installer printed: one for macOS and Linux, one
+  for Windows PowerShell. It saves nervus's root there, fetches the token by a one-time code and
+  keeps it where only you can read it, and prints the commands that tell the client to use nervus,
+  which you run. The token is never shown (`docs/clients.md`, "Set up the computer your client runs
+  on"). With a clone, `tools/nervus-trust` and `tools/nervus-status` still do it by hand
+  (`docs/clients.md`).
+- **Check it:** start a new session of the client and ask it to call nervus's `hosts` tool; find
+  the call in the UI's audit log under its token id.
 
 ## 5. Check that your recovery key opens a backup
 
@@ -375,8 +401,8 @@ expected:
 - `tools/proxmox-accounts`: the `observer` and `agent` accounts, each trusting nervus's certificate
   authority alone, as a machine added on the Machines page does (ADR-0025), and the host's keys pinned
   in nervus. It asks for the authority's fingerprint, read somewhere other than this host so a
-  wrong one stops it: `ssh-keygen -lf ~agent/.ssh/authorized_keys` on a machine nervus already
-  reaches, or, before there is one, `ssh-keygen -lf /opt/nervus/secrets/nervus_ca_ed25519.pub` on
+  wrong one stops it: `ssh-keygen -lf ~nervusagent-readonly/.ssh/authorized_keys` on a machine
+  added on the Machines page (`~agent` on one added before 0.3.0 or by hand), or, before there is one, `ssh-keygen -lf /opt/nervus/secrets/nervus_ca_ed25519.pub` on
   nervus as the installer left it. The root level is the machine underneath nervus ("Where nervus may run"): a client given
   it can stop nervus and rewrite its audit log, so give it to none, or to the one you would trust
   with nervus itself.
@@ -552,6 +578,17 @@ what you will see, what each client must do, and what the upgrade does on nervus
 
 **Then bring the newer release to nervus's machine**, as you brought the first:
 
+- **From the release page:** its upgrade line downloads the newer release into a folder of its own,
+  checks its SHA-256, and runs the upgrade from there, all in one line, the same as the install
+  line ending in `--upgrade`:
+
+  <!-- install:release-upgrade -->
+  ```bash
+  curl -fsSLO '<the release's download folder>/nervus-<number>.tar.gz' && echo '<its SHA-256>  nervus-<number>.tar.gz' | sha256sum -c - && tar -xzf nervus-<number>.tar.gz && cd nervus-<number> && sudo ./install.sh --upgrade
+  ```
+
+  An installation made from a release upgrades from a release, and one made from a clone from a
+  clone; the installer takes either.
 - **A clone:** `git pull` in it. On tier 1 that needs your access to this repository from nervus's
   machine, as cloning it did.
 - **An archive**, made on your own computer and copied over ("By hand", The code): unpack it in a

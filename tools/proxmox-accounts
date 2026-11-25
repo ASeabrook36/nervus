@@ -11,7 +11,8 @@
 # It can be fed in on standard input (`ssh root@<host> '<the names> bash -s' < proxmox-accounts`).
 # The two fingerprints are checked, not trusted: give each as you have it from somewhere
 # other than this host -- nervus's CA as a machine nervus enrolled holds it
-# (`ssh-keygen -lf ~agent/.ssh/authorized_keys` there), this host's key as your own
+# (`ssh-keygen -lf ~nervusagent-readonly/.ssh/authorized_keys` there, or `~agent` on a
+# machine added before 0.3.0 or by hand), this host's key as your own
 # known_hosts has it -- so that a wrong key stops it.
 #
 # If sudo is not installed, it stops and says so; `install-sudo` installs it and goes on.

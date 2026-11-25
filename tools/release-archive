@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""release-archive -- make a release's download from the preview's export commit, check it, and
+write its release page (ADR-0032 questions 1 and 2, step 2).
+
+Run on the operator's machine at export, from this repository, with its venv, once
+tools/export-preview has passed and its result is committed in the preview repository:
+
+    .venv/bin/python tools/release-archive <preview checkout> --out <folder> [--commit REF] [--url URL]
+
+<preview checkout> is the preview repository's checkout, the one the export was committed in. REF
+is its export commit (default HEAD). Everything is read from that commit, never from the working
+tree, so nothing unsaved or untracked goes into the download. In order, stopping at the first thing
+that fails:
+
+  1. Reads the release from the commit, which must be the preview's export. This repository's own
+     commits say "Exported <the day>." too, from an export until the next number is set, so its
+     tree is what tells them apart: it must hold none of what tools/export-preview leaves out of
+     every export and does not put back (the deployment record: procedures/, deployment/,
+     CURRENT_STATE.md and hosts.yaml; this repository's .mcp.json; and preview/), and must hold the
+     preview's own files that export-preview puts in their place, README.md and .mcp.json.example.
+     Pointed at this repository's own checkout, it stops there, saying so.
+     Its number is the version in its pyproject.toml: three numbers with no leading zeros, in
+     quotes, such as 0.4.0, as tools/export-preview requires. Its CHANGES.md must have that
+     release's section, a line "## <number>", which may go on after a space, whose first line is
+     "Exported <the day>." and nothing else: the commit an export is made from says so
+     (tests/test_changes.py). Then it works out the folder the release page's line downloads from
+     (below), so that a remote it cannot use stops it before anything is made.
+  2. Makes nervus-<number>.tar.gz: the commit's git archive, every path under one folder,
+     nervus-<number>/, compressed by gzip with no time and no file name in its header. Made again
+     from the same commit, with the same git and the same Python (whose zlib compresses it), it is
+     the same bytes; but the SHA-256 on a release page rests on the file being made once and kept
+     (ADR-0032 question 1), not on making it again. So a nervus-<number>.tar.gz or
+     nervus-<number>.release.md already in <folder>, a link to nothing included, is refused, never
+     replaced.
+  3. Checks it unpacks and installs as the tree does. Each member is read first, and must lie under
+     nervus-<number>/, with no absolute path and no empty, "." or ".." part in its name, and be a
+     file, a folder or a symbolic link: no device, fifo or hard link. Nothing may lie beneath a
+     link. A link's target, followed from the link's folder a part at a time, may not be an
+     absolute path, may not leave nervus-<number>/ on its way, and may not pass through another
+     link, since on disk a link's ".." is taken from where that link points: s -> . and then
+     p -> s/.. would be nervus-<number>/.., outside. Then it is unpacked in a temporary folder by
+     the system's own `tar -xzf`, as the release page's line unpacks it, and there:
+     a. the archive's own tools/release-name names the unpacked folder exactly as it names the
+        commit's git archive: the same number and code. The code covers every file's bytes and its
+        owner's run bit, and is how install.sh names a release and checks what it copied;
+     b. the archive's own tools/lock-libraries --check passes, as install.sh requires;
+     c. install.sh is a file its owner may run.
+  4. Puts the archive and its description in <folder>, made if missing: each is written whole under
+     a name of its own there, flushed to the disk, and only then given its name, which fails if the
+     name is taken. A write that fails, a full disk say, leaves nothing of the run in <folder>, so
+     a nervus-<number>.tar.gz there is always one this tool made whole and checked. It prints the
+     archive's name, size and SHA-256. Then the release page: its title, "nervus <number>", and its
+     tag, "v<number>", on the commit, each a field of its own on the release form; and its
+     description, to paste, the text of nervus-<number>.release.md. The description holds the
+     install line, exactly ADR-0032 question 2's; the same line for a root shell, as on a fresh
+     container with no sudo; what a minimal machine with no curl installs first; the upgrade line,
+     and its root-shell form; what the SHA-256 proves; and the release's own section of
+     CHANGES.md, read from the archive.
+  5. Says what the operator does next: create the release on the repository's release page, with
+     the tag on the export commit, attach the file, and paste the description.
+
+The line downloads <URL>/nervus-<number>.tar.gz. URL is --url when given: for a trial, any folder
+curl can fetch the file from, file:// included, with no space, quote, backtick, "?" or "#" in it,
+since it goes into the line, inside a code block, whole. Otherwise it is the GitHub release's own
+download folder, https://github.com/<owner>/<repository>/releases/download/v<number>, worked out
+from the preview checkout's origin remote, which may be https://github.com/<owner>/<repository>.git,
+git@github.com:<owner>/<repository>.git or ssh://git@github.com/<owner>/<repository>, with or
+without the .git. Any other remote, or none, with no --url, stops it, asking for --url.
+
+Exit 0: the archive passed every check, and it and its description are in <folder>. Exit 1:
+something failed, said above; nothing is put in <folder>. Exit 2: it could not run (its arguments,
+or no git or tar).
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import io
+import itertools
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+from pathlib import Path
+
+NUMBER = re.compile(r"(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}")
+# A section's first line once its release is exported, and nothing else on it (tests/test_changes.py).
+EXPORTED = re.compile(r"Exported [0-9]{4}-[0-9]{2}-[0-9]{2}\.")
+# The forms of a GitHub remote: an owner, and a repository, with or without its .git.
+GITHUB = [re.compile(rf"{start}([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?")
+          for start in (r"https://github\.com/", r"git@github\.com:", r"ssh://git@github\.com/")]
+# A URL that goes into the line whole, inside single quotes, inside the page's code block: a scheme, and nothing
+# a shell would split or end, no backtick to close the block, and no query or fragment, which a folder has not.
+URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'`?#]+")
+FIX = "give the preview repository's export commit, the one tools/export-preview's result was committed as"
+# What tools/export-preview leaves out of every export and does not put back, at the top of its tree: its LEFT_OUT,
+# less what its ADDED puts in their place. And the preview's own files, which ADDED puts there. Two tools, one list:
+# tests/test_release_archive.py holds these to export-preview's.
+NOT_IN_AN_EXPORT = ("procedures", "CURRENT_STATE.md", "hosts.yaml", "deployment", ".mcp.json", "preview")
+THE_PREVIEWS_OWN = ("README.md", ".mcp.json.example")
+DEPLOYMENT_RECORD = ("procedures", "CURRENT_STATE.md", "hosts.yaml", "deployment")
+NOT_THE_PREVIEW = "run release-archive on the preview repository's checkout, at its export commit"
+
+
+class Stop(Exception):
+    """A check failed; the message says which and what to do."""
+
+
+class CannotRun(Exception):
+    """It could not run: its arguments, or a command it needs."""
+
+
+def say(line: str) -> None:
+    print(f"[release-archive] {line}", flush=True)
+
+
+def git(checkout: Path, *args: str, binary: bool = False):
+    done = subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, check=False)
+    if done.returncode:
+        raise Stop(f"git {' '.join(args)} failed in {checkout}: {done.stderr.decode(errors='replace').strip()}")
+    return done.stdout if binary else done.stdout.decode()
+
+
+def shown(checkout: Path, sha: str, path: str) -> bytes | None:
+    """The bytes of `path` in the commit, or None if the commit has no such file."""
+    there = subprocess.run(["git", "-C", str(checkout), "cat-file", "-e", f"{sha}:{path}"], capture_output=True,
+                           check=False)
+    return git(checkout, "show", f"{sha}:{path}", binary=True) if there.returncode == 0 else None
+
+
+def release_number(pyproject: bytes | None, which: str) -> str:
+    if pyproject is None:
+        raise Stop(f"{which} has no pyproject.toml; {FIX}")
+    try:
+        project = tomllib.loads(pyproject.decode("utf-8")).get("project")
+    except ValueError as exc:  # not UTF-8, or not TOML
+        raise Stop(f"cannot read the pyproject.toml of {which}: {exc}; {FIX}") from exc
+    number = project.get("version") if isinstance(project, dict) else None  # no [project], or not a table
+    if number is None:
+        raise Stop(f"the pyproject.toml of {which} names no version; {FIX}")
+    if not isinstance(number, str):  # TOML's strings are in quotes: version = 0.2 is a number
+        raise Stop(f'the release number of {which}, {number!r}, is not in quotes, as in version = "0.2.0"; {FIX}')
+    if not NUMBER.fullmatch(number):
+        raise Stop(f"the release number of {which}, {number!r}, is not three numbers with no leading zeros, "
+                   f"such as 0.2.0; {FIX}")
+    return number
+
+
+def section(text: str, number: str) -> list[str] | None:
+    """The lines of CHANGES.md's section for `number`, below its heading, to the next "## "; or None."""
+    lines = text.splitlines()
+    heading = re.compile(rf"## {re.escape(number)}( .*)?")
+    at = next((i for i, line in enumerate(lines) if heading.fullmatch(line)), None)
+    if at is None:
+        return None
+    return list(itertools.takewhile(lambda line: not line.startswith("## "), lines[at + 1:]))
+
+
+def exported(changes: bytes | None, number: str, which: str) -> str:
+    """The section's first line, if it says the day the release was exported; else Stop."""
+    if changes is None:
+        raise Stop(f"{which} has no CHANGES.md; {FIX}")
+    body = section(changes.decode("utf-8", errors="replace"), number)
+    if body is None:
+        raise Stop(f'the CHANGES.md of {which} has no section for {number}, a line "## {number}"; {FIX}')
+    first = ("\n".join(body).strip().splitlines() or [""])[0]
+    if not EXPORTED.fullmatch(first):
+        raise Stop(f'the section for {number} in the CHANGES.md of {which} begins {first!r}, not "Exported '
+                   f'<the day>.", so it is not an export\'s commit; {FIX}')
+    return first
+
+
+def listed(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def an_export(checkout: Path, sha: str) -> None:
+    """Refused unless the commit's tree is an export's: none of what export-preview leaves out, and its own files."""
+    names = [name for name in git(checkout, "ls-tree", "-z", "--name-only", sha).split("\0") if name]
+    held = [name for name in names if name in NOT_IN_AN_EXPORT]
+    if held:
+        record, own = (any((name in DEPLOYMENT_RECORD) == side for name in held) for side in (True, False))
+        what = listed(["the deployment record"] * record + ["this repository's own files"] * own)
+        raise Stop(f"commit {sha[:7]} is not the preview's export: it holds {listed(held)}, {what}, which "
+                   "tools/export-preview leaves out of every export. It is a commit of this repository, not of the "
+                   f"preview's; {NOT_THE_PREVIEW}")
+    lacking = [name for name in THE_PREVIEWS_OWN if name not in names]
+    if lacking:
+        raise Stop(f"commit {sha[:7]} is not the preview's export: it has no {listed(lacking)}, the preview's own, "
+                   f"which tools/export-preview puts in every export; {NOT_THE_PREVIEW}")
+
+
+def release(checkout: Path, ref: str) -> tuple[str, str, str]:
+    """The commit's full sha, its release number, and its section's first line."""
+    try:
+        sha = git(checkout, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip()
+    except Stop:
+        raise Stop(f"{ref} is not a commit of {checkout}; {FIX}") from None
+    an_export(checkout, sha)
+    which = f"commit {sha[:7]}"
+    number = release_number(shown(checkout, sha, "pyproject.toml"), which)
+    return sha, number, exported(shown(checkout, sha, "CHANGES.md"), number, which)
+
+
+def download_folder(checkout: Path, number: str, given: str | None) -> str:
+    if given is not None:
+        return given
+    done = subprocess.run(["git", "-C", str(checkout), "remote", "get-url", "origin"], capture_output=True,
+                          text=True, check=False)
+    remote = done.stdout.strip() if done.returncode == 0 else None
+    for form in GITHUB:
+        if remote and (found := form.fullmatch(remote)):
+            owner, repository = found.groups()
+            return f"https://github.com/{owner}/{repository}/releases/download/v{number}"
+    which = f"its origin remote, {remote}, is not on GitHub" if remote else "it has no origin remote"
+    raise Stop(f"the release page's line needs the folder it downloads from, and {which}: give it as --url")
+
+
+def make(checkout: Path, sha: str, top: str) -> bytes:
+    """The commit's git archive, under `top`/, gzipped with no time and no file name: with the same git and the same
+    Python (its zlib), the same commit gives the same bytes. The release page's hash rests on keeping the file."""
+    tar = git(checkout, "archive", "--format=tar", f"--prefix={top}/", sha, binary=True)
+    made = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=made, compresslevel=9, mtime=0) as gz:
+        gz.write(tar)
+    return made.getvalue()
+
+
+def kind(member: tarfile.TarInfo) -> str:
+    if member.islnk():
+        return "a hard link"
+    if member.ischr() or member.isblk():
+        return "a device"
+    if member.isfifo():
+        return "a fifo"
+    return f"of tar's type {member.type!r}"
+
+
+def followed(name: str, target: str, top: str, links: set[str]) -> str | None:
+    """Why the target of the link `name` is refused, followed from the link's folder a part at a time; or None.
+
+    On disk a link's ".." is taken from where it points, not from where it lies, so a target that passes through
+    another link can resolve somewhere its parts do not say: with s -> ., p -> s/.. is the folder above `top`. A
+    target that never passes through a link resolves as its parts say, and so must stay under `top`/ at each one."""
+    if target.startswith("/"):
+        return f"a link to an absolute path, {target!r}"
+    where = name.split("/")[:-1]
+    steps = [part for part in target.split("/") if part not in ("", ".")]
+    for at, part in enumerate(steps):
+        if part == "..":
+            where.pop()
+            if not where:
+                return f"a link pointing outside {top}/, to {target!r}"
+            continue
+        where.append(part)
+        # Its last part may be a link: that link's own target is checked as it is, from where it lies.
+        if at < len(steps) - 1 and "/".join(where) in links:
+            return f"a link whose target passes through {'/'.join(where)!r}, a link, to {target!r}"
+    return None
+
+
+def members(archive: Path, top: str) -> None:
+    """Every member under `top`/, safe to unpack: read before anything is unpacked."""
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            everything = tar.getmembers()
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise Stop(f"the archive cannot be read back: {exc}") from exc
+    # Each name as tar unpacks it: a slash at its end, which tarfile takes away from a folder's alone, names the same.
+    names = [member.name.rstrip("/") for member in everything]
+    links = {name for name, member in zip(names, everything) if member.issym()}
+    for name, member in zip(names, everything):
+        parts = name.split("/")
+        if name.startswith("/"):
+            raise Stop(f"{name!r} in the archive is an absolute path")
+        if ".." in parts:
+            raise Stop(f"{name!r} in the archive goes up a folder, by ..")
+        if parts[0] != top:
+            raise Stop(f"{name!r} in the archive is not under {top}/")
+        if "" in parts or "." in parts:
+            raise Stop(f"{name!r} in the archive has an empty or . part, so it is not the one path it reads as")
+        beneath = next((above for above in ("/".join(parts[:i]) for i in range(1, len(parts))) if above in links),
+                       None)
+        if beneath is not None:
+            raise Stop(f"{name!r} in the archive lies beneath {beneath!r}, a link: unpacking it could write "
+                       "wherever the link points")
+        if member.issym():
+            why = followed(name, member.linkname, top, links)
+            if why is not None:
+                raise Stop(f"{name!r} in the archive is {why}")
+        elif not (member.isreg() or member.isdir()):
+            raise Stop(f"{name!r} in the archive is {kind(member)}, not a file, a folder or a symbolic link")
+
+
+def unpack(into: Path, name: str, top: str) -> Path:
+    """The archive in `into` unpacked there by the system's own tar, as the release page's line runs it."""
+    done = subprocess.run(["tar", "-xzf", name], cwd=into, capture_output=True, text=True, check=False)
+    if done.returncode:
+        raise Stop(f"the system's tar -xzf could not unpack it: {(done.stdout + done.stderr).strip()}")
+    if not (into / top).is_dir():
+        raise Stop(f"the system's tar -xzf unpacked no {top}/")
+    return into / top
+
+
+def tool(folder: Path, name: str) -> Path:
+    path = folder / "tools" / name
+    if not path.is_file():
+        raise Stop(f"the archive has no tools/{name}, which install.sh runs; it is part of this repository")
+    return path
+
+
+def named(checkout: Path, sha: str, folder: Path, number: str) -> str:
+    """The release's name, if the archive's own release-name names the unpacked folder as it names the commit."""
+    namer = tool(folder, "release-name")
+    by_folder = subprocess.run([sys.executable, "-I", str(namer), "--full", str(folder)], capture_output=True,
+                               text=True, check=False)
+    by_commit = subprocess.run([sys.executable, "-I", str(namer), "--full", "--archive"],
+                               input=git(checkout, "archive", "--format=tar", sha, binary=True), capture_output=True,
+                               check=False)
+    for done, which in ((by_folder, "the unpacked archive"), (by_commit, f"commit {sha[:7]}")):
+        if done.returncode:
+            why = done.stderr if isinstance(done.stderr, str) else done.stderr.decode(errors="replace")
+            raise Stop(f"release-name cannot name {which}: {why.strip().removeprefix('release-name: ')}")
+    folder_name, commit_name = by_folder.stdout.strip(), by_commit.stdout.decode().strip()
+    if folder_name != commit_name:
+        raise Stop(f"unpacked by tar -xzf, the archive is not the tree of commit {sha[:7]}: release-name names "
+                   f"it {folder_name.split(' ')[0]}, and the commit {commit_name.split(' ')[0]}. A file was lost, "
+                   "gained or changed, or lost its run bit, on the way; install.sh would install another release")
+    name, its_number, _ = folder_name.split(" ")
+    if its_number != number:
+        raise Stop(f"release-name reads the release as {its_number}, and pyproject.toml says {number}")
+    return name
+
+
+def lock(folder: Path) -> None:
+    done = subprocess.run([sys.executable, "-I", str(tool(folder, "lock-libraries")), "--check", str(folder)],
+                          capture_output=True, text=True, check=False)
+    if done.returncode:
+        why = done.stderr.strip().removeprefix("lock-libraries: ").replace(str(folder), "the archive")
+        raise Stop(f"{why}; install.sh would refuse it. tools/export-preview checks the lock, so this commit is not "
+                   f"what it passed; {FIX}")
+
+
+def runnable(folder: Path) -> None:
+    script = folder / "install.sh"
+    mode = script.lstat().st_mode if script.is_symlink() or script.exists() else 0
+    if not (stat.S_ISREG(mode) and mode & stat.S_IXUSR):
+        raise Stop("the archive's install.sh is not a file its owner may run, so the line's ./install.sh would be "
+                   "refused; it is committed with its run bit in this repository, and exported so")
+
+
+def page(url: str, digest: str, number: str, changes: list[str]) -> str:
+    """The release page's description: the lines to paste, what the SHA-256 proves, and the release's changes."""
+    name, top = f"nervus-{number}.tar.gz", f"nervus-{number}"
+    fetch = (f"curl -fsSLO '{url}/{name}' && echo '{digest}  {name}' | sha256sum -c - && tar -xzf {name} "
+             f"&& cd {top} && ")
+    what_changed = "\n".join(changes).strip()
+
+    def block(line: str) -> str:
+        return f"```bash\n{line}\n```"
+
+    return f"""\
+## Install
+
+On the machine nervus will run on, Linux with systemd, paste this line. It downloads this
+release, checks it is the file this page names, unpacks it into a folder of its own,
+`{top}`, and runs the installer from there, which shows its plan and waits for `yes`:
+
+{block(fetch + "sudo ./install.sh")}
+
+In a root shell, as on a fresh container with no `sudo`:
+
+{block(fetch + "./install.sh")}
+
+A minimal machine may have no `curl`; a fresh Debian container has none. Install it first, in a
+root shell:
+
+{block("apt-get update && apt-get install -y curl")}
+
+## Upgrade
+
+To upgrade a nervus installed from an earlier release to this one, on its machine:
+
+{block(fetch + "sudo ./install.sh --upgrade")}
+
+In a root shell:
+
+{block(fetch + "./install.sh --upgrade")}
+
+## What the SHA-256 proves
+
+`sha256sum -c` stops the line before anything is unpacked or run, unless the file's SHA-256 is the
+one written in the line. That proves the file is whole, and is the one this page names. It does not
+protect against someone who controls the repository's account, who could change both the file and
+this page.
+
+## What {number} changes
+
+{what_changed}
+"""
+
+
+def keep(out: Path, files: list[tuple[str, bytes]]) -> None:
+    """Each file put in `out` whole, never replacing one, or nothing of this run left there.
+
+    Each is written under a name of its own in `out` and flushed to the disk; only once all are whole is each linked
+    to its name, which fails if the name is taken, a link to nothing included. A file cut short, by a full disk say,
+    so never stands under a name a later run would call the one to publish."""
+    made: list[Path] = []
+    staged: list[tuple[Path, Path]] = []
+    at = out
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for name, data in files:
+            at = out / f".{name}.{os.getpid()}.partial"
+            fd = os.open(at, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            made.append(at)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            staged.append((at, out / name))
+        for partial, final in staged:
+            at = final
+            os.link(partial, final)
+            made.append(final)
+    except OSError as exc:
+        for path in made:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if isinstance(exc, FileExistsError) and any(at == final for _, final in staged):
+            raise Stop(f"{at} is there already, and is never replaced") from exc
+        raise Stop(f"cannot write {at}: {exc.strerror or exc}; nothing of this run is left in {out}") from exc
+    for partial, _ in staged:
+        try:
+            partial.unlink()
+        except OSError:
+            pass  # its name is its file's other name, hidden, and the file is whole under the name it was given
+
+
+def refuse_kept(out: Path, names: list[str]) -> None:
+    for name in names:
+        path = out / name
+        if path.exists() or path.is_symlink():
+            raise Stop(f"{path} is there already, and is never replaced: the SHA-256 on a release page is of a file "
+                       "made once and kept. One this tool made is whole and was checked, so if it is this "
+                       "release's, it is the one to publish; otherwise give another --out")
+
+
+def checkout_top(preview: Path) -> Path:
+    if not preview.is_dir():
+        raise CannotRun(f"{preview} is not a folder; give the preview repository's checkout")
+    done = subprocess.run(["git", "-C", str(preview), "rev-parse", "--show-toplevel"], capture_output=True,
+                          text=True, check=False)
+    if done.returncode:
+        raise CannotRun(f"{preview} is not a git checkout; give the preview repository's checkout")
+    return Path(done.stdout.strip()).resolve()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="release-archive", description=__doc__.split("\n\n")[0])
+    parser.add_argument("preview", type=Path, help="the preview repository's checkout, holding the export commit")
+    parser.add_argument("--out", type=Path, required=True,
+                        help="the folder the archive and its release page's description are put in; made if missing")
+    parser.add_argument("--commit", default="HEAD", help="the export commit (default HEAD)")
+    parser.add_argument("--url", help="the folder the release page's line downloads the archive from (default: the "
+                                      "GitHub release's, from the preview checkout's origin remote)")
+    args = parser.parse_args(argv)
+    url = args.url.rstrip("/") if args.url is not None else None
+    if url is not None and not URL.fullmatch(url):
+        parser.error(f"--url {args.url!r} is not a URL the line can carry: a scheme such as https:// or file://, "
+                     "then no spaces and no single quotes")
+
+    out = args.out.resolve()
+    try:
+        for command in ("git", "tar"):
+            if shutil.which(command) is None:
+                raise CannotRun(f"{command} is not installed, and is needed")
+        top = checkout_top(args.preview.resolve())
+        if out.exists() and not out.is_dir():
+            raise CannotRun(f"{out} is not a folder; give a folder for --out")
+        if out == top or top in out.parents:
+            raise CannotRun("--out cannot be inside the preview checkout, where the archive could be committed")
+    except CannotRun as exc:
+        print(f"[release-archive] {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        sha, number, day = release(top, args.commit)
+        say(f'1.   commit {sha}, release {number}: its CHANGES.md section says "{day}"')
+        url = download_folder(top, number, url)
+        root, name, described = f"nervus-{number}", f"nervus-{number}.tar.gz", f"nervus-{number}.release.md"
+        refuse_kept(out, [name, described])
+        data = make(top, sha, root)
+        say(f"2.   made {name} from {sha[:7]}, every path under {root}/")
+        with tempfile.TemporaryDirectory(prefix="release-archive-") as tmp:
+            (Path(tmp) / name).write_bytes(data)
+            members(Path(tmp) / name, root)
+            folder = unpack(Path(tmp), name, root)
+            release_name = named(top, sha, folder, number)
+            lock(folder)
+            runnable(folder)
+            changes = section((folder / "CHANGES.md").read_text(encoding="utf-8", errors="replace"), number)
+        say(f"3.   its members are safe to unpack; tar -xzf unpacks it into {root}/, which release-name names "
+            f"{release_name}, as it names the commit; its lock is its release's; install.sh may be run")
+        digest = hashlib.sha256(data).hexdigest()
+        description = page(url, digest, number, changes or [])
+        keep(out, [(name, data), (described, description.encode("utf-8"))])
+        say(f"4.   {out / name}: {len(data):,} bytes, SHA-256 {digest}")
+        say("     the release page:")
+        say(f"       title        nervus {number}")
+        say(f"       tag          v{number}, on commit {sha}")
+        say(f"       description  as follows, also in {out / described}:")
+        print(f"\n{description}", flush=True)
+    except Stop as exc:
+        say(f"STOP  {exc}")
+        say(f"nothing was put in {out}")
+        return 1
+    say("done. Next, once the export commit is pushed, on the repository's release page, draft a new release:")
+    say(f"  - the tag v{number}, on commit {sha}, the export commit; the title nervus {number}")
+    say(f"  - attach {out / name}: the line downloads it from {url}/{name}")
+    say(f"  - paste {out / described} as its description, and publish it")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

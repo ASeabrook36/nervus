@@ -27,6 +27,7 @@ from nervus.auth import (
 from nervus.config import Host, Settings, hypervisor_host
 from nervus.download import download_endpoint
 from nervus.host_enrollment import HostEnrollment, enroll_endpoint
+from nervus.laptop import LaptopRoute, laptop_endpoints
 from nervus.upload_route import upload_endpoints
 from nervus.uploader import Uploader
 from nervus.exporter import DEFAULT_WAIT_SECONDS, MEASURING, Exporter, HostRequest, Status, VMRequest, export_fields
@@ -289,6 +290,7 @@ def build_server(
     enrolled: EnrolledHostStore | None = None,
     enrollment: HostEnrollment | None = None,
     machine_accounts: accounts.MachineAccounts | None = None,
+    laptop: LaptopRoute | None = None,
 ) -> MCPServer:
     """Build the nervus MCP server: tool surface, audit, and the one
     authorization check this layer performs beyond token validity --
@@ -799,6 +801,13 @@ def build_server(
         mcp_server.custom_route("/enroll/{code}", methods=["GET", "POST"], include_in_schema=False)(
             enroll_endpoint(enrollment)
         )
+
+    if laptop is not None:
+        # Beside /mcp on the same port, unauthenticated but for the one-time code, so a laptop can fetch its
+        # script and its token (ADR-0032 questions 4, 5 and 11).
+        sh, windows = laptop_endpoints(laptop)
+        mcp_server.custom_route("/laptop/{code}", methods=["GET", "POST"], include_in_schema=False)(sh)
+        mcp_server.custom_route("/laptop/{code}/windows", methods=["GET"], include_in_schema=False)(windows)
 
     if exporter is not None:
         exports = exporter

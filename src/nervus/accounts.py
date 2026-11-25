@@ -61,7 +61,7 @@ class NoReadOnlyAccount(ValueError):
         super().__init__(
             f"{host} has no read-only account{because}, and this token is read-only there, so nothing ran. "
             f"Its owner adds one from nervus's Machines page: by adding the machine again, or, for a machine "
-            f"described by hand, with the two lines shown beside it.")
+            f"described by hand, with the line shown beside it.")
         self.host = host
 
 

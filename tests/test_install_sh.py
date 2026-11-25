@@ -12,10 +12,14 @@ venv's pip and nervus-ctl are stood in for, and `install` is logged on its way
 to the real one, so where each unit came from can be read; tar unpacks as it
 does run as root, keeping the modes it reads; tls-init, tls-fingerprint,
 ensure-switches, tools/release-name, ssh-keygen and git are real. A Python too
-old fails tools/release-name as 3.10 would. nervus-ctl's stand-in plays
+old fails tools/release-name as 3.10 would. Where a test gives the machine
+addresses of its own, to be asked which one nervus is at, `ip` and `hostname`
+are stood in for too (_network). nervus-ctl's stand-in plays
 signin, recovery-key and restore (ADR-0027), whose own tests are
 tests/test_restore.py; tools/release-name's are tests/test_release_name.py."""
 
+import ipaddress
+import json
 import os
 import re
 import shutil
@@ -28,8 +32,9 @@ from pathlib import Path
 
 import pytest
 
+from nervus.config import ConfigError
 from nervus.ctl import exec_start
-from nervus.tls import certificate_fingerprint
+from nervus.tls import certificate_fingerprint, certificate_name, key_pin, machine_addresses
 
 REPO = Path(__file__).resolve().parent.parent
 VENV_BIN = Path(sys.executable).parent
@@ -508,6 +513,33 @@ def test_it_says_what_to_do_next_with_the_real_fingerprint(installed):
     assert "Never give nervus full access to this machine" in out
 
 
+def _served_pin(m) -> str:
+    """The key of the certificate nervus serves, as the lines it gives pin it (key_pin)."""
+    from cryptography import x509
+    return key_pin(x509.load_pem_x509_certificates((m.opt / "secrets" / "tls.crt").read_bytes())[0].public_key())
+
+
+def test_it_ends_with_nervus_s_key_as_the_lines_it_gives_carry_it(installed):
+    # ADR-0032 question 4: a page reaching the person through a browser nothing has checked could show
+    # a line carrying another key. The person checks the key the page shows against this one.
+    m, done = installed
+    out = done.stdout
+    pin = _served_pin(m)
+    assert f"\n  {pin}\n" in out and out.count(pin) == 1
+    fp = certificate_fingerprint((m.opt / "secrets" / "tls-root.crt").read_bytes())
+    said = out.index("The web UI's Machines and Clients pages show this key above each line they give you to run.")
+    assert out.index(f"  {fp}\n") < out.index(pin) < said < out.index("Next, from docs/install.md")
+    assert "check that the key shown there is this one; if it is not, do not run it" in out
+    # A client's computer no longer compares the root by eye: the line carries it, or nervus-trust compares it.
+    assert ("Its root certificate's fingerprint (keep it with nervus's key below; on a computer with a copy of\n"
+            "this repository, tools/nervus-trust compares it):\n") in out
+    assert "compares it once" not in out
+    # Each computer a client runs on takes the Clients page's line, once its key checks out; a clone, nervus-trust.
+    step = out[out.index("  4. "):out.index("Never give nervus")]
+    assert "run the line the Clients page gives you" in step and "checked that the key it shows" in step
+    assert step.index("Clients page") < step.index("tools/nervus-trust")
+
+
 # --- the release's own folder (ADR-0029 question 3a) ---------------------------------------
 #
 # What every later release reads: the release's tree and its venv in /opt/nervus/releases/<name>/,
@@ -871,6 +903,380 @@ def test_an_ipv6_address_is_bracketed_in_urls(machine, clone):
     assert done.returncode == 0, done.stderr
     assert "--ui-url https://[2001:db8::5]:8443" in machine.dropin.read_text()
     assert "tools/nervus-trust https://[2001:db8::5]:8000/mcp" in done.stdout
+
+
+# --- its address, asked when not given (ADR-0032 question 3a) -------------------------------------
+#
+# The release page's line ends `sudo ./install.sh`, with nothing in it to edit, so the installer asks
+# which of this machine's own addresses and names clients and machines will use.
+
+# What `ip -j address show` gives on a machine with an address of every kind: those nervus's
+# certificate names, and those it never does.
+INTERFACES = [
+    {"ifname": "lo", "addr_info": [{"family": "inet", "local": "127.0.0.1", "scope": "host"},
+                                   {"family": "inet6", "local": "::1", "scope": "host"}]},
+    {"ifname": "eth0", "addr_info": [
+        {"family": "inet", "local": "192.0.2.5", "scope": "global"},
+        {"family": "inet6", "local": "2001:db8::5", "scope": "global"},
+        {"family": "inet6", "local": "2001:db8::a", "scope": "global", "temporary": True},
+        {"family": "inet6", "local": "2001:db8::b", "scope": "global", "deprecated": True},
+        {"family": "inet6", "local": "2001:db8::c", "scope": "global", "tentative": True},
+        {"family": "inet6", "local": "2001:db8::d", "scope": "global", "dadfailed": True},
+        {"family": "inet6", "local": "fe80::5", "scope": "link"}]},
+    {"ifname": "eth1", "addr_info": [
+        {"family": "inet", "local": "198.51.100.7", "scope": "global"},
+        # Never one another computer reaches it at, whatever its scope says.
+        {"family": "inet", "local": "169.254.3.4", "scope": "global"},
+        {"family": "inet", "local": "127.0.0.2", "scope": "global"},
+        {"family": "inet", "local": "0.0.0.0", "scope": "global"},
+        {"family": "inet", "local": "224.0.0.9", "scope": "global"},
+        {"family": "inet", "local": "not an address", "scope": "global"},
+        {"family": "inet", "local": "192.0.2.5", "scope": "global"}]},  # the same one again
+]
+# The numbered list it shows for them.
+LISTED = ["  1  192.0.2.5", "  2  2001:db8::5", "  3  198.51.100.7", "  4  host.test  (its hostname)"]
+
+
+def _network(m, interfaces=INTERFACES, hostname="host.test"):
+    """The machine's own addresses, as `ip -j address show` gives them, or no `ip` at all; and its
+    hostname, as `hostname` gives it. nervus's tls-init, run by the install, reads the same `ip`, but
+    the hostname by itself (socket.gethostname()), so a test of the hostname tests what the installer
+    asks and refuses, not what tls-init would do with it."""
+    if interfaces is None:
+        (m.bin / "ip").unlink(missing_ok=True)
+    else:
+        listing = m.root.parent / "ip-address.json"
+        listing.write_text(json.dumps(interfaces))
+        _script(m.bin / "ip", f'[ "$*" = "-j address show" ] || exit 1\ncat {listing}')
+    _script(m.bin / "hostname", f"echo {hostname}")
+
+
+def _names(m) -> set[str]:
+    """The names and addresses nervus's certificate is for."""
+    from cryptography import x509
+    cert = x509.load_pem_x509_certificates((m.opt / "secrets" / "tls.crt").read_bytes())[0]
+    return {str(n.value) for n in cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value}
+
+
+def _plan_names(out: str) -> str:
+    """What the plan says nervus's certificate is for."""
+    return out.split("its TLS authority and certificate for:\n", 1)[1].splitlines()[0].strip()
+
+
+def test_without_an_address_it_asks_listing_this_machines_own_addresses_and_its_hostname(machine, clone):
+    _network(machine)
+    done = machine.run(clone, answer="\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = done.stdout
+    asked = out[out.index("Which addresses and names"):out.index("It will install nervus")]
+    assert [line for line in asked.splitlines() if re.match(r"  \d", line)] == LISTED
+    for never in ("127.0.0.", "::1", "fe80::", "2001:db8::a", "2001:db8::b", "2001:db8::c", "2001:db8::d",
+                  "169.254.", "0.0.0.0", "224.0.0.9", "not an address"):
+        assert never not in asked, never
+    assert "Addresses and names (Enter alone takes 1, 192.0.2.5): " in asked
+    # While it reads the machine, before its plan; Enter alone takes the first address.
+    assert out.index("nothing changes until you say yes") < out.index("Which addresses") < out.index("It will install")
+    assert _plan_names(out) == "192.0.2.5, and this machine's own addresses and hostname"
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://192.0.2.5:8443"]
+    assert "tools/nervus-trust https://192.0.2.5:8000/mcp" in out
+    assert "192.0.2.5" in _names(machine)
+
+
+def test_the_addresses_it_lists_are_the_ones_nervus_s_certificate_names(machine, clone):
+    # Read by the machine's own python3, which has none of nervus's libraries: the same list as
+    # tls.machine_addresses, which tls-init puts in the certificate, from the same `ip`.
+    _network(machine)
+    done = machine.run(clone, answer="")
+    listed = [line.split()[1] for line in done.stdout.splitlines() if re.match(r"  \d  ", line)]
+    run = lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(INTERFACES), "")  # noqa: E731
+    assert listed == machine_addresses(run) + ["host.test"]
+    assert done.returncode == 1 and machine.changed() == []
+
+
+def test_a_number_picks_a_name_and_an_address_in_the_order_typed(machine, clone):
+    _network(machine)
+    done = machine.run(clone, answer="4 3\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    # The name first, so sign-in links use it; the address is --address's.
+    assert _plan_names(done.stdout) == "host.test, 198.51.100.7, and this machine's own addresses and hostname"
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://host.test:8443"]
+    assert "tools/nervus-trust https://198.51.100.7:8000/mcp" in done.stdout
+    assert {"host.test", "198.51.100.7"} <= _names(machine)
+
+
+def test_an_address_and_a_name_typed_in_are_taken_with_those_listed(machine, clone):
+    # Neither is this machine's own, so only the answer puts them in the certificate. The first address
+    # given is --address's; another goes into the certificate beside it.
+    _network(machine)
+    done = machine.run(clone, answer="nervus.test 203.0.113.9 1 2001:db8::9 nervus.test\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _plan_names(done.stdout) == ("nervus.test, 203.0.113.9, 192.0.2.5, 2001:db8::9, and this machine's own "
+                                        "addresses and hostname")
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://nervus.test:8443"]
+    assert "tools/nervus-trust https://203.0.113.9:8000/mcp" in done.stdout
+    assert {"nervus.test", "203.0.113.9", "2001:db8::9"} <= _names(machine)
+
+
+NOT_A_NAME = "a name is labels of 1 to 63 letters, digits and hyphens, joined by dots"
+
+
+@pytest.mark.parametrize("wrong, says", [
+    ("5", "5 is not one of the numbers listed"),
+    ("0", "0 is not one of the numbers listed"),
+    ("1 not_a_name", f"not_a_name will not do: {NOT_A_NAME}"),
+    ("https://192.0.2.5", f"https://192.0.2.5 will not do: {NOT_A_NAME}"),
+    ("4", "none of them is an IP address: nervus's certificate needs one"),
+    ("nervus.test", "none of them is an IP address: nervus's certificate needs one"),
+    # Names tls-init would refuse once the install had begun (tls.certificate_name).
+    ("1 nervus..lan", f"nervus..lan will not do: {NOT_A_NAME}"),
+    ("1 nervus-.lan", f"nervus-.lan will not do: {NOT_A_NAME}"),
+    ("1 " + "n" * 64 + ".lan", f"{'n' * 64}.lan will not do: {NOT_A_NAME}"),
+    # Names and addresses no other computer reaches nervus at: the sign-in links would stay there.
+    ("1 localhost", "localhost will not do: localhost is every computer to itself"),
+    ("1 LOCALHOST", "LOCALHOST will not do: localhost is every computer to itself"),
+    ("1 nervus.localhost", "nervus.localhost will not do: localhost is every computer to itself"),
+    ("127.0.0.1", "127.0.0.1 will not do: it is loopback"),
+    ("::1", "::1 will not do: it is loopback"),
+    ("0.0.0.0", "0.0.0.0 will not do: it stands for all of a machine's addresses"),
+    ("::", ":: will not do: it stands for all of a machine's addresses"),
+    ("224.0.0.1", "224.0.0.1 will not do: it is a multicast address"),
+    ("169.254.3.4", "169.254.3.4 will not do: it is link-local"),
+    ("fe80::1%eth0", "fe80::1%eth0 will not do: it names a network interface after its %"),
+    ("1 192.0.2.300", "192.0.2.300 will not do: its last part is all digits: it is an address mistyped"),
+])
+def test_an_answer_that_will_not_do_is_asked_again_saying_why(machine, clone, wrong, says):
+    _network(machine)
+    done = machine.run(clone, answer=f"{wrong}\n2\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"  {says}" in done.stdout and done.stdout.count("Addresses and names (Enter alone") == 2
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://[2001:db8::5]:8443"]
+
+
+@pytest.mark.parametrize("answer", ["", "not_a_name\n"], ids=["no answer", "no answer after a wrong one"])
+def test_at_the_end_of_its_input_nothing_changes(machine, clone, answer):
+    _network(machine)
+    done = machine.run(clone, answer=answer)
+    assert done.returncode == 1 and "nothing changed" in done.stderr
+    assert "It will install" not in done.stdout
+    assert machine.logged() == [] and machine.changed() == []
+
+
+@pytest.mark.parametrize("interfaces, says", [
+    (None, "There is no `ip` command here to read this machine's addresses with."),
+    (INTERFACES[:1] + [{"ifname": "eth0", "addr_info": [{"family": "inet6", "local": "fe80::5", "scope": "link"}]}],
+     "This machine has no address another computer could reach it at, as `ip address` shows it."),
+], ids=["no ip", "none but loopback and link-local"])
+def test_with_no_address_of_its_own_it_says_so_and_asks_for_one_to_be_typed(machine, clone, interfaces, says):
+    _network(machine, interfaces)
+    done = machine.run(clone, answer="\n1\n198.51.100.20 1\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = done.stdout
+    assert f"\n{says}\n" in out
+    assert [line for line in out.splitlines() if re.match(r"  \d  ", line)] == ["  1  host.test  (its hostname)"]
+    # Enter alone takes no address where there is none: asked again, and again for the name alone.
+    assert "  nothing was typed. Try again." in out and "  none of them is an IP address" in out
+    assert "Enter alone" not in out and out.count("Addresses and names: ") == 3
+    assert _plan_names(out) == "host.test, 198.51.100.20, and this machine's own addresses and hostname"
+
+
+@pytest.mark.parametrize("hostname, why", [
+    ("box_1", f"this machine's hostname, box_1, cannot be used instead ({NOT_A_NAME}"),
+    ("localhost", "this machine's hostname, localhost, cannot be used instead (localhost is every computer to"),
+    ("", "install.sh could not read this machine's hostname to use instead"),
+], ids=["underscore", "localhost", "none"])
+def test_without_a_hostname_the_certificate_can_hold_an_install_is_given_a_name(machine, clone, hostname, why):
+    # nervus's certificate needs a DNS name (ADR-0021 B1). tls-init takes the machine's hostname where it
+    # can, and refused one it cannot with "needs at least one DNS name" once the install had begun; so
+    # the installer does not offer it, says so, and asks again for an answer with no name, Enter included.
+    _network(machine, hostname=hostname)
+    done = machine.run(clone, answer="\n1 2\n1 nervus.test\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = done.stdout
+    assert "(its hostname)" not in out
+    assert f"And one must be a DNS name, which the certificate needs too: {why}" in out
+    assert out.count(f"  none of them is a DNS name, and nervus's certificate needs one: {why}") == 2
+    assert _plan_names(out) == "nervus.test, 192.0.2.5, and this machine's own addresses and hostname"
+
+
+@pytest.mark.parametrize("name", [
+    "nervus.test", "Nervus.TEST", "nervus", "123.nervus", "xn--bcher-kva.test", "n" * 63 + ".test",
+    ".".join(["n" * 63] * 3) + "." + "n" * 61,  # 253 characters, the most a name may have
+    ".".join(["n" * 63] * 3) + "." + "n" * 62,  # 254
+    "n" * 64 + ".test", "nervus..test", "nervus-.test", "-nervus.test", "nervus.test.", "nervus_1.test",
+    "nérvus.test", "localhost", "LOCALHOST", "nervus.localhost", "192.0.2.300", "nervus.123", "192.0.2.6",
+])
+def test_a_name_is_taken_by_the_rule_of_nervus_s_certificate(machine, clone, name):
+    """What --name and the question take as a name is what tls.certificate_name takes, which tls-init
+    refuses any other by after the plan's yes; less localhost, which the certificate leaves out
+    (ADR-0021 B1), a name whose last label is all digits, an address mistyped, and an address."""
+    try:
+        ipaddress.ip_address(name)
+        taken = False
+    except ValueError:
+        try:
+            lowered = certificate_name(name)
+            taken = lowered != "localhost" and not lowered.endswith(".localhost") \
+                and not lowered.rsplit(".", 1)[-1].isdigit()
+        except ConfigError:
+            taken = False
+    done = machine.run(clone, "--address", "192.0.2.5", "--name", name, answer="no\n")
+    assert done.returncode == 1
+    assert ("It will install nervus" in done.stdout) == taken, done.stderr
+    assert (f"--name {name} " in done.stderr) == (not taken), done.stderr
+    assert machine.changed() == []
+
+
+def test_a_restore_asks_too(machine, clone, backup):
+    _network(machine)
+    done = machine.run(clone, "--restore", str(backup), answer="2\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = done.stdout
+    assert out.index("Which name or address will your clients reach the restored nervus at?") \
+        < out.index("Name or address (Enter alone takes 1, 192.0.2.5): ") < out.index("It will install")
+    # Its certificate comes back with the backup: what is chosen goes into the sign-in links alone.
+    assert "backup's, so give the one the backup's nervus had, which its clients trust" in out
+    assert "They go into its" not in out and "At least one must be an IP address" not in out
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://[2001:db8::5]:8443"]
+    assert f"nervus-ctl --unit {machine.unit} restore {backup}" in machine.logged()
+
+
+def test_a_restore_takes_the_backup_s_name_alone_and_one_answer_only(machine, clone, backup):
+    # docs/install.md: restore at the same name, which clients trust. More than one would be dropped.
+    _network(machine)
+    done = machine.run(clone, "--restore", str(backup), answer="1 nervus.test\nnervus.test\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "  a restore takes one, the name or address the backup's nervus had" in done.stdout
+    assert done.stdout.count("Name or address (Enter alone") == 2
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://nervus.test:8443"]
+
+
+def test_on_a_machine_without_python_it_asks_once_python_is_here(machine, clone):
+    _without_python(machine)
+    _network(machine)
+    done = machine.run(clone, answer="yes\n1\nyes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = done.stdout
+    assert out.index("installed python3 python3-venv") < out.index("Which addresses") < out.index("It will install")
+
+
+def test_it_asks_only_once_nothing_else_it_reads_refuses_the_install(installed, clone):
+    # Asked last of all it reads: an installed nervus is refused before the person answers anything.
+    m, _ = installed
+    _network(m)
+    done = m.run(clone, answer="1\nyes\n")
+    assert done.returncode == 1 and "already installed" in done.stderr
+    assert "Which addresses" not in done.stdout
+
+
+@pytest.mark.parametrize("args", [[], ["--restore", "BACKUP"]], ids=["install", "restore"])
+def test_yes_without_an_address_is_refused_before_anything_changes(machine, clone, backup, args):
+    # No one is there to answer. Refused before Python is installed, the first thing that would change.
+    _without_python(machine)
+    _network(machine)
+    done = machine.run(clone, *[str(backup) if a == "BACKUP" else a for a in args], "--yes")
+    assert done.returncode == 1 and "give --address" in done.stderr and "no one is there to answer" in done.stderr
+    assert "Which addresses" not in done.stdout
+    assert machine.logged() == [] and machine.changed() == []
+
+
+def test_proxmox_is_still_told_its_address_and_asks_nothing(installed, clone):
+    # It changes an installed nervus, as before: without --address it is refused, --yes or not.
+    m, _ = installed
+    _network(m)
+    before = m.dropin.read_text()
+    done = m.run(clone, "--proxmox", answer="1\nyes\n")
+    assert done.returncode == 1 and "give --address, the address your clients and VMs reach nervus at" in done.stderr
+    assert "Which addresses" not in done.stdout and "no one is there to answer" not in done.stderr
+    assert m.dropin.read_text() == before
+
+
+def test_a_name_without_an_address_is_refused(machine, clone):
+    _network(machine)
+    done = machine.run(clone, "--name", "nervus.test", answer="1\nyes\n")
+    assert done.returncode == 1 and "--name needs --address" in done.stderr
+    assert machine.logged() == [] and machine.changed() == []
+
+
+def test_a_key_pressed_before_the_question_does_not_answer_it(machine, clone):
+    # An Enter typed while the release downloaded would take the first address unseen. At a terminal,
+    # what waits there is thrown away before the question is put; answers piped in, as in every other
+    # test here, are kept.
+    _network(machine)
+    controller, terminal = os.openpty()
+    run = subprocess.Popen(["bash", str(clone / "install.sh")], stdin=terminal, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, env=machine.env())
+    os.close(terminal)
+    seen = b""
+
+    def until(text: bytes) -> None:
+        nonlocal seen
+        while text not in seen:
+            chunk = os.read(run.stdout.fileno(), 4096)
+            assert chunk, seen.decode()
+            seen += chunk
+
+    def typed(text: bytes) -> None:
+        try:
+            os.write(controller, text)
+        except OSError:  # the run has ended: what it said is checked below
+            pass
+
+    try:
+        typed(b"\n")  # before the installer has read anything
+        until(b"Addresses and names (Enter alone takes 1, 192.0.2.5): ")
+        typed(b"2\n")
+        until(b"Type yes to go ahead: ")
+        typed(b"yes\n")
+        seen += run.communicate(timeout=120)[0]
+    finally:
+        if run.poll() is None:
+            run.kill()
+        os.close(controller)
+    assert run.returncode == 0, seen.decode()
+    assert exec_start(machine.unit)[-2:] == ["--ui-url", "https://[2001:db8::5]:8443"]
+
+
+def test_a_run_that_stops_after_the_recovery_key_is_made_still_shows_its_private_half(machine, clone):
+    # It is made once, and nothing else holds it: unshown, every backup would be locked to a key no one has.
+    standin = machine.bin / "systemctl-standin"
+    (machine.bin / "systemctl").rename(standin)
+    _script(machine.bin / "systemctl", '[ "$*" = "enable --now nervus-backup.timer" ] && '
+            f'{{ echo "Failed to enable unit" >&2; exit 1; }}\nexec {standin} "$@"')
+    done = machine.run(clone, "--address", "192.0.2.5", "--yes")
+    assert done.returncode != 0 and "Failed to enable unit" in done.stderr
+    assert "nervus is installed and running." not in done.stdout
+    assert done.stdout.count("AGE-SECRET-KEY-1STANDIN") == 1
+    assert "install.sh stopped before its end, after it made the recovery key. Its private half" in done.stdout
+
+
+def _interrupted_as_the_key_is_kept(m):
+    """Ctrl-C reaches the whole foreground group, install.sh and nervus-ctl, just after nervus-ctl keeps the
+    recovery key's public half and before it prints the private half: the moment that, acted on, locks every
+    backup to a key no one has (procedure 069)."""
+    real = m.bin / "nervus-ctl-standin.real"
+    (m.bin / "nervus-ctl-standin").rename(real)
+    _script(m.bin / "nervus-ctl-standin",
+            'case " $* " in *" recovery-key "*) echo "nervus-ctl $*" >> "$LOG"\n'
+            '  printf "age1%058d\\n" 0 > "$NERVUS_INSTALL_ROOT/opt/nervus/secrets/recovery.pub"\n'
+            '  kill -INT $PPID; kill -INT $$\n'
+            '  echo "A new recovery key."; echo; echo "  AGE-SECRET-KEY-1STANDIN"; exit 0;;\nesac\n'
+            f'exec "{real}" "$@"')
+
+
+def test_ctrl_c_as_the_recovery_key_is_made_loses_no_key(machine, clone):
+    _interrupted_as_the_key_is_kept(machine)
+    done = machine.run(clone, "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "nervus is installed and running." in done.stdout
+    assert done.stdout.count("AGE-SECRET-KEY-1STANDIN") == 1
+
+
+def test_an_address_given_is_not_asked_for(machine, clone):
+    _network(machine)
+    done = machine.run(clone, "--address", "192.0.2.5", "--name", "nervus.test", answer="yes\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "Which addresses" not in done.stdout and done.stdout.count("Type yes to go ahead") == 1
+    assert _plan_names(done.stdout) == "nervus.test, 192.0.2.5, and this machine's own addresses and hostname"
 
 
 # --- a failure part-way: what is left, and what it says (ADR-0029 question 3a) -----------------
@@ -1306,6 +1712,19 @@ def test_a_restore_ends_with_what_is_true_after_one_not_a_fresh_installs_steps(m
                                     "nervus-ctl backup --check <its name>")]
     assert steps == sorted(steps)
     assert "Never give nervus full access to this machine" in end
+
+
+def test_a_restore_ends_with_the_backup_s_key_as_the_lines_carry_it(machine, clone, backup):
+    # The key the backup put back, which every line its web UI gave before still carries.
+    (machine.root / ".backup-has-key").touch()
+    done = machine.run(clone, "--restore", str(backup), "--address", "192.0.2.5", "--yes")
+    assert done.returncode == 0, done.stdout + done.stderr
+    end = done.stdout[done.stdout.index("nervus is restored from"):]
+    pin = _served_pin(machine)
+    fp = certificate_fingerprint((machine.opt / "secrets" / "tls-root.crt").read_bytes())
+    assert f"nervus's key, the backup's too, as the lines its web UI gives you carry it:\n  {pin}\n" in end
+    said = end.index("The web UI's Machines and Clients pages show this key above each line they give you to run.")
+    assert end.index(fp) < end.index(pin) < said < end.index("Next, from docs/install.md (Backups)")
 
 
 def test_a_restored_backup_without_a_recovery_key_says_to_make_one(machine, clone, backup):
@@ -1980,7 +2399,36 @@ def test_what_the_new_release_needs_and_the_installation_lacks_is_made_and_what_
     assert done.returncode == 0, done.stdout + done.stderr
     assert (secrets / "nervus_ca_ed25519").exists() and (secrets / "recovery.pub").exists()
     assert (secrets / "nervus_ed25519").read_bytes() == key
-    assert "AGE-SECRET-KEY-1STANDIN" in done.stdout  # the recovery key's private half, shown once
+    assert done.stdout.count("AGE-SECRET-KEY-1STANDIN") == 1  # the recovery key's private half, shown once
+
+
+def test_an_upgrade_that_stops_after_it_made_the_recovery_key_still_shows_its_private_half(upgradable, clone, tmp_path):
+    # As an install's (step 3's review): made once, held nowhere else. Here an older release's folder that cannot
+    # be removed stops the run after the key is made, before its end.
+    m = upgradable
+    _database(m)
+    (m.opt / "secrets" / "recovery.pub").unlink()
+    stuck = m.opt / "releases" / "0.0.1-000000000000" / "held"
+    stuck.mkdir(parents=True)
+    (stuck / "file").write_text("x")
+    stuck.chmod(0o555)
+    try:
+        done = m.run(_newer(clone, tmp_path, "0.2.0"), "--upgrade", "--yes")
+    finally:
+        stuck.chmod(0o755)
+    assert done.returncode != 0 and "nervus is upgraded" not in done.stdout, done.stdout + done.stderr
+    assert done.stdout.count("AGE-SECRET-KEY-1STANDIN") == 1
+    assert "install.sh stopped before its end, after it made the recovery key. Its private half" in done.stdout
+
+
+def test_ctrl_c_as_an_upgrade_makes_the_recovery_key_loses_no_key(upgradable, clone, tmp_path):
+    m = upgradable
+    _database(m)
+    (m.opt / "secrets" / "recovery.pub").unlink()
+    _interrupted_as_the_key_is_kept(m)
+    done = m.run(_newer(clone, tmp_path, "0.2.0"), "--upgrade", "--yes")
+    assert done.returncode == 0 and "nervus is upgraded" in done.stdout, done.stdout + done.stderr
+    assert done.stdout.count("AGE-SECRET-KEY-1STANDIN") == 1
 
 
 def test_an_upgrade_gives_nervus_nothing_and_unpacks_its_release_as_roots(upgradable, clone, tmp_path):
@@ -2482,7 +2930,10 @@ def test_a_signal_goes_back_by_itself(upgradable, clone, tmp_path, signal, when)
     m = upgradable
     was, tree = _running(m), _newer(clone, tmp_path, "0.2.0", unit="--example-new-option on")
     new, in_place = _named(tree)[0], _in_place(m)
-    _during(m, "systemctl", when, f"kill -{signal} $PPID")
+    # Ctrl-C reaches the whole foreground group: install.sh and the program it is waiting on. bash acts on an
+    # INT that comes while it waits only if that program died of it too, so the stand-in takes it as well; sent
+    # to install.sh alone, it was acted on or not by timing (the export's run of 2026-11-24).
+    _during(m, "systemctl", when, f"kill -{signal} $PPID" + ("; kill -INT $$" if signal == "INT" else ""))
     done = m.run(tree, "--upgrade", "--yes")
     _went_back(m, done, was, new, in_place, "this run was stopped by a signal")
 

@@ -303,6 +303,7 @@ NOT_ITS_ACCOUNTS = {
     ("ctl.py", "_effective"): "the unit file and its drop-ins, which are root's",
     ("restore.py", "place"): "the unit's drop-ins, which are root's",
     ("host_enrollment.py", "enroll_script"): "a file of nervus's own package",
+    ("laptop.py", "_helper"): "the laptop's scripts and helpers, files of nervus's own package (ADR-0032)",
     ("host_enrollment.py", "own_machine_id"): "the system's machine id, which is root's",
 }
 

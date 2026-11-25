@@ -85,14 +85,24 @@ def key_pin(public_key) -> str:
     return "sha256//" + base64.b64encode(hashlib.sha256(spki).digest()).decode()
 
 
-def key_file_fingerprint(key_path: Path) -> str:
-    """The public-key fingerprint of the private key in `key_path`, which is
-    nervus's identity whatever certificate currently carries it."""
+def _key_file_public(key_path: Path):
     try:
         key = serialization.load_pem_private_key(plainfile.read_bytes(key_path), password=None)
     except (OSError, ValueError, TypeError) as exc:
         raise ConfigError(f"cannot read a private key from {key_path}: {exc}") from exc
-    return key_fingerprint(key.public_key())
+    return key.public_key()
+
+
+def key_file_fingerprint(key_path: Path) -> str:
+    """The public-key fingerprint of the private key in `key_path`, which is
+    nervus's identity whatever certificate currently carries it."""
+    return key_fingerprint(_key_file_public(key_path))
+
+
+def key_file_pin(key_path: Path) -> str:
+    """The same key as key_file_fingerprint, as key_pin gives it: the form the
+    lines nervus hands out carry it (ADR-0032 question 4)."""
+    return key_pin(_key_file_public(key_path))
 
 
 def fingerprint(cert_pem: bytes) -> str:

@@ -70,6 +70,38 @@ def test_the_request_log_never_writes_an_enrollment_code():
     assert '"GET /exports/e123 HTTP/1.1" 200' in seen.lines[2]  # every other line as it was
 
 
+def test_the_request_log_never_writes_a_laptop_s_code():
+    # ADR-0032: the laptop's line fetches its script (GET), then the token (POST), seconds apart; a run stopped
+    # between them leaves its code working for up to 15 minutes, so it is never written whole.
+    async def answer(request):
+        return PlainTextResponse("x")
+
+    app = Starlette(routes=[Route("/laptop/{code}", answer, methods=["GET", "POST"]),
+                            Route("/laptop/{code}/windows", answer)])
+    port = _free_port()
+    server = uvicorn.Server(_web_server_config(app, "127.0.0.1", port, None))
+    seen = Seen()
+    logging.getLogger("uvicorn.access").addHandler(seen)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.05)
+        base = f"http://127.0.0.1:{port}"
+        urllib.request.urlopen(f"{base}/laptop/{CODE}", timeout=5).read()
+        urllib.request.urlopen(f"{base}/laptop/{CODE}/windows", timeout=5).read()
+        urllib.request.urlopen(urllib.request.Request(f"{base}/laptop/{CODE}", b"", method="POST"), timeout=5).read()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        logging.getLogger("uvicorn.access").removeHandler(seen)
+    assert len(seen.lines) == 3, seen.lines
+    assert all(CODE not in line for line in seen.lines)
+    assert all("/laptop/<code> HTTP/1.1" in line for line in seen.lines), seen.lines
+
+
 @contextlib.contextmanager
 def _serving(app):
     """A real uvicorn server built as nervus builds MCP's, on a free loopback port: its base URL, and the

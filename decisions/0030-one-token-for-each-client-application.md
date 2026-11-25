@@ -9,6 +9,9 @@ Each question keeps its options, so the record shows what was not chosen.
 - **Question 2: a, recorded as the client says it, "Yes, but later".** Built in a later release
   than 0.2.2; until then the log names the application's token and no project. Order of work steps
   1 to 3 wait for it.
+- **Order of work step 4, begun 2026-11-24** on the first installation: the application's token
+  issued and delivered by the operator, and its first calls seen in the audit log (procedure 070).
+  Its projects not yet moved, so verification 4 is not yet observed.
 **Date:** 2026-11-19
 **Asked for by:** the operator, on 2026-11-19: "i really need to just create one key for claude
 code. managing them all has become quite annoying."

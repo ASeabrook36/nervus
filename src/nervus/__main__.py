@@ -30,6 +30,7 @@ from nervus.accounts import MachineAccounts, accounts_at, described
 from nervus.enrolled_hosts import EnrolledHostStore, merged
 from nervus.enrollment_codes import EnrollmentCodes
 from nervus.host_enrollment import HostEnrollment, own_machine_id
+from nervus.laptop import LaptopRoute
 from nervus.host_login import LoginEnrollment
 from nervus.export_sources import VM_RESPONSE_BYTES
 from nervus.exporter import Exporter
@@ -43,6 +44,7 @@ from nervus.vm_targets import VMTargets
 from nervus.proxmox import ProxmoxClient, load_config
 from nervus.server import build_server, connect_host
 from nervus.switches import SwitchesUnreadable, load_switches, locked
+from nervus.token_codes import TokenCodes
 from nervus.tls import (
     ServingCertificate,
     add_addresses,
@@ -57,6 +59,7 @@ from nervus.tls import (
     upgrade_to_own_authority,
     is_loopback,
     key_file_fingerprint,
+    key_file_pin,
     key_pin,
 )
 from nervus.ui import Backups, Machines, Management, Setup, build_ui
@@ -128,7 +131,10 @@ class _NoAccessLog(AutoHTTPProtocol):
 
 class _HideEnrollmentCodes(logging.Filter):
     """Writes `/enroll/<code>` in MCP's request log where a request's path
-    held a one-time enrollment code, and every other line as it was.
+    held a one-time enrollment code, `/laptop/<code>` where it held a laptop's
+    (ADR-0032: its line's GET is logged before its POST hands the token over,
+    so a run stopped between them would leave a working code there), and
+    every other line as it was.
 
     uvicorn logs each request line to the journal, and a code in it could be
     used by anyone who reads the journal before the machine reports
@@ -143,13 +149,13 @@ class _HideEnrollmentCodes(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
-            hidden = _ENROLL_PATH.sub("/enroll/<code>", args[2])
+            hidden = _CODE_PATH.sub(lambda found: f"/{found.group(1)}/<code>", args[2])
             if hidden != args[2]:
                 record.args = (*args[:2], hidden, *args[3:])
         return True
 
 
-_ENROLL_PATH = re.compile(r"^/enroll/.*", re.DOTALL)
+_CODE_PATH = re.compile(r"^/(enroll|laptop)/.*", re.DOTALL)
 
 
 def _web_server_config(
@@ -718,6 +724,15 @@ def tls_fingerprint(argv: list[str]) -> int:
     Where nervus has its own authority (ADR-0021), it also prints the root's
     certificate fingerprint, labelled apart: the reference a user compares
     tools/nervus-trust's value with before a client trusts the root (E2).
+
+    And the same key as curl pins it, labelled "public key pin" (ADR-0032
+    question 4): `sha256//` and base64, the form each line nervus gives a
+    person to run carries it, so that the line refuses any server but nervus.
+    The page showing a line reaches the person through a browser whose view of
+    nervus nothing has checked, so it could show a line carrying someone
+    else's key. The Machines and Clients pages show the key above each line,
+    and the person checks it is this one, which the installer prints too,
+    before running the line.
     """
     parser = argparse.ArgumentParser(
         prog="nervus tls-fingerprint",
@@ -729,11 +744,13 @@ def tls_fingerprint(argv: list[str]) -> int:
     root = root_cert_path(Path(args.tls_cert))
     try:
         found = key_file_fingerprint(Path(args.tls_key))
+        pin = key_file_pin(Path(args.tls_key))
         root_fp = certificate_fingerprint(plainfile.read_bytes(root)) if root.exists() else None
     except (ConfigError, OSError) as exc:
         print(f"nervus: {exc}", file=sys.stderr)
         return 1
     print(f"{args.tls_key}: public key SHA-256 {found}")
+    print(f"{args.tls_key}: public key pin {pin}")
     if root_fp is not None:
         print(f"{root}: root certificate SHA-256 {root_fp}")
     return 0
@@ -875,7 +892,7 @@ def main(argv: list[str] | None = None) -> int:
                    pull_root=root_cert_path(certificate.cert_path) if certificate else None,
                    vm_connect=vms.connect if vms else None),
     ))
-    # Machines enrolled with two lines run on them (ADR-0024): the script and
+    # Machines enrolled with one line run on them (ADR-0024, ADR-0032): the script and
     # the report back on MCP's port, only over HTTPS, pinned to the key MCP
     # serves now; never full access to the machine nervus runs on.
     ssh_key = Path(settings.ssh_key_path)
@@ -895,9 +912,15 @@ def main(argv: list[str] | None = None) -> int:
         # The accounts every hosts.yaml entry at a machine's address is described with (procedure 068, section 12).
         taken=lambda name: accounts_at(hosts, name),
     )
+    # A laptop set up by one line (ADR-0032): its script and its token on MCP's port, only over HTTPS, pinned to
+    # the key MCP serves now, the root it carries read at each fetch; the token handed over once, by its code.
+    token_codes = TokenCodes(database)
+    laptop = LaptopRoute(token_codes, audit, pin=pin,
+                         root=lambda: plainfile.read_bytes(root_cert_path(certificate.cert_path)).decode(),
+                         locked=lambda: locked(settings.switches_path))
     mcp_server = build_server(settings=settings, tokens=tokens, audit=audit, proxmox=proxmox, exporter=exporter,
                               uploader=uploader, vms=vms, enrolled=enrolled, enrollment=enrollment,
-                              machine_accounts=machine_accounts)
+                              machine_accounts=machine_accounts, laptop=laptop)
     # At every start: the tier declared at setup, and whether nervus listens on
     # an address public in form, with the ranges declared internal (ADR-0007
     # decision 4, ADR-0015 decisions C to E). It only reads, and is never a
@@ -926,8 +949,13 @@ def main(argv: list[str] | None = None) -> int:
     backups = Backups(folder=restore.backups_folder(service), recovery_key=service.recovery_key,
                       make=lambda: restore.backup_now(service, database, audit, tool="ui"))
     ui_app = build_ui(database, audit, secure=ui_cert is not None, setup=Setup(first_run, exposure), backups=backups,
-                      management=Management(tokens, Path(args.switches), sorted(hosts), never_issued(hosts)),
-                      # Added from the page, the two lines naming nervus as --ui-url does (ADR-0024).
+                      # Each token issued with the line that hands it to its laptop, naming nervus as
+                      # --ui-url does (ADR-0032 question 5).
+                      management=Management(tokens, Path(args.switches), sorted(hosts), never_issued(hosts),
+                                            codes=token_codes, pin=pin, port=settings.bind_port,
+                                            nervus_host=urllib.parse.urlsplit(args.ui_url).hostname or ""
+                                            if args.ui_url else ""),
+                      # Added from the page, the line naming nervus as --ui-url does (ADR-0024).
                       machines=Machines(codes, enrolled, pin, settings.bind_port, sorted(hosts),
                                         urllib.parse.urlsplit(args.ui_url).hostname or "" if args.ui_url else "",
                                         # Added by an admin login given once, the machine's key shown first (ADR-0026).
@@ -938,7 +966,9 @@ def main(argv: list[str] | None = None) -> int:
                                         taken={n: accounts_at(hosts, n) for n in described(hosts)},
                                         # nervus's key words, for the removal commands (ADR-0031 question 9).
                                         key_words=lambda: tuple(w for w in (
-                                            " ".join(ssh_ca.public_key().split()[:2]), public_words(ssh_key)) if w)))
+                                            " ".join(ssh_ca.public_key().split()[:2]), public_words(ssh_key)) if w),
+                                        # The script each line fetches, shown beneath it (ADR-0032 question 7).
+                                        shown=enrollment.shown))
     host = settings.bind_host
 
     for served in {id(c): c for c in (certificate, ui_cert) if c}.values():

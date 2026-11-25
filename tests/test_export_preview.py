@@ -142,6 +142,9 @@ def test_a_clean_export_leaves_out_the_record_and_adds_the_previews_own_files(wo
         assert (out / kept).exists(), kept
     assert "1 passed" in done.stdout
     assert "Export of " in done.stdout
+    # The step after the commit: the release's download, made from it by tools/release-archive (ADR-0032 step 2),
+    # with the preview checkout --against named.
+    assert f"tools/release-archive {tmp / 'last'} --out <folder>" in done.stdout.splitlines()[-1]
 
 
 def test_a_name_on_the_check_list_stops_it_and_says_where(world):

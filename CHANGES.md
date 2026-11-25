@@ -7,6 +7,47 @@ exported; until then it says "Not yet exported.", and what is still being built.
 heads: what you will see, what each client must do, and what the upgrade does on nervus's
 machine. An ADR named beside a change is the decision record behind it, in `decisions/`.
 
+## 0.4.0
+
+Exported 2026-11-25.
+
+**What you will see:**
+
+- **nervus installs from its release page** (ADR-0032 questions 1 and 2). The page gives one line
+  that downloads the release, checks its SHA-256 against the one written in the line, unpacks it into
+  a folder of its own and runs the installer from there; a file that is not the one the page names is
+  refused before anything is unpacked or run. Nothing is cloned. The same line ending `--upgrade`
+  upgrades a nervus installed from an earlier release. A clone still works, as before.
+- **The installer asks which address and names your clients will use** (question 3), listing the
+  machine's own, when `--address` is not given; `--address` and `--name` still skip the question. It
+  ends by printing nervus's key, as `sha256//…`, which the Machines and Clients pages show above each
+  line they give, for you to check there.
+- **A client's computer is set up by one line from the Clients page** (questions 4, 5, 6 and 11):
+  issuing a token asks which client it is for (Claude Code, Codex, or another by name), then shows
+  nervus's key and two lines, one for macOS and Linux and one for Windows PowerShell, to run on the
+  computer the client runs on, as yourself. The line saves nervus's root where `tools/nervus-trust`
+  saves it, puts a small helper there, fetches the token once by a one-time code that works for 15
+  minutes, keeps it where only you can read it (the macOS keychain, a file only you can read on Linux,
+  a file Windows encrypts for your account), and prints the commands that tell your client to use
+  nervus, which you run. **The token is never shown**: not on the page, in a clipboard, in a
+  command's arguments, or in your client's environment. A line that expires unused can be made again
+  for its token; whatever runs a line first gets the token, so if yours says its code was used and
+  you did not run it, revoke the token.
+- **Codex reads its token through the same helper** (`http_headers_helper`), seen working against a
+  nervus on the network, not only on `localhost` (verification 8), so it no longer needs an
+  environment variable.
+- **A machine is added by one line**, `curl … | sudo sh`, in place of two (question 7), the script it
+  runs shown beneath it on the Machines page. Nothing in either script runs until all of it has
+  arrived, so a download cut partway changes nothing.
+
+**What each client must do:** nothing. A client set up before keeps working unchanged: the same
+address, root and token. A new client is set up by the line.
+
+**What the upgrade does:** `sudo ./install.sh --upgrade`, from this release's folder, which the
+release page's upgrade line downloads and checks. One table is added to nervus's database, for the
+one-time codes, whose version stays 1, so going back still starts; a token whose line was never used
+lets no one in on the release before, as on this one.
+
 ## 0.3.0
 
 Exported 2026-11-20.

@@ -270,6 +270,8 @@ def _forms(page):
             forms.append(current)
         elif tag == "input" and current is not None:
             current["fields"][a.get("name")] = (a.get("type"), a.get("value"))
+        elif tag == "select" and current is not None:
+            current["fields"][a.get("name")] = ("select", None)
         elif tag == "button" and current is not None:
             current["buttons"] += 1
     return forms
@@ -474,7 +476,8 @@ def test_the_filter_form_keeps_what_was_asked_and_changes_nothing():
                             older=None, paged=False, until=T0, form_token="tok")
     forms = _forms(page)
     assert forms[1]["method"] == "get" and forms[1]["action"] == "audit"
-    assert {k: v for k, (_, v) in forms[1]["fields"].items()} == {"client": "c", "host": "h", "tool": "t", "q": "rm -rf"}
+    assert {k: v for k, (kind, v) in forms[1]["fields"].items() if kind != "select"} == {
+        "client": "c", "host": "h", "tool": "t", "q": "rm -rf"}
     assert [dict(attrs) for tag, attrs in Parsed(page).tags if tag == "option" and ("selected", None) in attrs] \
         == [{"value": "refused", "selected": None}]
     assert "No records match." in page
@@ -578,7 +581,9 @@ def test_issuing_offers_the_hosts_it_is_given():
     `issue: never` is the UI's (ADR-0019 decision D, tested in test_ui)."""
     page = _clients(_view())
     issue = next(f for f in _forms(page) if f["fields"].get("action") == ("hidden", "issue"))
-    assert {"id", "client", "project"} <= set(issue["fields"])
+    assert {"id", "client", "client-name", "project"} <= set(issue["fields"])
+    # ADR-0032 question 5: the client from a list, so the laptop's script can rely on it.
+    assert re.findall(r'<option value="([a-z-]+)"', page) == ["claude-code", "codex", "other"]
     boxes = [dict(attrs) for tag, attrs in Parsed(page).tags if tag == "input" and dict(attrs).get("type") == "checkbox"]
     assert [b["value"] for b in boxes] == ["node-a", "node-b", "hv"]
     assert all(b["name"] == "hosts" for b in boxes)
@@ -595,13 +600,33 @@ def test_an_unreadable_switch_file_is_said_at_the_top():
     assert "every client is refused" in page and "cannot read /x: gone" in page
 
 
-def test_an_issued_tokens_value_is_shown_once_and_never_in_a_form():
-    page = pages.page_token_issued(token_id="laptop", value="V" * 43, until=T0, form_token="tok")
+def test_an_issued_token_s_page_shows_nervus_s_key_first_then_its_lines_never_its_value():
+    # ADR-0032 questions 4, 5 and 11: the key to check comes before the lines; no value is on the page.
+    pin = "sha256//47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+    page = pages.page_token_issued(token_id="laptop", client="Claude Code", pin=pin, host="nervus.example",
+                                   line="curl … | sh\n", windows_line="iex (curl.exe … | Out-String)\n",
+                                   until=T0, form_token="tok")
+    text = " ".join("".join(Parsed(page).text).split())
+    assert text.index(pin) < text.index("curl … | sh") < text.index("iex (curl.exe … | Out-String)")
+    assert "If it is not the one the installer printed, stop" in text
+    assert "The token is never shown" in text and "works once, within 15 minutes" in text
+    assert "not as root or an administrator" in text
+    assert _forms(page) == [f for f in _forms(page) if f["action"] == "signout"]
+    assert "clients" in _links(page)
+
+
+def test_over_plain_http_the_clients_page_says_the_token_will_be_shown_once():
+    page = pages.page_clients(view=_view(), hosts=["node-a"], until=T0, form_token="tok", by_line=False)
+    assert any(f["fields"].get("action") == ("hidden", "issue") for f in _forms(page))
+    assert "shows the token&#x27;s value once" in page or "shows the token's value once" in page
+
+
+def test_a_token_shown_once_over_plain_http_is_in_no_form():
+    page = pages.page_token_shown(token_id="laptop", value="V" * 43, until=T0, form_token="tok")
     assert ("V" * 43) in "".join(Parsed(page).text)
     assert all(("V" * 43) not in str(f) for f in _forms(page))
-    assert "only time" in page
+    assert "only time" in page and "plain HTTP" in page
     assert "your password manager" in page  # names no product (ADR-0019)
-    assert "clients" in _links(page)
 
 
 def test_under_lockdown_a_client_on_says_so_and_still_offers_switch_off():
