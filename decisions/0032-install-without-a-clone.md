@@ -22,6 +22,11 @@ as question 11 decided; verification 5's Windows part is observed in that later 
 record stays Proposed until it is.
 **Its verification was observed on 2026-11-25** on throwaway machines (procedure 069), every item
 but verification 5's Windows part.
+**On 2026-11-25 the operator chose a physical Windows computer for that part, in place of a VM**
+("Would the easiest thing be for me to find a Windows computer we could test it on?", then "yes,
+write the instructions"): it needs no installer download, and the line runs there as an ordinary
+account, as a person would run it. Whether later releases' trials use a VM, as question 11 planned,
+is not decided.
 **Date:** 2026-11-24
 **Asked for by:** the operator, 2026-11-24: "asking people to clone a GitHub repo is too much …
 somebody could have a very straightforward path for getting nervus up and running".
@@ -276,7 +281,9 @@ A client run inside WSL, Windows' built-in Linux, takes the Linux line unchanged
 
 *Recommended: a.* It is a second copy of a small script, not new machinery, and most people who
 might use nervus are on Windows or a Mac. The larger cost is the Windows machine at each trial.
-**Decided 2026-11-24: a** ("for question 11, my answer is yes").
+**Decided 2026-11-24: a** ("for question 11, my answer is yes"). **Amended 2026-11-25:** this
+record's Windows trial is on a physical Windows computer, not a VM (status, above); a VM for every
+release's trial is not decided.
 
 ### 12. nervus itself on a Windows computer
 

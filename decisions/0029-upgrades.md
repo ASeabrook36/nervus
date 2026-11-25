@@ -25,6 +25,7 @@ below nervus's own get a lock file ("Not settled here", now settled). And step 7
 answered: the backup made before an upgrade is kept until the next upgrade. Migrations themselves
 wait for the first release that needs one, as question 6a decided; that is the decision, not an
 open step.
+**Amended 2026-11-25, by ADR-0018's last section:** a docs-only export, which changes only the docs, keeps the last export's release number, code and lock; it is not a release, and an upgrade never sees it.
 **Date:** 2026-11-01
 **Asked for by:** the operator, item 6 of the order before friends are invited: "An upgrade path for
 a friend taking a newer export."

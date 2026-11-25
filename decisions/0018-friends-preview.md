@@ -14,7 +14,8 @@ note 0018.
 **Amended by:** ADR-0029 questions 2 and 9 (2026-11-05), marked at decision E: each export has a release number above the last's, and a `CHANGES.md` section for it.
 **Amended by:** ADR-0019 decision H (2026-10-15), carried out by the section at the end of this ADR (2026-10-17), which governs: the deployment record stays out whole, the map becomes a check rather than a rewrite, and friends get `docs/install.md` and `docs/clients.md`.
 **Amended:** 2026-11-13, by the operator (the section before the last): the preview's repository is made public and takes the project's name; nobody is invited as a collaborator.
-**Amended:** 2026-11-15, by the operator (the last section): the public commits' author, the Apache License 2.0 with a `NOTICE`, the README for any reader, the preview's repository deleted and made again, this repository's new name, and security problems reported privately.
+**Amended:** 2026-11-25, by the operator (the last section): docs-only exports between releases, which keep the last release's number and code.
+**Amended:** 2026-11-15, by the operator (the section before the last): the public commits' author, the Apache License 2.0 with a `NOTICE`, the README for any reader, the preview's repository deleted and made again, this repository's new name, and security problems reported privately.
 **Builds on:** ADR-0005 decisions 1 and 3 (nervus will be published; this repository stays
 private; the public one starts with fresh history), AGENTS.md rule 7 (secrets never enter the
 repository)
@@ -220,6 +221,9 @@ anything a friend sends back is copied in by hand. **Decided: 1.**
 *Amended 2026-11-05 by ADR-0029 questions 2 and 9:* the export also refuses a release number not above
 the preview's last export's, and a `CHANGES.md` without that release's section, so a friend's upgrade
 can tell a newer release from an older one and say what changed.
+
+*Amended 2026-11-25 (the last section):* a docs-only export keeps the last export's release number, and
+everything but the docs is the last export's own; the rest of this decision stands for it.
 
 ### F. The preview's README
 
@@ -451,3 +455,45 @@ same name; the next export is its only commit.
 The README's Feedback section says a security problem is reported through the repository's private
 vulnerability reporting rather than as an issue, and the operator switches that on when they make the
 repository public. For everything else decision H stands.
+
+## Amended 2026-11-25: docs-only exports between releases
+
+**What happened.** On 2026-11-25 the operator found the README's first diagram cut off on GitHub's
+page, asked for the README to be honest that a Windows client is not yet tried, and asked for "nervus'"
+in place of "nervus's", which they had already changed in one line on GitHub's page itself. Each is a
+change of wording. Under decision E as ADR-0029 amended it, each export is a release: a number above the
+last's, a `CHANGES.md` section, the libraries locked again at their newest, and a download. So a fix to a
+diagram waited for the next release. The operator asked why, was told, and decided: "Yes, allow
+docs-only exports between releases. and get the new diagram and updates to docs into the public page
+without a new release please".
+
+**1. A docs-only export takes the docs from a commit and everything else from the last export.** The
+docs are the README (from `preview/README.md`, as decision F has it), `AGENTS.md`, `CLAUDE.md`,
+`docs/`, `decisions/` and `research/`. Everything else, `src/`, `tests/`, `tools/`, `deploy/`,
+`install.sh`, `pyproject.toml`, `requirements.lock`, `CHANGES.md` and the rest, is the last export's,
+byte for byte, taken from the checkout of it the export is made against. So the code on the public page
+stays the code of the release its number names, whatever this repository holds by then.
+`CHANGES.md` is not docs here: it says what each release changes, and a section for a release not yet
+made would describe code the page does not have.
+
+**2. The same checks, and the last release's tests.** The check list, the lines the map allows,
+`gitleaks`, and `tests/` run on the result as on any export. The tests are the last release's own, so
+they test the new docs against the code they describe: a doc that quotes a message the release does
+not print, or a step it does not take, stops the export.
+
+**3. No release.** The number stays the last export's, with no `CHANGES.md` section, no new lock and
+no download. The release's tag stays on its own export commit, and its download keeps that commit's
+README: the page moves on, the release does not.
+
+**4. The commit says what it is:** "Docs export of <commit>, <date>", with the same author and
+committer as every export (the section before the last, answer 1), pushed by the operator as before.
+
+**5. The public repository still takes exports only.** The operator's edit on GitHub's page that day
+(one word of the README) is the one commit there that is not an export. Its change was made at its
+source in this repository the same day, so every later export carries it; the next export is committed
+on top of it, since GitHub refuses a push that would drop it.
+
+Rejected: a numbered release for each wording fix (the ceremony that prompted this), and edits made on
+GitHub's page (they skip the check list, `gitleaks` and the tests, and the next export would undo them).
+
+The tool's option and its tests, and the first docs-only export, are in procedure 071.

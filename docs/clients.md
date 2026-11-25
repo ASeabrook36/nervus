@@ -23,7 +23,8 @@ Nothing to install first, and no copy of this repository: the line nervus gives 
    curl -fsSk --pinnedpubkey 'sha256//<nervus's key>' 'https://<nervus>:8000/laptop/<one-time code>' | sh
    ```
 
-   On Windows, in PowerShell:
+   On Windows, in PowerShell. This line passes its tests but has not yet been run on a real Windows
+   computer; if you try it, please say how it went, in an issue on the repository:
 
    <!-- laptop:windows -->
    ```powershell

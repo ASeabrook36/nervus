@@ -39,7 +39,7 @@ ADR-0014).
 the one key, checks what each token may reach, and writes every call down.
 
 ```mermaid
-%%{init: {"flowchart": {"diagramPadding": 200}}}%%
+%%{init: {"flowchart": {"diagramPadding": 200, "wrappingWidth": 400, "padding": 20}}}%%
 flowchart LR
     subgraph clients["Where your agents run"]
         c1["Claude Code"]
@@ -47,7 +47,7 @@ flowchart LR
         c3["Cursor"]
     end
     you(["You, in a browser"])
-    n["nervus, on a small machine of its own:<br/>checks each token,<br/>holds the only SSH key,<br/>writes every call to its audit log"]
+    n["nervus,<br/>on a small machine of its own:<br/>checks each token,<br/>holds the only SSH key,<br/>writes every call<br/>to its audit log"]
     subgraph fleet["Your machines"]
         m1["A server"]
         m2["Another server"]
@@ -92,12 +92,15 @@ used by their id, enrolled by nervus on the first call (ADR-0022), machines adde
 by an admin login given once, or with one line run on them, at the level their owner chooses:
 read-only, standard or full (ADR-0024, ADR-0026), a client read-only on a machine other clients may change, chosen
 for each machine as its token is issued (ADR-0031), nervus installed by one line from a release, checked by its SHA-256, with
-nothing cloned (ADR-0032), each client's computer, macOS, Linux or Windows, set up by one line from nervus's web UI, which saves the
+nothing cloned (ADR-0032), each client's computer, macOS or Linux, set up by one line from nervus's web UI, which saves the
 root Claude Code and Codex trust nervus by (ADR-0021) and fetches the client's token by a one-time code, the token never shown and
 kept where only you can read it (ADR-0032), and upgrading to a newer release with one line, which keeps everything of yours and goes
 back by itself if the new release does not come up (ADR-0029; shown by tests and on throwaway machines).
 
 **Not yet:**
+- **A client on Windows has not been tried on a real Windows computer.** Its line is built and
+  passes its tests, and `docs/clients.md` gives it, but no one has run it on Windows yet. If you
+  do, please say how it went (Feedback, below).
 - **No container image.** One line installs it on a Linux machine; the rest happens in its web UI:
   `docs/install.md`. So nervus itself does not yet run on a Mac or on Windows, except in a Linux VM
   (below); the clients on them do.
@@ -191,7 +194,7 @@ Linux VM the Mac hosts, which a program running as you can open (tier 3). The cl
 Windows are set up as on any computer, below.
 
 ```mermaid
-%%{init: {"flowchart": {"diagramPadding": 200}}}%%
+%%{init: {"flowchart": {"diagramPadding": 200, "wrappingWidth": 400, "padding": 20}}}%%
 flowchart LR
     s1["Install it:<br/>one line from<br/>a release"] --> s2["Sign in,<br/>say where<br/>it runs"]
     s2 --> s3["Add machines:<br/>read-only,<br/>standard or full"]
@@ -203,7 +206,7 @@ flowchart LR
 1. Install it: **`docs/install.md`**. If you hand it to your own AI agent, it is written to be
    followed step by step, with a check after each.
 2. Connect your clients: issue each a token on nervus's Clients page, and run the line it gives on
-   the computer the client runs on, macOS, Linux or Windows: **`docs/clients.md`**.
+   the computer the client runs on, macOS or Linux, or Windows, not yet tried (above): **`docs/clients.md`**.
 3. To use nervus from Claude Code while working in this repository, copy `.mcp.json.example` to
    `.mcp.json` and put nervus's name in it. It reads the token from the environment variable
    `NERVUS_CLAUDE_CODE`, and Claude Code trusts nervus once `NODE_EXTRA_CA_CERTS` names its root
